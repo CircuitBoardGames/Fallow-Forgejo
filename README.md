@@ -1,3 +1,30 @@
+<!-- BEGIN hub fork note — re-apply after every upstream sync. See docs/agents/forge-migration.md. -->
+> # This is a fork, and this GitHub copy is a mirror
+>
+> **What this is.** A CircuitBoardGames fork of [`fallow-rs/fallow`](https://github.com/fallow-rs/fallow),
+> patched so the action runs on **Forgejo Actions** instead of only on GitHub. The patched code is on
+> branch **`hub/no-sarif`**, tagged **`v3.5.1-hub1`**. Branch `main` tracks upstream unmodified.
+>
+> **What changed.** Two steps are removed from the composite action — *Check Code Scanning
+> availability* and *Upload SARIF* (26 lines).
+>
+> **Why that is necessary rather than cosmetic.** The composite action references
+> `github/codeql-action` through a nested `uses:`. Forgejo's runner pre-clones **every** `uses:` it
+> finds, regardless of any `if:` guarding it, so setting `sarif: false` does not avoid the reference.
+> `github/codeql-action` is not published to `data.forgejo.org`, and mirroring it onto our own
+> instance does not help, because a nested reference resolves through the runner's
+> `DEFAULT_ACTIONS_URL` rather than through us. The job therefore fails while cloning, before any
+> fallow code executes.
+>
+> **Why nothing was lost.** Forgejo has no code-scanning/SARIF ingestion, so the removed steps had no
+> destination on this platform. The deletion carries a comment saying to re-apply it on every
+> upstream bump.
+>
+> **Authority, and a warning.** The Forgejo copy on our hub is authoritative. This GitHub repository
+> is written by a weekly `git push --mirror`, which **prunes** — anything committed here, including a
+> branch that exists only on GitHub, is destroyed by the next run. Send changes to the hub, not here.
+<!-- END hub fork note -->
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/fallow-rs/fallow/main/assets/logo-dark.svg">
