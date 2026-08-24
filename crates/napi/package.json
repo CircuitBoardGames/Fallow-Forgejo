@@ -67,7 +67,7 @@
     "@napi-rs/cli": "3.8.0"
   },
   "optionalDependencies": {
-    "@fallow-cli/fallow-node-darwin-arm64": "3.14.0",
+    "@fallow-cli/fallow-node-darwin-arm64": "3.17.0",
     "@fallow-cli/fallow-node-darwin-x64": "3.14.0",
     "@fallow-cli/fallow-node-linux-arm64-gnu": "3.14.0",
     "@fallow-cli/fallow-node-linux-arm64-musl": "3.14.0",
