@@ -925,7 +925,7 @@
     "@types/mocha": "10.0.10",
     "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "3.9.2",
-    "json-schema-to-typescript": "15.0.4",
+    "json-schema-to-typescript": "16.0.0",
     "mocha": "11.7.6",
     "rolldown": "1.2.0",
     "ovsx": "1.0.2",
