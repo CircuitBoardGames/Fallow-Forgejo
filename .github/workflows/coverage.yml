@@ -94,7 +94,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: steps.coverage_policy.outputs.run == 'true'
-        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
         with:
           tool: cargo-llvm-cov
 
