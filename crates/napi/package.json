@@ -74,7 +74,7 @@
     "@fallow-cli/fallow-node-linux-x64-gnu": "3.14.0",
     "@fallow-cli/fallow-node-linux-x64-musl": "3.14.0",
     "@fallow-cli/fallow-node-win32-arm64-msvc": "3.14.0",
-    "@fallow-cli/fallow-node-win32-x64-msvc": "3.14.0",
+    "@fallow-cli/fallow-node-win32-x64-msvc": "3.21.0",
     "fallow-type-aware": "3.14.0"
   }
 }
