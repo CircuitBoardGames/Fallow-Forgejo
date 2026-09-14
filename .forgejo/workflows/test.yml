@@ -43,5 +43,13 @@ jobs:
           fi
           "$HOME/.cargo/bin/rustup" toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # The CLI's audit tests spawn the type-aware sidecar (node), so its dependencies must exist
+      # before `cargo test` -- upstream's check job does this; the first forge run without it failed
+      # on ERR_MODULE_NOT_FOUND.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install type-aware sidecar dependencies
+        run: npm ci --prefix tools/type-aware-sidecar --no-audit --no-fund --ignore-scripts
       - name: Run tests
         run: cargo test --workspace --lib --bins --tests --examples
