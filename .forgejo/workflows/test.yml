@@ -1,0 +1,41 @@
+name: Test
+
+# The forge's gate for this fork. Actions were off here, and the 23 upstream workflows under
+# `.github/workflows` assume GitHub (windows/macos runners, benches, fuzzing, release). A present
+# `.forgejo/workflows` is what the forge reads instead, so none of those run and the upstream files
+# stay untouched for clean syncs.
+#
+# SCOPE IS DELIBERATELY THE TEST SUITE ONLY: `cargo test` from upstream ci.yml's `check` job. Its
+# clippy passes, NAPI build and contract-drift gates are not ported. The runner executes on the
+# AIroborOS host (labels ubuntu-latest:host, Nice=10), which also serves the forge, the site and the
+# agents, and a Rust workspace build is the heaviest thing this forge would run. Add steps when the
+# host has headroom for them.
+#
+# The toolchain installs into the runner user's home and persists between runs, so only the first
+# run pays the download; the channel matches rust-toolchain.toml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Run tests
+        run: cargo test --workspace --lib --bins --tests --examples
