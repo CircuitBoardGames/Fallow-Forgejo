@@ -12,7 +12,9 @@ name: Test
 # host has headroom for them.
 #
 # The toolchain installs into the runner user's home and persists between runs, so only the first
-# run pays the download; the channel matches rust-toolchain.toml.
+# run pays the download; rust-toolchain.toml then selects the pinned channel and its components.
+# A `run:` step, not dtolnay/rust-toolchain: this forge resolves bare `uses:` names through
+# data.forgejo.org, which does not mirror that action (measured 2026-09-14: the job died cloning it).
 
 on:
   pull_request:
@@ -34,8 +36,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.97.1
+      - name: Install Rust (rust-toolchain.toml pin)
+        run: |
+          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          fi
+          "$HOME/.cargo/bin/rustup" toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Run tests
         run: cargo test --workspace --lib --bins --tests --examples
