@@ -398,7 +398,7 @@ jobs:
           7z a ../../../fallow-${{ matrix.target }}.zip ${{ matrix.binary }} ${{ matrix.lsp_binary }} ${{ matrix.mcp_binary }}
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-${{ matrix.target }}
           path: fallow-${{ matrix.target }}.*
@@ -473,7 +473,7 @@ jobs:
           cp "fallow-multicall-${{ matrix.npm_dir }}${ext}.sig" "npm-payload/fallow${ext}.sig"
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-cli-${{ matrix.npm_dir }}
           path: |
@@ -481,7 +481,7 @@ jobs:
             fallow-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
 
       - name: Upload LSP artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-lsp-${{ matrix.npm_dir }}
           path: |
@@ -489,7 +489,7 @@ jobs:
             fallow-lsp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
 
       - name: Upload MCP artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-mcp-${{ matrix.npm_dir }}
           path: |
@@ -497,7 +497,7 @@ jobs:
             fallow-mcp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
 
       - name: Upload npm binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: npm-${{ matrix.npm_dir }}
           path: |
@@ -505,7 +505,7 @@ jobs:
             npm-payload/fallow${{ runner.os == 'Windows' && '.exe' || '' }}.sig
 
       - name: Upload NAPI addon
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: napi-${{ matrix.npm_dir }}
           path: crates/napi/fallow-node.${{ matrix.npm_dir }}.node
@@ -577,7 +577,7 @@ jobs:
           done
 
       - name: Upload release asset bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-assets
           path: release-assets/
@@ -881,7 +881,7 @@ jobs:
             tarballs/20-cli-root/*.tgz
 
       - name: Upload npm tarballs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: npm-tarballs
           path: tarballs/
@@ -1081,7 +1081,7 @@ jobs:
           pnpm package
 
       - name: Upload VSIX artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-vscode
           path: editors/vscode/*.vsix
