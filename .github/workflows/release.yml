@@ -526,7 +526,7 @@ jobs:
       contents: read
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           pattern: fallow-*
@@ -649,13 +649,13 @@ jobs:
           # NODE_AUTH_TOKEN to .npmrc. Auth lives in the publish job.
 
       - name: Download all npm binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: npm-*
           path: npm-artifacts
 
       - name: Download all NAPI addons
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: napi-*
           path: napi-artifacts
@@ -933,7 +933,7 @@ jobs:
           npm install -g --ignore-scripts npm@11.14.1
 
       - name: Download npm tarballs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: npm-tarballs
           path: tarballs
@@ -1099,7 +1099,7 @@ jobs:
           node-version: '22'
 
       - name: Download VSIX
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-vscode
           path: vsix
