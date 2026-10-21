@@ -580,9 +580,12 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary sidecar root");
         let sidecar = root.path().join("blocking-sidecar.sh");
         let ready = root.path().join("sidecar-ready");
+        // Ready only once the request has arrived: `write_request` drops stdin after writing, so the
+        // read returns then. Signalled before it, a busy host could terminate the sidecar before the
+        // request thread wrote, failing the write ("Broken pipe") instead of the blocked read.
         fs::write(
             &sidecar,
-            "#!/bin/sh\nprintf ready > sidecar-ready\nexec sleep 30\n",
+            "#!/bin/sh\nread -r _request\nprintf ready > sidecar-ready\nexec sleep 30\n",
         )
         .expect("write sidecar");
         let mut permissions = fs::metadata(&sidecar)
