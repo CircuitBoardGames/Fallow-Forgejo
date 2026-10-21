@@ -71,7 +71,8 @@ jobs:
             echo "CARGO_INCREMENTAL=0"; } >> "$GITHUB_ENV"
       - name: Run tests
         run: cargo test --workspace --lib --bins --tests --examples
-      # The hit rate goes in the log, and the job's server does not outlive it.
+      # The hit rate goes in the log, and the job's server does not outlive it. Never fails: a cancelled
+      # job's server is already dead, and a failing stop turned that cancellation into a red (cmux job 36085).
       - name: sccache stats, stop
         if: always()
-        run: '[ -z "${RUSTC_WRAPPER:-}" ] || { "$RUSTC_WRAPPER" --show-stats; "$RUSTC_WRAPPER" --stop-server; }'
+        run: '[ -z "${RUSTC_WRAPPER:-}" ] || { "$RUSTC_WRAPPER" --show-stats; "$RUSTC_WRAPPER" --stop-server; } || true'
