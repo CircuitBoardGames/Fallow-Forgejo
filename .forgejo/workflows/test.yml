@@ -5,8 +5,9 @@ name: Test
 # `.forgejo/workflows` is what the forge reads instead, so none of those run and the upstream files
 # stay untouched for clean syncs.
 #
-# SCOPE IS DELIBERATELY THE TEST SUITE ONLY: `cargo test` from upstream ci.yml's `check` job. Its
-# clippy passes, NAPI build and contract-drift gates are not ported. The runner executes on the
+# SCOPE IS DELIBERATELY `cargo test` AND CLIPPY from upstream ci.yml's `check` job: its three clippy
+# passes, run verbatim (`-D warnings`, so any warning fails), and its test suite. Its NAPI build and
+# contract-drift gates are not ported. The runner executes on the
 # AIroborOS host (labels ubuntu-latest:host, Nice=10), which also serves the forge, the site and the
 # agents, and a Rust workspace build is the heaviest thing this forge would run. Add steps when the
 # host has headroom for them.
@@ -77,6 +78,12 @@ jobs:
           { echo "RUSTC_WRAPPER=$S/sccache"; echo "SCCACHE_DIR=$HOME/.cache/sccache"; echo "SCCACHE_CACHE_SIZE=4G"
             echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"; echo "SCCACHE_SERVER_UDS=$(mktemp -u /tmp/sccache-XXXXXXXX.sock)"
             echo "CARGO_INCREMENTAL=0"; } >> "$GITHUB_ENV"
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (test-sidecar-key feature)
+        run: cargo clippy -p fallow-cli --features test-sidecar-key --all-targets -- -D warnings
+      - name: Clippy (schema-emit feature)
+        run: cargo clippy -p fallow-cli --features schema-emit --bin fallow-schema-emit --tests -- -D warnings
       - name: Run tests
         run: cargo test --workspace --lib --bins --tests --examples
       # The hit rate goes in the log, and the job's server does not outlive it. Never fails: a cancelled
