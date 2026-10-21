@@ -50,5 +50,28 @@ jobs:
           node-version: 22
       - name: Install type-aware sidecar dependencies
         run: npm ci --prefix tools/type-aware-sidecar --no-audit --no-fund --ignore-scripts
+      # sccache: a compile cache keyed on each crate's source content, shared by every Rust gate on
+      # this runner. Not a shared target/ (a stale-code false green, 2026-09-15): each job keeps its own target/ and its own server,
+      # and an entry is only reused when the inputs hash the same. SCCACHE_BASEDIRS strips this job's
+      # random workspace path so dependencies hit across jobs; workspace crates still hash their
+      # absolute paths, so the PR's own code always rebuilds (proved 2026-10-21: a fault in a cached
+      # crate still failed). 4G cap: the runner's disk is near full.
+      - name: sccache (serialised install)
+        run: |
+          S="$HOME/.cache/sccache-0.18.0"; mkdir -p "$HOME/.rustup" "$S"
+          flock "$HOME/.rustup/.ci-install.lock" sh -euc '
+            [ -x "$0/sccache" ] && exit 0
+            curl -fsSL -o "$0.tgz" https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz
+            printf "%s  %s\n" 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89 "$0.tgz" | sha256sum -c --quiet
+            tar xzf "$0.tgz" -C "$0" --strip-components=1 sccache-v0.18.0-x86_64-unknown-linux-musl/sccache
+            rm "$0.tgz"
+          ' "$S"
+          { echo "RUSTC_WRAPPER=$S/sccache"; echo "SCCACHE_DIR=$HOME/.cache/sccache"; echo "SCCACHE_CACHE_SIZE=4G"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"; echo "SCCACHE_SERVER_UDS=$(mktemp -u /tmp/sccache-XXXXXXXX.sock)"
+            echo "CARGO_INCREMENTAL=0"; } >> "$GITHUB_ENV"
       - name: Run tests
         run: cargo test --workspace --lib --bins --tests --examples
+      # The hit rate goes in the log, and the job's server does not outlive it.
+      - name: sccache stats, stop
+        if: always()
+        run: '[ -z "${RUSTC_WRAPPER:-}" ] || { "$RUSTC_WRAPPER" --show-stats; "$RUSTC_WRAPPER" --stop-server; }'
