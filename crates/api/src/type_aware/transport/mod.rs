@@ -863,7 +863,7 @@ for await (const line of lines) {
   if (envelope.type === "shutdown") process.exit(0);
   fs.writeFileSync(path.join(process.cwd(), ".session-request-seen"), "1");
   const cancellationAcknowledgement = path.join(process.cwd(), ".session-cancelled");
-  for (let attempt = 0; attempt < 200 && !fs.existsSync(cancellationAcknowledgement); attempt += 1) {
+  for (let attempt = 0; attempt < 6000 && !fs.existsSync(cancellationAcknowledgement); attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   process.exit(1);
@@ -889,8 +889,11 @@ for await (const line of lines) {
         let cancellation_watcher = Arc::clone(&cancellation);
         let request_marker = sidecar_dir.join(".session-request-seen");
         let cancellation_marker = sidecar_dir.join(".session-cancelled");
+        // Both waits are deadlines for an event that does arrive, so they are generous: a loaded
+        // runner can take longer than half a second to start node, and a watcher that gave up
+        // first let the sidecar exit uncancelled and restart, failing this test.
         let watcher = std::thread::spawn(move || {
-            for _ in 0..100 {
+            for _ in 0..6000 {
                 if request_marker.exists() {
                     cancellation_watcher.store(true, Ordering::SeqCst);
                     fs::write(cancellation_marker, "1").expect("acknowledge cancellation");
