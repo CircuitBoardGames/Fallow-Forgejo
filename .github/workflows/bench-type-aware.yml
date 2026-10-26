@@ -47,7 +47,7 @@ jobs:
         working-directory: tools/type-aware-sidecar
 
       - name: Run type-aware benchmarks
-        uses: CodSpeedHQ/action@f22792bfac16f3e14eb9fbea76f4a48e9cc22b93 # v4.19.1
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         with:
           mode: walltime
           run: npm run bench --prefix tools/type-aware-sidecar
