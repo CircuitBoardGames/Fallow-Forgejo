@@ -8,7 +8,7 @@
 //! the Vue/Svelte/Nuxt ecosystems catches this (they emit runtime-only warnings
 //! or have unimplemented eslint proposals).
 //!
-//! The detector is built to never false-flag (degrade by abstaining):
+//! Every gate below degrades by abstaining:
 //! - **Dep-gated** on `vue` / `@vue/runtime-core` / `svelte`.
 //! - **External-abstain**: a key imported from an npm PACKAGE is skipped, because
 //!   the `provide` may live inside that package's own code (in `node_modules`,
@@ -22,24 +22,28 @@
 //!   loop/parameter local), the whole project abstains, because a surviving
 //!   inject finding could be falsely flagged. Mirrors the Pinia spread-return
 //!   whole-object abstain.
+//! - **Star-collision abstain**: a key supplied by ambiguous `export *` sources
+//!   is unknown rather than unprovided, whether the provide or inject reaches it
+//!   through the broken barrel.
 //!
 //! The provided set is built LIBERALLY (the composable `provide(KEY, _)` plus
 //! app-level `*.provide(KEY, _)`): over-crediting a provided key can only
 //! suppress a finding, never create one. The inject side emits conservatively.
-
+//!
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use fallow_types::extract::{DiFramework, DiRole, ExportName, ModuleInfo};
 
 use crate::discover::FileId;
-use crate::graph::ModuleGraph;
+use crate::graph::{
+    AmbiguityParticipants, EffectiveExportResolution, ExportNamespace, ModuleGraph,
+};
 use crate::resolve::ResolvedModule;
 use crate::results::UnprovidedInject;
 use crate::suppress::{IssueKind, SuppressionContext};
 
 use super::members::{
-    ExportKey, build_local_to_export_keys, entry_point_star_re_export_targets,
-    export_has_entry_point_re_export_reference, export_key_with_origins,
+    ExportKey, build_local_to_export_keys, export_key_with_origins, public_export_origin_keys,
 };
 use super::{LineOffsetsMap, byte_offset_to_line_col};
 
@@ -87,15 +91,17 @@ pub fn find_unprovided_injects(input: UnprovidedInjectInput<'_>) -> Vec<Unprovid
         .collect();
 
     let provided = build_provided_key_set(input, &modules_by_id);
-    let entry_star_targets =
-        entry_point_star_re_export_targets(input.graph, input.public_api_entry_points);
+    let public_export_origins =
+        public_export_origin_keys(input.graph, input.public_api_entry_points);
+    let ambiguity = input.graph.ambiguity_participants();
 
     let scan = InjectScanContext {
         input,
         modules_by_id: &modules_by_id,
         path_by_id: &path_by_id,
         provided: &provided,
-        entry_star_targets: &entry_star_targets,
+        public_export_origins: &public_export_origins,
+        ambiguity: &ambiguity,
     };
     collect_unprovided_inject_findings(&scan)
 }
@@ -163,7 +169,8 @@ struct InjectScanContext<'a> {
     modules_by_id: &'a FxHashMap<FileId, &'a ModuleInfo>,
     path_by_id: &'a FxHashMap<FileId, &'a std::path::Path>,
     provided: &'a FxHashSet<ExportKey>,
-    entry_star_targets: &'a FxHashSet<FileId>,
+    public_export_origins: &'a FxHashSet<ExportKey>,
+    ambiguity: &'a AmbiguityParticipants,
 }
 
 /// Pass 2: emit a finding for each inject site whose key is provided nowhere.
@@ -238,6 +245,12 @@ fn inject_site_has_unprovided_key(
     if canonical.is_empty() {
         return false;
     }
+    if canonical
+        .iter()
+        .any(|key| key_is_ambiguity_affected(scan, key))
+    {
+        return false;
+    }
     // Angular InjectionToken FP gate: only a USER `InjectionToken` is in scope. A
     // class / framework token (`inject(MyService)`) is FP-prone via
     // `providedIn: 'root'` and third-party `provideX()`, so abstain unless at
@@ -255,18 +268,25 @@ fn inject_site_has_unprovided_key(
         return false;
     }
     // Public-API abstain: the consumer of this package provides the key.
-    if canonical.iter().any(|key| {
-        key_is_public_api(
-            scan.input.graph,
-            key,
-            scan.input.public_api_entry_points,
-            scan.entry_star_targets,
-        )
-    }) {
+    if canonical
+        .iter()
+        .any(|key| key_is_public_api(scan.input.graph, key, scan.public_export_origins))
+    {
         return false;
     }
 
     true
+}
+
+fn key_is_ambiguity_affected(scan: &InjectScanContext<'_>, key: &ExportKey) -> bool {
+    scan.ambiguity
+        .contains_in_namespace(key.file_id, &key.export_name, ExportNamespace::Value)
+        || matches!(
+            scan.input
+                .graph
+                .resolve_export(key.file_id, &key.export_name, ExportNamespace::Value,),
+            EffectiveExportResolution::Ambiguous
+        )
 }
 
 fn inject_site_suppressed(scan: &InjectScanContext<'_>, file_id: FileId, line: u32) -> bool {
@@ -340,22 +360,19 @@ fn resolve_key(
 fn key_is_public_api(
     graph: &ModuleGraph,
     key: &ExportKey,
-    public_api_entry_points: &FxHashSet<FileId>,
-    entry_star_targets: &FxHashSet<FileId>,
+    public_export_origins: &FxHashSet<ExportKey>,
 ) -> bool {
     let Some(module) = graph.modules.get(key.file_id.0 as usize) else {
         return false;
     };
-    let Some(export) = module
+    if !module
         .exports
         .iter()
-        .find(|export| export_name_matches(&export.name, &key.export_name))
-    else {
+        .any(|export| export_name_matches(&export.name, &key.export_name))
+    {
         return false;
-    };
-    public_api_entry_points.contains(&key.file_id)
-        || entry_star_targets.contains(&key.file_id)
-        || export_has_entry_point_re_export_reference(graph, export, public_api_entry_points)
+    }
+    public_export_origins.contains(key)
 }
 
 /// Whether a canonical export key names a known Angular `InjectionToken`: the

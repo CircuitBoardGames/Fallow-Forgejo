@@ -128,6 +128,7 @@ fn synthetic_package_import(package_name: String) -> ResolvedImport {
             imported_name: ImportedName::SideEffect,
             local_name: String::new(),
             is_type_only: false,
+            is_type_only_star: false,
             from_style: false,
             span: Span::default(),
             source_span: Span::default(),
@@ -189,8 +190,10 @@ fn base_resolve_input<'a>(
         active_plugins: &plugin_result.active_plugins,
         path_aliases: &plugin_result.path_aliases,
         auto_imports: &[],
+        jsx_import_sources: &[],
         scss_include_paths: &plugin_result.scss_include_paths,
         static_dir_mappings: &plugin_result.static_dir_mappings,
+        framework_static_dir_mappings: &plugin_result.static_dir_mappings,
         root: &config.root,
         extra_conditions: &config.resolve.conditions,
     }

@@ -30,14 +30,16 @@
 use std::path::{Path, PathBuf};
 
 use fallow_types::extract::{ImportedName, ModuleInfo};
-pub use fallow_types::trace_chain::{
-    ChainHop, DEFAULT_TRACE_DEPTH, SymbolChainQuery, SymbolChainTrace, TraceDirections,
-    UnresolvedCallee, UnresolvedReason,
+use fallow_types::semantic::SemanticNamespace;
+use fallow_types::trace_chain::{
+    ChainHop, StarExportAmbiguity, SymbolChainQuery, SymbolChainTrace, UnresolvedCallee,
+    UnresolvedReason,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::discover::FileId;
-use crate::graph::ModuleGraph;
+use crate::graph::{ExportNamespace, ModuleGraph};
+use crate::trace::trace_impl::find_module;
 
 /// Trace the symbol-level call chain for `query.symbol` in `query.file`.
 ///
@@ -57,13 +59,16 @@ pub fn trace_symbol_chain(
         depth,
         directions,
     } = query;
-    let module = graph
-        .modules
-        .iter()
-        .find(|m| path_matches(&m.path, root, file))?;
+    let module = find_module(graph, root, file)?;
     let rel_file = relativize(&module.path, root);
 
     let symbol_found = module.exports.iter().any(|e| e.name.to_string() == *symbol);
+    // A barrel whose star sources collide on this name exports nothing under
+    // it, so it looks exactly like an unknown name unless the collision is
+    // reported alongside.
+    let star_export_ambiguity = (!symbol_found)
+        .then(|| star_export_ambiguity(graph, root, module.file_id, symbol))
+        .flatten();
 
     let module_by_id: FxHashMap<FileId, &ModuleInfo> =
         modules.iter().map(|m| (m.file_id, m)).collect();
@@ -81,6 +86,7 @@ pub fn trace_symbol_chain(
 
     let reason = build_reason(
         symbol_found,
+        star_export_ambiguity.as_ref(),
         callers.as_deref(),
         callees.as_deref(),
         unresolved_callees.as_deref(),
@@ -95,8 +101,59 @@ pub fn trace_symbol_chain(
         callers,
         callees,
         unresolved_callees,
+        star_export_ambiguity,
         reason,
     })
+}
+
+/// The `export *` collision on `module_id` that swallows `symbol`, if any.
+fn star_export_ambiguity(
+    graph: &ModuleGraph,
+    root: &Path,
+    module_id: FileId,
+    symbol: &str,
+) -> Option<StarExportAmbiguity> {
+    let collisions: Vec<_> = graph
+        .ambiguous_star_exports_on(module_id)
+        .into_iter()
+        .filter(|collision| collision.name.as_ref() == symbol)
+        .collect();
+    if collisions.is_empty() {
+        return None;
+    }
+
+    let mut sources: Vec<PathBuf> = collisions
+        .iter()
+        .flat_map(|collision| collision.contributors.iter())
+        .filter_map(|contributor| graph.modules.get(contributor.0 as usize))
+        .map(|module| relativize(&module.path, root))
+        .collect();
+    sources.sort();
+    sources.dedup();
+
+    let mut namespaces: Vec<SemanticNamespace> = collisions
+        .iter()
+        .map(|collision| match collision.namespace {
+            ExportNamespace::Type => SemanticNamespace::Type,
+            ExportNamespace::Value => SemanticNamespace::Value,
+        })
+        .collect();
+    namespaces.sort_unstable_by_key(|namespace| namespace_order(*namespace));
+    namespaces.dedup();
+
+    Some(StarExportAmbiguity {
+        sources,
+        namespaces,
+    })
+}
+
+/// Report type space before value space, matching the collision order the
+/// graph reports so both surfaces read the same way.
+const fn namespace_order(namespace: SemanticNamespace) -> u8 {
+    match namespace {
+        SemanticNamespace::Type => 0,
+        SemanticNamespace::Value => 1,
+    }
 }
 
 /// Shared walk state, so the recursive helpers stay under the argument cap.
@@ -288,10 +345,22 @@ fn collect_unresolved_callees(info: &ModuleInfo) -> Vec<UnresolvedCallee> {
 
 fn build_reason(
     symbol_found: bool,
+    ambiguity: Option<&StarExportAmbiguity>,
     callers: Option<&[ChainHop]>,
     callees: Option<&[ChainHop]>,
     unresolved: Option<&[UnresolvedCallee]>,
 ) -> String {
+    if let Some(ambiguity) = ambiguity {
+        let sources = ambiguity
+            .sources
+            .iter()
+            .map(|source| source.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "two or more `export *` sources of this file declare this name, so it resolves as ambiguous and the file exports nothing under it (ECMA-262 ResolveExport); colliding origins: {sources}"
+        );
+    }
     if !symbol_found {
         return "symbol not found as an export of this file; chains are file-scoped best-effort and may be empty".to_string();
     }
@@ -338,30 +407,9 @@ fn relativize(path: &Path, root: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
-/// Match a user-provided file path against a module's actual path. Mirrors
-/// `trace::path_matches` (kept local to avoid widening that private helper).
-fn path_matches(module_path: &Path, root: &Path, user_path: &str) -> bool {
-    let user_path_norm = user_path.replace('\\', "/");
-    let rel = module_path.strip_prefix(root).unwrap_or(module_path);
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    let module_str = module_path.to_string_lossy().replace('\\', "/");
-    if rel_str == user_path_norm || module_str == user_path_norm {
-        return true;
-    }
-    if dunce::canonicalize(root).is_ok_and(|canonical_root| {
-        module_path
-            .strip_prefix(&canonical_root)
-            .is_ok_and(|rel| rel.to_string_lossy().replace('\\', "/") == user_path_norm)
-    }) {
-        return true;
-    }
-    module_str.ends_with(&format!("/{user_path_norm}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyze::test_support::empty_module;
 
     #[test]
     fn imported_name_matches_named_default_namespace() {
@@ -393,7 +441,7 @@ mod tests {
                     span_start: 10,
                 },
             ],
-            ..empty_module()
+            ..ModuleInfo::empty(FileId(1))
         };
         let unresolved = collect_unresolved_callees(&info);
         assert_eq!(unresolved.len(), 2);
@@ -411,6 +459,7 @@ mod tests {
                 imported_name: ImportedName::Named("dep".to_string()),
                 local_name: "dep".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::default(),
                 source_span: oxc_span::Span::default(),
@@ -425,7 +474,7 @@ mod tests {
                     span_start: 5,
                 },
             ],
-            ..empty_module()
+            ..ModuleInfo::empty(FileId(1))
         };
         let unresolved = collect_unresolved_callees(&info);
         // `dep` resolves to an import (covered by resolved callees); only `ghost`

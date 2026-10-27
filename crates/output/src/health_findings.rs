@@ -41,7 +41,7 @@ pub struct HealthActionContext {
 }
 
 /// Wire envelope for a single complexity finding.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HealthFinding {
     /// Inner complexity-violation payload.
@@ -50,9 +50,31 @@ pub struct HealthFinding {
     /// Machine-actionable fix and suppress hints.
     pub actions: Vec<HealthFindingAction>,
     /// Audit-mode flag indicating whether the finding is new versus the base
-    /// snapshot.
+    /// snapshot. A complexity finding is new when no base finding has the same
+    /// path and function name, when a grown metric exceeds a threshold that
+    /// the base finding did not exceed, or when the growth of an exceeded
+    /// metric moves it to a higher severity tier. A CRAP score from estimated
+    /// coverage, or a CRAP score that the base finding does not have, is not
+    /// growth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<bool>,
+    /// Audit-mode class of the finding against the base snapshot:
+    /// `introduced`, `worsened` or `inherited`. A worsened finding matches a
+    /// base finding, is not introduced, and has a higher value in at least one
+    /// measured metric. Absent outside an audit with a base snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<crate::AuditFindingAttribution>,
+    /// Audit-mode list of the measured metrics that are higher than in the
+    /// matched base finding, with the base value and the head value. Present
+    /// on a worsened finding, and on an introduced finding that matches a base
+    /// finding. Absent when no metric grew.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worsened_metrics: Vec<crate::WorsenedMetric>,
+    /// Audit-mode reason why the finding does not gate the verdict. With
+    /// `test-file`, the finding is in a test file and `effective_severity` is
+    /// `warn`. Absent outside `audit`, and on a finding that gates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_exemption: Option<crate::AuditGateExemption>,
 }
 
 impl Deref for HealthFinding {
@@ -70,6 +92,9 @@ impl From<ComplexityViolation> for HealthFinding {
             violation,
             actions: Vec::new(),
             introduced: None,
+            attribution: None,
+            worsened_metrics: Vec::new(),
+            gate_exemption: None,
         }
     }
 }
@@ -90,6 +115,9 @@ impl HealthFinding {
             violation,
             actions,
             introduced,
+            attribution: None,
+            worsened_metrics: Vec::new(),
+            gate_exemption: None,
         }
     }
 
@@ -102,6 +130,9 @@ impl HealthFinding {
             violation,
             actions,
             introduced: None,
+            attribution: None,
+            worsened_metrics: Vec::new(),
+            gate_exemption: None,
         }
     }
 }
@@ -147,7 +178,7 @@ pub fn build_health_finding_actions(
         actions.push(action);
     }
 
-    let is_template = name == "<template>";
+    let is_template = fallow_types::extract::is_synthetic_template_unit(name);
     let is_component = name == "<component>";
     if should_add_refactor_action(RefactorActionDecision {
         crap_only,
@@ -204,8 +235,22 @@ fn build_refactor_action(
     is_template: bool,
     is_component: bool,
 ) -> HealthFindingAction {
+    let is_svelte = violation
+        .path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svelte"));
     let (description, note): (String, &str) = if is_component {
         component_refactor_copy(violation)
+    } else if is_template && is_svelte {
+        // Svelte has an in-file decomposition primitive that fallow scores as
+        // its own unit, so the cheap lever is named before the file split.
+        (
+            format!(
+                "Refactor `{name}` to reduce template complexity (move a repeated or deeply nested block into a {{#snippet}}; fallow scores a top-level snippet as its own unit)"
+            ),
+            "A top-level {#snippet name(...)} becomes its own `<snippet:name>` complexity unit, so in-file extraction moves the score; splitting into a child component also works",
+        )
     } else if is_template {
         (
             format!(
@@ -218,7 +263,7 @@ fn build_refactor_action(
             format!(
                 "Refactor `{name}` to reduce complexity (extract helper functions, simplify branching)"
             ),
-            "Consider splitting into smaller functions with single responsibilities",
+            "Split into smaller functions with single responsibilities. Splitting relocates branching, so it lowers this function's score without lowering the total",
         )
     };
     HealthFindingAction {
@@ -249,44 +294,64 @@ fn component_refactor_copy(violation: &ComplexityViolation) -> (String, &'static
     )
 }
 
+/// Suppression comment recommended for single-file-component markup templates
+/// (`.svelte`, `.vue`, `.astro`). The `//` form is not markup syntax there and
+/// would render into the DOM as visible text.
+pub const SFC_TEMPLATE_SUPPRESS_COMMENT: &str = "<!-- fallow-ignore-next-line complexity -->";
+
+/// Description of the SFC template suppression action. Names the reported line
+/// rather than the top of the template because the synthetic `<template>` unit
+/// is anchored at its first contributing construct.
+pub const SFC_TEMPLATE_SUPPRESS_DESCRIPTION: &str =
+    "Suppress with an HTML comment on the line immediately preceding the reported line";
+
+const DEFAULT_SUPPRESS_COMMENT: &str = "// fallow-ignore-next-line complexity";
+
 fn build_suppress_action(
     violation: &ComplexityViolation,
     is_template: bool,
     is_component: bool,
 ) -> HealthFindingAction {
-    if is_template && is_standalone_template_path(&violation.path) {
+    let extension = violation.path.extension().and_then(|ext| ext.to_str());
+    if is_template && extension.is_some_and(|ext| ext.eq_ignore_ascii_case("html")) {
         return suppress_file_action(
             "Suppress with an HTML comment at the top of the template",
             "<!-- fallow-ignore-file complexity -->",
             "top-of-template",
         );
     }
+    if is_template
+        && extension.is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("svelte")
+                || ext.eq_ignore_ascii_case("vue")
+                || ext.eq_ignore_ascii_case("astro")
+        })
+    {
+        return suppress_line_action(
+            SFC_TEMPLATE_SUPPRESS_DESCRIPTION,
+            SFC_TEMPLATE_SUPPRESS_COMMENT,
+            "above-template-anchor-line",
+        );
+    }
     if is_template {
         return suppress_line_action(
             "Suppress with an inline comment above the Angular decorator",
+            DEFAULT_SUPPRESS_COMMENT,
             "above-angular-decorator",
         );
     }
     if is_component {
         return suppress_line_action(
             "Suppress with an inline comment above the worst class method (the rollup is anchored at that method's line, so a comment above it hides both the function finding and the rollup)",
+            DEFAULT_SUPPRESS_COMMENT,
             "above-component-worst-method",
         );
     }
     suppress_line_action(
         "Suppress with an inline comment above the function declaration",
+        DEFAULT_SUPPRESS_COMMENT,
         "above-function-declaration",
     )
-}
-
-fn is_standalone_template_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            ["html", "svelte", "vue", "astro"]
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
 }
 
 fn suppress_file_action(description: &str, comment: &str, placement: &str) -> HealthFindingAction {
@@ -301,19 +366,23 @@ fn suppress_file_action(description: &str, comment: &str, placement: &str) -> He
     }
 }
 
-fn suppress_line_action(description: &str, placement: &str) -> HealthFindingAction {
+fn suppress_line_action(description: &str, comment: &str, placement: &str) -> HealthFindingAction {
     HealthFindingAction {
         kind: HealthFindingActionType::SuppressLine,
         auto_fixable: false,
         description: description.to_string(),
         note: None,
-        comment: Some("// fallow-ignore-next-line complexity".to_string()),
+        comment: Some(comment.to_string()),
         placement: Some(placement.to_string()),
         target_path: None,
     }
 }
 
 /// Build the coverage-leaning action for a CRAP-contributing finding.
+///
+/// Synthetic template-family units never reach this builder: they are
+/// excluded from the CRAP dimension at the scoring choke point, so their
+/// findings never carry `exceeded: crap` (issue #2235).
 fn build_crap_coverage_action(
     name: &str,
     tier: Option<CoverageTier>,
@@ -385,7 +454,7 @@ fn build_crap_coverage_action(
 /// pipeline (the typed action builder operates on the inner
 /// [`HotspotEntry`]) or via [`HotspotFinding::from`] for fixture and
 /// test code.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HotspotFinding {
     /// Inner hotspot payload. Flattened on the wire.
@@ -606,7 +675,7 @@ fn suggest_codeowners_pattern(path: &str) -> String {
 /// Construct via [`RefactoringTargetFinding::with_actions`] in the
 /// typical health pipeline or via [`RefactoringTargetFinding::from`] for
 /// fixture and test code.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RefactoringTargetFinding {
     /// Inner refactoring target payload. Flattened on the wire.
@@ -673,7 +742,13 @@ fn build_refactoring_target_actions(target: &RefactoringTarget) -> Vec<Refactori
         comment: None,
     }];
 
-    if target.evidence.is_some() {
+    // A hidden-coupling target has no complexity finding to suppress.
+    if target.evidence.is_some()
+        && !matches!(
+            target.category,
+            RecommendationCategory::ResolveHiddenCoupling
+        )
+    {
         actions.push(RefactoringTargetAction {
             kind: RefactoringTargetActionType::SuppressLine,
             auto_fixable: false,
@@ -708,6 +783,7 @@ const fn category_snake_case(cat: &RecommendationCategory) -> &'static str {
         RecommendationCategory::ExtractComplexFunctions => "extract_complex_functions",
         RecommendationCategory::ExtractDependencies => "extract_dependencies",
         RecommendationCategory::AddTestCoverage => "add_test_coverage",
+        RecommendationCategory::ResolveHiddenCoupling => "resolve_hidden_coupling",
     }
 }
 
@@ -732,6 +808,8 @@ mod hotspot_target_tests {
             complexity_density: 1.5,
             fan_in: 3,
             trend: ChurnTrend::Stable,
+            median_files_per_commit: None,
+            median_lines_per_commit: None,
             ownership: None,
             is_test_path: false,
         }
@@ -1055,6 +1133,7 @@ mod hotspot_target_tests {
             RecommendationCategory::ExtractComplexFunctions,
             RecommendationCategory::ExtractDependencies,
             RecommendationCategory::AddTestCoverage,
+            RecommendationCategory::ResolveHiddenCoupling,
         ];
         for cat in &variants {
             let via_serde = serde_json::to_value(cat).expect("category should serialize");
@@ -1067,5 +1146,78 @@ mod hotspot_target_tests {
                 "category_snake_case for {cat:?} drifted from serde rename_all",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod crap_action_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_coverage_redirects_to_the_owning_component() {
+        let owner = Path::new("src/host.component.ts");
+        let action = build_crap_coverage_action("<template>", None, true, Some(owner))
+            .expect("an inherited-coverage finding gets an action");
+        assert!(matches!(
+            action.kind,
+            HealthFindingActionType::IncreaseCoverage
+        ));
+        assert_eq!(action.target_path.as_deref(), Some("src/host.component.ts"));
+    }
+
+    #[test]
+    fn a_real_function_with_no_coverage_still_gets_add_tests() {
+        let action = build_crap_coverage_action("parseExpression", None, true, None)
+            .expect("an untested function gets an action");
+        assert!(matches!(action.kind, HealthFindingActionType::AddTests));
+    }
+
+    #[test]
+    fn snippet_units_on_svelte_route_to_the_sfc_suppress_comment() {
+        let mut violation = crate::ComplexityViolation {
+            path: std::path::PathBuf::from("src/Widget.svelte"),
+            name: "<snippet:rowBody>".to_string(),
+            line: 12,
+            col: 2,
+            cyclomatic: 16,
+            standard_cyclomatic: None,
+            cognitive: 13,
+            line_count: 20,
+            param_count: 0,
+            react_hook_count: 0,
+            react_jsx_max_depth: 0,
+            react_prop_count: 0,
+            react_hook_profile: None,
+            exceeded: ExceededThreshold::Cognitive,
+            severity: crate::FindingSeverity::Moderate,
+            effective_severity: None,
+            crap: None,
+            mutation: None,
+            coverage_pct: None,
+            coverage_tier: None,
+            coverage_source: None,
+            inherited_from: None,
+            component_rollup: None,
+            contributions: Vec::new(),
+            effective_thresholds: None,
+            threshold_source: None,
+        };
+        let action = build_suppress_action(&violation, true, false);
+        assert_eq!(
+            action.comment.as_deref(),
+            Some(SFC_TEMPLATE_SUPPRESS_COMMENT),
+            "a // comment is rendered text in Svelte markup and suppresses nothing"
+        );
+        assert_eq!(
+            action.placement.as_deref(),
+            Some("above-template-anchor-line")
+        );
+
+        violation.name = "<template>".to_string();
+        let template_action = build_suppress_action(&violation, true, false);
+        assert_eq!(
+            template_action.placement.as_deref(),
+            Some("above-template-anchor-line")
+        );
     }
 }

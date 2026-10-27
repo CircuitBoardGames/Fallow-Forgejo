@@ -44,6 +44,10 @@
         "section": "community"
       },
       {
+        "path": "GOVERNANCE.md",
+        "section": "community"
+      },
+      {
         "path": "ROADMAP.md",
         "section": "roadmap"
       },
@@ -86,11 +90,27 @@
         "section": "development"
       },
       {
+        "path": "docs/development/release-procedure.md",
+        "section": "development"
+      },
+      {
         "path": "docs/development/release-security.md",
         "section": "development"
       },
       {
+        "path": "docs/development/dependency-updates.md",
+        "section": "development"
+      },
+      {
+        "path": "docs/development/drift-contract.md",
+        "section": "development"
+      },
+      {
         "path": "docs/analyzer-authoring.md",
+        "section": "architecture"
+      },
+      {
+        "path": "docs/architecture.md",
         "section": "architecture"
       },
       {
@@ -119,6 +139,10 @@
       },
       {
         "path": "docs/fallow-core-migration.md",
+        "section": "architecture"
+      },
+      {
+        "path": "docs/mutation-testing.md",
         "section": "architecture"
       },
       {
@@ -166,6 +190,10 @@
         "section": "verification"
       },
       {
+        "path": "docs/similar-code-analysis.md",
+        "section": "architecture"
+      },
+      {
         "path": "docs/styling-corpus-smoke.md",
         "section": "styling"
       },
@@ -202,6 +230,11 @@
     "checkCommand": "npm run check:agent-adapters"
   },
   "hostRules": [
+    {
+      "client": "shared",
+      "root": ".agents/rules",
+      "mode": "scoped-router"
+    },
     {
       "client": "claude",
       "root": ".claude/rules",
@@ -243,7 +276,7 @@
       "role": "portable-public-skill-packaging",
       "direction": "canonical-contract-to-public-consumer",
       "revisionSource": "source-lock.json#commit",
-      "allowedRoot": "npm/fallow/skills/fallow",
+      "allowedRoot": "npm/fallow/skills",
       "processor": {
         "kind": "validator",
         "entrypoint": "scripts/check-source-contract.mjs"

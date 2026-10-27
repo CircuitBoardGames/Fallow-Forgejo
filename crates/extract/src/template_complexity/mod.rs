@@ -351,10 +351,27 @@ fn mask_ranges(source: &str, regex: &regex::Regex) -> String {
 
 /// Shared emission shape for every framework template scanner: drop the
 /// trivial baseline, anchor the finding at the first non-trivial expression,
-/// and produce the synthetic `<template>` [`FunctionComplexity`].
+/// and produce the synthetic `<template>` [`FunctionComplexity`] whose
+/// `line_count` is the whole file's line count.
 pub(in crate::template_complexity) fn build_template_complexity(
     source: &str,
     complexity: &TemplateComplexity,
+) -> Option<FunctionComplexity> {
+    build_unit_complexity(source, complexity, "<template>", None)
+}
+
+/// Emission shape shared by [`build_template_complexity`] and the Svelte
+/// snippet units: drop the trivial baseline, anchor at the first
+/// non-trivial expression, and produce a synthetic [`FunctionComplexity`]
+/// named `name`. `region` is the unit's byte span in `source` (a
+/// `{#snippet}`..`{/snippet}` block) and drives its `line_count`; `None`
+/// keeps the whole-file line count the `<template>` unit has always
+/// reported.
+pub(in crate::template_complexity) fn build_unit_complexity(
+    source: &str,
+    complexity: &TemplateComplexity,
+    name: &str,
+    region: Option<std::ops::Range<usize>>,
 ) -> Option<FunctionComplexity> {
     if complexity.cyclomatic == 1 && complexity.cognitive == 0 {
         return None;
@@ -363,7 +380,20 @@ pub(in crate::template_complexity) fn build_template_complexity(
     let line_offsets = compute_line_offsets(source);
     let first_offset = u32::try_from(complexity.first_offset.unwrap_or(0)).unwrap_or(u32::MAX);
     let (line, col) = byte_offset_to_line_col(&line_offsets, first_offset);
-    let line_count = u32::try_from(source.lines().count()).unwrap_or(u32::MAX);
+    let line_count = region.map_or_else(
+        || u32::try_from(source.lines().count()).unwrap_or(u32::MAX),
+        |region| {
+            let (start_line, _) = byte_offset_to_line_col(
+                &line_offsets,
+                u32::try_from(region.start).unwrap_or(u32::MAX),
+            );
+            let (end_line, _) = byte_offset_to_line_col(
+                &line_offsets,
+                u32::try_from(region.end.saturating_sub(1)).unwrap_or(u32::MAX),
+            );
+            end_line.saturating_sub(start_line).saturating_add(1)
+        },
+    );
 
     // The scanners record in scan order, which is source order for the outer
     // markup walk but not within an expression that recurses into brackets or
@@ -383,13 +413,16 @@ pub(in crate::template_complexity) fn build_template_complexity(
                 kind: raw.kind,
                 weight: raw.weight,
                 nesting: raw.nesting,
+                literal_membership: false,
             }
         })
         .collect();
     contributions.sort_by_key(|contribution| (contribution.line, contribution.col));
 
     Some(FunctionComplexity {
-        name: "<template>".to_string(),
+        name: name.to_string(),
+        is_private_member: false,
+        context_named: None,
         line,
         col,
         cyclomatic: complexity.cyclomatic,
@@ -526,6 +559,7 @@ mod tests {
 {/if}
 ",
         )
+        .pop()
         .expect("svelte template should have complexity");
         assert_breakdown_explains_totals(&svelte, "svelte");
 
@@ -549,6 +583,7 @@ mod tests {
 </div>
 ",
         )
+        .pop()
         .expect("svelte template should have complexity");
 
         assert!(!complexity.contributions.is_empty());
@@ -584,6 +619,36 @@ mod tests {
 
         assert!(complexity.cyclomatic >= 8, "{complexity:?}");
         assert!(complexity.cognitive >= 5, "{complexity:?}");
+    }
+
+    /// Issue #2798: an operator inside a `${}` interpolation of a bound
+    /// template literal counts like the same operator outside the literal.
+    #[test]
+    fn angular_template_literal_interpolation_counts() {
+        let bare = compute_angular_template_complexity(
+            r#"<span [title]="isReady ? label : suffix"></span>"#,
+        )
+        .expect("bare ternary should have complexity");
+        let interpolated = compute_angular_template_complexity(
+            r#"<span [title]="`a ${ isReady ? label : suffix } b`"></span>"#,
+        )
+        .expect("interpolated ternary should have complexity");
+        assert_eq!(
+            (interpolated.cyclomatic, interpolated.cognitive),
+            (bare.cyclomatic, bare.cognitive)
+        );
+        assert_eq!((interpolated.cyclomatic, interpolated.cognitive), (2, 1));
+
+        let logical = compute_angular_template_complexity(
+            r#"<span [title]="`a ${ isReady && label } b`"></span>"#,
+        )
+        .expect("interpolated logical operator should have complexity");
+        assert_eq!(logical.cyclomatic, 2, "{logical:?}");
+
+        assert!(
+            compute_angular_template_complexity(r#"<span [title]="`a && b ? c : d`"></span>"#)
+                .is_none()
+        );
     }
 
     #[test]

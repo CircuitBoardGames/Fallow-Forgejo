@@ -77,7 +77,7 @@ test("resolveSentinelPath falls back to FALLOW_VERIFY_CACHE_DIR when platform pk
   const cacheDir = mkTmp();
   try {
     const result = resolveSentinelPath({
-      platformPkgDir: "/dev/null/not-a-dir",
+      platformPkgDir: path.join(cacheDir, "missing-platform-package"),
       packageName: "@fallow-cli/darwin-arm64",
       env: { FALLOW_VERIFY_CACHE_DIR: cacheDir },
     });
@@ -89,10 +89,7 @@ test("resolveSentinelPath falls back to FALLOW_VERIFY_CACHE_DIR when platform pk
   }
 });
 
-test("resolveSentinelPath honors FALLOW_VERIFY_CACHE_DIR even when platform pkg dir IS writable", () => {
-  // Per the cascade documented in the source, the platform pkg dir wins when
-  // writable. The cache-dir env is the FALLBACK for when the platform dir is
-  // read-only. We pass a non-existent platform dir to force the fallback.
+test("resolveSentinelPath uses FALLOW_VERIFY_CACHE_DIR when platform pkg dir is unset", () => {
   const cacheDir = mkTmp();
   try {
     const result = resolveSentinelPath({
@@ -220,12 +217,19 @@ test("resolveSentinelPath honors injected isWritable + ensureDir for full test i
 test("resolveSentinelPath skips cache-dir-env when ensureDir fails for it", () => {
   // FALLOW_VERIFY_CACHE_DIR points at a non-creatable path, XDG points at a
   // creatable one. Confirm the resolver moves past the env override.
+  //
+  // A directory nested under a regular FILE is the portable way to make mkdir
+  // fail: `/dev/null/inside/a/file` only refuses on POSIX, and on Windows the
+  // recursive mkdir succeeds against the current drive, which both defeats the
+  // assertion and creates C:\dev outside any temp directory.
   const homeDir = mkTmp();
+  const blocker = path.join(homeDir, "not-a-directory");
+  fs.writeFileSync(blocker, "");
   try {
     const result = resolveSentinelPath({
       platformPkgDir: undefined,
       packageName: "@fallow-cli/darwin-arm64",
-      env: { FALLOW_VERIFY_CACHE_DIR: "/dev/null/inside/a/file" },
+      env: { FALLOW_VERIFY_CACHE_DIR: path.join(blocker, "inside", "a", "file") },
       homedir: homeDir,
       platform: "darwin",
     });

@@ -2,17 +2,26 @@
     clippy::unwrap_used,
     reason = "benches use unwrap and expect to keep fixture setup concise"
 )]
+#![allow(
+    clippy::significant_drop_tightening,
+    reason = "the external Criterion macro owns the benchmark lifecycle"
+)]
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use fallow_cli::report::{
+    github_annotations::EnvelopeKind,
+    github_summary::{LinkContext, render_summary},
+};
 use fallow_output::{
     CiIssue, CiProvider, ExplainOutput, InspectEvidence, InspectEvidenceScope,
     InspectEvidenceSection, InspectFileIdentity, InspectIdentity, InspectOutput,
-    InspectTargetDescriptor, PrCommentRenderInput, RootEnvelopeMode, render_pr_comment,
+    InspectTargetDescriptor, PrCommentRenderInput, render_pr_comment,
     serialize_explain_json_output, serialize_inspect_json_output,
 };
 use serde_json::json;
 
 const ISSUE_COUNT: usize = 250;
+const SAVED_REPORT_FINDING_COUNT: usize = 1_000;
 
 fn create_ci_issues() -> Vec<CiIssue> {
     (0..ISSUE_COUNT)
@@ -26,7 +35,10 @@ fn create_ci_issues() -> Vec<CiIssue> {
             severity: if index % 5 == 0 { "major" } else { "minor" }.to_string(),
             path: format!("src/module-{}.ts", index % 40),
             line: u64::try_from(index + 1).unwrap(),
+            end_line: None,
+            other_locations: Vec::new(),
             fingerprint: format!("fp-{index:04}"),
+            legacy_fingerprint: None,
         })
         .collect()
 }
@@ -47,7 +59,7 @@ fn create_explain_output() -> ExplainOutput {
         rationale: "Unused exports increase maintenance cost.".to_string(),
         example: "export const unused = true;".to_string(),
         how_to_fix: "Remove the export or reference it from an entry point.".to_string(),
-        docs: "https://docs.fallow.tools/rules/unused-export".to_string(),
+        docs: "https://fallow.tools/docs/explanations/dead-code/#unused-exports".to_string(),
     }
 }
 
@@ -88,6 +100,27 @@ fn create_inspect_output() -> InspectOutput {
     }
 }
 
+fn create_saved_dead_code_envelope() -> serde_json::Value {
+    let unused_exports = (0..SAVED_REPORT_FINDING_COUNT)
+        .map(|index| {
+            json!({
+                "path": format!("src/module-{}.ts", index % 200),
+                "line": index + 1,
+                "col": index % 80,
+                "export_name": format!("unusedExport{index}"),
+                "is_re_export": index % 5 == 0,
+                "is_type_only": index % 7 == 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "kind": "dead-code",
+        "elapsed_ms": 125,
+        "total_issues": SAVED_REPORT_FINDING_COUNT,
+        "unused_exports": unused_exports,
+    })
+}
+
 fn component_output_pr_comment_render(c: &mut Criterion) {
     c.bench_function("component_output_pr_comment_render", |bencher| {
         bencher.iter_batched_ref(
@@ -100,6 +133,7 @@ fn component_output_pr_comment_render(c: &mut Criterion) {
                     marker_id: "bench".to_string(),
                     max_comments: 50,
                     category_for_rule: &category_for_rule,
+                    trailing_section: None,
                 })
             },
             BatchSize::LargeInput,
@@ -111,10 +145,7 @@ fn component_output_explain_json_serialize(c: &mut Criterion) {
     c.bench_function("component_output_explain_json_serialize", |bencher| {
         bencher.iter_batched(
             create_explain_output,
-            |output| {
-                serialize_explain_json_output(output, RootEnvelopeMode::Tagged, Some("bench-run"))
-                    .unwrap()
-            },
+            |output| serialize_explain_json_output(output, Some("bench-run")).unwrap(),
             BatchSize::SmallInput,
         );
     });
@@ -124,19 +155,40 @@ fn component_output_inspect_json_serialize(c: &mut Criterion) {
     c.bench_function("component_output_inspect_json_serialize", |bencher| {
         bencher.iter_batched(
             create_inspect_output,
-            |output| {
-                serialize_inspect_json_output(output, RootEnvelopeMode::Tagged, Some("bench-run"))
-                    .unwrap()
-            },
+            |output| serialize_inspect_json_output(output, Some("bench-run")).unwrap(),
             BatchSize::SmallInput,
         );
     });
+}
+
+fn component_output_saved_report_github_summary(c: &mut Criterion) {
+    let source = serde_json::to_string(&create_saved_dead_code_envelope()).unwrap();
+    let links = LinkContext::default();
+    c.bench_function("component_output_saved_report_github_summary", |bencher| {
+        bencher.iter(|| {
+            let envelope = serde_json::from_str(&source).unwrap();
+            render_summary(EnvelopeKind::DeadCode, &envelope, &links)
+        });
+    });
+}
+
+fn component_output_dead_code_github_summary_render(c: &mut Criterion) {
+    let envelope = create_saved_dead_code_envelope();
+    let links = LinkContext::default();
+    c.bench_function(
+        "component_output_dead_code_github_summary_render",
+        |bencher| {
+            bencher.iter(|| render_summary(EnvelopeKind::DeadCode, &envelope, &links));
+        },
+    );
 }
 
 criterion_group!(
     benches,
     component_output_pr_comment_render,
     component_output_explain_json_serialize,
-    component_output_inspect_json_serialize
+    component_output_inspect_json_serialize,
+    component_output_saved_report_github_summary,
+    component_output_dead_code_github_summary_render
 );
 criterion_main!(benches);

@@ -33,24 +33,30 @@ TYPE_AWARE_BENCH = REPO_ROOT / "tools" / "type-aware-sidecar" / "bench" / "sessi
 TYPE_AWARE_MANIFEST = REPO_ROOT / "tools" / "type-aware-sidecar" / "package.json"
 MAX_BENCHES_PER_SHARD = 1_000
 NOISY_FAST_TARGETS = {
-    ("fallow-benchmarks", "programmatic_commands"),
     ("fallow-core", "scaling_analysis"),
-    ("fallow-core", "large_analysis"),
     ("fallow-engine", "dupes_pipeline"),
+}
+LOCAL_ONLY_TARGETS = {
+    ("fallow-benchmarks", "programmatic_commands"),
+    ("fallow-core", "large_analysis"),
 }
 REQUIRED_FAST_TARGETS = {
     ("fallow-core", "analysis"),
+    ("fallow-core", "entry_point_discovery"),
     ("fallow-engine", "dupes_detect"),
+    ("fallow-engine", "similar_code"),
     ("fallow-benchmarks", "programmatic_stable"),
     ("fallow-benchmarks", "representative_sources"),
+    ("fallow-benchmarks", "component_cache"),
     ("fallow-benchmarks", "component_config"),
     ("fallow-benchmarks", "component_engine"),
     ("fallow-benchmarks", "component_graph"),
     ("fallow-benchmarks", "component_output"),
+    ("fallow-benchmarks", "lsp_save_publish"),
 }
 REQUIRED_FULL_TARGETS = {
     ("fallow-core", "scaling_analysis"),
-    ("fallow-core", "large_analysis"),
+    ("fallow-engine", "dupes_pipeline"),
 }
 
 
@@ -277,6 +283,9 @@ def validate_targets(targets: list[BenchTarget]) -> list[str]:
         if target.job == FAST_JOB and key in NOISY_FAST_TARGETS:
             errors.append(f"noisy target {target.package}/{target.bench} cannot run in fast PR job")
 
+        if key in LOCAL_ONLY_TARGETS:
+            errors.append(f"local-only target {target.package}/{target.bench} cannot run in CodSpeed CI")
+
         if target.bench == "programmatic_stable":
             unstable = [name for name in names if not name.startswith("stable_")]
             if unstable:
@@ -317,6 +326,56 @@ def validate_unique_names() -> list[str]:
     return errors
 
 
+# Rayon splits work adaptively when a thread steals a job, so more than one
+# thread makes simulated instruction counts differ between runs of the same
+# code. Simulation jobs pin one thread, and benches take their thread count
+# from the shared helper that follows RAYON_NUM_THREADS.
+THREAD_HELPER = REPO_ROOT / "crates" / "benchmarks" / "benches" / "support" / "threads.rs"
+LITERAL_THREAD_COUNT = re.compile(
+    r"threads:\s*Some\(\s*\d|num_threads\(\s*\d|const\s+\w*THREADS\w*\s*:\s*usize\s*=\s*\d"
+)
+# `FallowConfig::resolve` takes the thread count as its third positional
+# argument, and the call often spans several lines. `load_default` picks
+# `available_parallelism()` for the file walk.
+LITERAL_RESOLVE_THREADS = re.compile(r"OutputFormat::\w+\s*,\s*\d+\s*,")
+DEFAULT_PARALLELISM_LOAD = re.compile(r"AnalysisSession::load_default\(")
+
+
+def job_block(text: str, job: str) -> str:
+    match = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  \S|\Z)", text, re.M | re.S)
+    return match.group(1) if match else ""
+
+
+def validate_thread_determinism(text: str) -> list[str]:
+    errors = []
+    for job in (FAST_JOB, FULL_JOB):
+        if not re.search(r'^\s+RAYON_NUM_THREADS:\s*"1"\s*$', job_block(text, job), re.M):
+            errors.append(f'{job} must set RAYON_NUM_THREADS: "1" for stable simulation counts')
+    for path in sorted((REPO_ROOT / "crates").glob("*/benches/**/*.rs")):
+        if path == THREAD_HELPER:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), 1):
+            if LITERAL_THREAD_COUNT.search(line):
+                errors.append(
+                    f"{path.relative_to(REPO_ROOT)}:{number} sets a literal thread count; "
+                    "use bench_threads() from benches/support/threads.rs"
+                )
+        for match in LITERAL_RESOLVE_THREADS.finditer(text):
+            number = text.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"{path.relative_to(REPO_ROOT)}:{number} passes a literal thread count to "
+                "resolve(); use bench_threads() from benches/support/threads.rs"
+            )
+        for match in DEFAULT_PARALLELISM_LOAD.finditer(text):
+            number = text.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"{path.relative_to(REPO_ROOT)}:{number} loads a session with all CPU threads; "
+                "use load_default_with_config and set threads to bench_threads()"
+            )
+    return errors
+
+
 def main() -> int:
     text = BENCH_WORKFLOW.read_text(encoding="utf-8")
     if not TYPE_AWARE_WORKFLOW.is_file():
@@ -337,6 +396,7 @@ def main() -> int:
     errors.extend(validate_targets(targets))
     errors.extend(validate_required_targets(targets))
     errors.extend(validate_unique_names())
+    errors.extend(validate_thread_determinism(text))
     errors.extend(validate_type_aware_benchmark(type_aware_text))
 
     if not any(target.job == FAST_JOB for target in targets):

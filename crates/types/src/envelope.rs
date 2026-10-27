@@ -69,7 +69,12 @@ pub struct ElapsedMs(pub u64);
 /// Audit-mode marker emitted on each finding when `fallow audit --format json`
 /// runs with a base ref. `true` means the finding's structural key was not
 /// present at the base ref (introduced by the current changeset); `false`
-/// means it was inherited.
+/// means it was inherited. Duplication findings carry one carve-out: a clone
+/// group whose structural key is new but whose instances contain no added line
+/// from the diff (a group re-shaped by removing duplication elsewhere) is
+/// demoted to inherited and serializes `false` (issue #2164). Such demoted
+/// groups additionally carry a `demotion_reason` field naming the rule, and
+/// are counted in `attribution.duplication_demoted` (issue #2220).
 ///
 /// Outside of audit sub-results the field is omitted, so call sites typically
 /// hold `Option<AuditIntroduced>`. Renders to the JSON wire as a bare boolean.
@@ -91,6 +96,14 @@ pub struct EntryPoints {
     pub sources: BTreeMap<String, usize>,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a reference"
+)]
+const fn zero_count(count: &usize) -> bool {
+    *count == 0
+}
+
 /// Per-category issue counts for dead-code analysis. Always present in
 /// `CheckOutput`; when `--summary` is used the individual issue arrays are
 /// omitted but this object stays populated.
@@ -99,6 +112,15 @@ pub struct EntryPoints {
 pub struct CheckSummary {
     /// Total number of issues across all categories.
     pub total_issues: usize,
+    /// Prop chains whose saved effective severity explicitly enforces error policy.
+    #[serde(default, skip_serializing_if = "zero_count")]
+    pub prop_drilling_chains: usize,
+    /// Thin wrappers whose saved effective severity explicitly enforces error policy.
+    #[serde(default, skip_serializing_if = "zero_count")]
+    pub thin_wrappers: usize,
+    /// Duplicate prop shapes whose saved effective severity explicitly enforces error policy.
+    #[serde(default, skip_serializing_if = "zero_count")]
+    pub duplicate_prop_shapes: usize,
     /// Unused source files.
     pub unused_files: usize,
     /// Unused value exports.
@@ -107,6 +129,8 @@ pub struct CheckSummary {
     pub unused_types: usize,
     /// Public exports whose signature references same-file private types.
     pub private_type_leaks: usize,
+    /// Exports marked `@deprecated` that are still referenced.
+    pub deprecated_exports_in_use: usize,
     /// Combined count of unused entries across `dependencies`,
     /// `devDependencies`, and `optionalDependencies`. The per-section
     /// breakdown lives in the individual issue arrays on `CheckOutput`.
@@ -127,6 +151,9 @@ pub struct CheckSummary {
     /// Vue, Svelte, or React props referenced nowhere inside their own component.
     #[serde(default)]
     pub unused_component_props: usize,
+    /// Optional consumed props omitted by known reachable callers, for manual review.
+    #[serde(default)]
+    pub absent_component_props: usize,
     /// Vue `<script setup>` emits emitted nowhere inside their own SFC.
     #[serde(default)]
     pub unused_component_emits: usize,
@@ -140,6 +167,15 @@ pub struct CheckSummary {
     /// whose name is listened to nowhere in the project.
     #[serde(default)]
     pub unused_svelte_events: usize,
+    /// Effect layers composed only into layers that nothing uses.
+    #[serde(default)]
+    pub unused_effect_layers: usize,
+    /// Effect tagged error classes that no code constructs or fails with.
+    #[serde(default)]
+    pub unused_tagged_errors: usize,
+    /// `catchTag` handlers for a project tag that no code produces.
+    #[serde(default)]
+    pub unproduced_catch_tags: usize,
     /// Next.js Server Actions (exports of `"use server"` files) referenced by no
     /// code in the project.
     #[serde(default)]
@@ -168,6 +204,9 @@ pub struct CheckSummary {
     /// re-exporting from each other in a loop).
     #[serde(default)]
     pub re_export_cycles: usize,
+    /// Dependency cycles between workspace packages.
+    #[serde(default)]
+    pub package_cycles: usize,
     /// Imports that cross architecture boundary rules.
     pub boundary_violations: usize,
     /// Files that match no architecture boundary zone.
@@ -189,10 +228,10 @@ pub struct CheckSummary {
     /// Workspace package.json catalog references the workspace catalogs
     /// do not declare.
     pub unresolved_catalog_references: usize,
-    /// Pnpm `overrides:` entries whose target package is not declared by any
-    /// workspace package and not present in the lockfile.
+    /// Package-manager overrides whose target package is not declared by any
+    /// workspace package and not present in the active readable lockfile.
     pub unused_dependency_overrides: usize,
-    /// Pnpm `overrides:` entries whose key or value cannot be parsed.
+    /// Package-manager overrides whose key or value cannot be parsed.
     pub misconfigured_dependency_overrides: usize,
     /// `"use client"` files that export a Next.js server-only / route-config name.
     #[serde(default)]
@@ -332,7 +371,7 @@ pub struct Meta {
 }
 
 /// Bounded provenance emitted when the opt-in type-aware pass runs.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TypeAwareMeta {
     /// Compatibility identity used by audit, baselines, snapshots, and stores.
@@ -416,7 +455,7 @@ pub enum TypeAwareAbstentionReason {
 }
 
 /// Closed abstention reason counts for stable machine consumption.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TypeAwareAbstentionCounts {
     /// Candidates not contained by a selected TypeScript project.
@@ -425,6 +464,9 @@ pub struct TypeAwareAbstentionCounts {
     pub ambiguous_project: usize,
     /// Candidates retained because structural diagnostics block scanning.
     pub blocking_diagnostics: usize,
+    /// Candidates retained because the raw TypeScript-Go host cannot expose
+    /// named exports from Svelte virtual modules.
+    pub svelte_virtual_module_exports: usize,
     /// Candidates whose exact declaration identity could not be resolved.
     pub unknown_symbol: usize,
     /// Candidates using declaration syntax unsupported by the semantic backend.
@@ -475,7 +517,7 @@ pub enum TypeAwareInvalidationKind {
 }
 
 /// Semantic sidecar timings, separated from Fallow's syntactic pipeline.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TypeAwarePhaseTimings {
     /// TypeScript API construction and project snapshot selection.
@@ -487,7 +529,7 @@ pub struct TypeAwarePhaseTimings {
 }
 
 /// Bounded provenance for one TypeScript project handled by the sidecar.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TypeAwareProjectMeta {
     /// Project config relative to the analysis root, or `<inferred>`.

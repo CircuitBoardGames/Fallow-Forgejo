@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use fallow_config::RulesConfig;
 #[cfg(test)]
 use fallow_config::Severity;
+use fallow_config::{OutputFormat, RulesConfig};
 use fallow_output::{
     CodeClimateAnnotationField, CodeClimateIssue, CodeClimateIssueKind, CodeClimateLines,
     CodeClimateLocation, CodeClimateSeverity, HealthReport, annotate_codeclimate_issues,
@@ -36,6 +36,9 @@ pub fn rebase_codeclimate_paths(issues: &mut [CodeClimateIssue]) {
     }
     for issue in issues {
         issue.location.path = fallow_output::apply_path_prefix(prefix, &issue.location.path);
+        for location in &mut issue.other_locations {
+            location.path = fallow_output::apply_path_prefix(prefix, &location.path);
+        }
     }
 }
 
@@ -57,13 +60,24 @@ pub fn print_envelope_codeclimate_with_config(
     config_path: Option<&Path>,
     resolver: Option<&OwnershipResolver>,
 ) -> ExitCode {
-    emit_codeclimate(envelope_codeclimate_issues_with_context(
+    let issues = match envelope_codeclimate_issues_with_config(
         kind,
         envelope,
         root,
         config_path,
         resolver,
-    ))
+    ) {
+        Ok(issues) => issues,
+        Err(error) => {
+            return crate::emit_known_failure(
+                &error,
+                2,
+                OutputFormat::CodeClimate,
+                crate::telemetry::FailureReason::Validation,
+            );
+        }
+    };
+    emit_codeclimate(issues)
 }
 
 #[cfg(test)]
@@ -72,37 +86,59 @@ fn envelope_codeclimate_issues(
     envelope: &serde_json::Value,
     root: &Path,
 ) -> Vec<CodeClimateIssue> {
-    envelope_codeclimate_issues_with_config(kind, envelope, root, None)
+    envelope_codeclimate_issues_with_config(kind, envelope, root, None, None)
+        .expect("test envelope should reconstruct as CodeClimate issues")
 }
 
-#[cfg(test)]
-fn envelope_codeclimate_issues_with_config(
+/// Reconstruct the typed CodeClimate issues stored in a saved native envelope.
+///
+/// Paths remain analysis-root-relative here. Presentation renderers apply the
+/// repository prefix once at their existing output boundary.
+pub fn envelope_codeclimate_issues_with_config(
     kind: EnvelopeKind,
     envelope: &serde_json::Value,
     root: &Path,
     config_path: Option<&Path>,
-) -> Vec<CodeClimateIssue> {
-    envelope_codeclimate_issues_with_context(kind, envelope, root, config_path, None)
+    resolver: Option<&OwnershipResolver>,
+) -> Result<Vec<CodeClimateIssue>, String> {
+    validate_saved_schema(kind, envelope)?;
+    match saved_native_codeclimate_issues(kind, envelope, root, config_path, resolver) {
+        Ok(issues) => Ok(issues),
+        Err(native_error)
+            // `architecture` has no legacy schema: it first shipped with its
+            // own envelope, so a saved architecture file is never legacy.
+            if matches!(
+                kind,
+                EnvelopeKind::DeadCode
+                    | EnvelopeKind::Dupes
+                    | EnvelopeKind::Health
+                    | EnvelopeKind::Audit
+                    | EnvelopeKind::Combined
+            ) && saved_schema_is_legacy(kind, envelope) =>
+        {
+            let issues =
+                saved_annotation_codeclimate_issues(kind, envelope, root, config_path, resolver);
+            if issues.is_empty() {
+                Err(native_error)
+            } else {
+                Ok(issues)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn envelope_codeclimate_issues_with_context(
+fn saved_annotation_codeclimate_issues(
     kind: EnvelopeKind,
     envelope: &serde_json::Value,
     root: &Path,
     config_path: Option<&Path>,
     resolver: Option<&OwnershipResolver>,
 ) -> Vec<CodeClimateIssue> {
-    if let Some(issues) =
-        saved_native_codeclimate_issues(kind, envelope, root, config_path, resolver)
-    {
-        return issues;
-    }
     let options = resolve_render_options(root);
     let mut issues = collect_annotations(kind, envelope, options.pm)
         .into_iter()
         .map(|annotation| {
-            // Keep the analysis-root-relative path here. `emit_codeclimate`
-            // applies the process-wide report prefix exactly once.
             let path = annotation.path;
             let line = annotation.line.unwrap_or(1).clamp(1, u64::from(u32::MAX)) as u32;
             let rule_id = super::sarif::native_rule_id(&annotation.title);
@@ -131,21 +167,24 @@ fn envelope_codeclimate_issues_with_context(
                 kind: CodeClimateIssueKind::Issue,
                 check_name: rule_id.clone(),
                 description,
-                categories: vec![native_category(&rule_id).to_string()],
+                categories: vec![native_category(&rule_id).to_owned()],
                 severity,
                 fingerprint,
                 location: CodeClimateLocation {
                     path,
-                    lines: CodeClimateLines { begin: line },
+                    lines: CodeClimateLines {
+                        begin: line,
+                        end: None,
+                    },
                 },
+                other_locations: Vec::new(),
                 owner: None,
                 group: None,
+                legacy_fingerprint: None,
             }
         })
         .collect::<Vec<_>>();
-    if resolver.is_some() {
-        annotate_saved_fallback_grouping(&mut issues, kind, resolver);
-    }
+    annotate_saved_fallback_grouping(&mut issues, kind, resolver);
     issues
 }
 
@@ -155,40 +194,462 @@ fn saved_native_codeclimate_issues(
     root: &Path,
     config_path: Option<&Path>,
     resolver: Option<&OwnershipResolver>,
-) -> Option<Vec<CodeClimateIssue>> {
+) -> Result<Vec<CodeClimateIssue>, String> {
     let rules = super::sarif::saved_report_rules(root, config_path);
     match kind {
-        EnvelopeKind::DeadCode => {
-            let results = serde_json::from_value::<AnalysisResults>(envelope.clone()).ok()?;
+        EnvelopeKind::DeadCode | EnvelopeKind::Architecture => {
+            let mut results =
+                parse_saved_section::<AnalysisResults>(envelope, "dead-code envelope")?;
+            if !saved_schema_is_legacy(kind, envelope) {
+                let declared_total = envelope
+                    .get("total_issues")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        "saved dead-code envelope is missing a non-negative integer `total_issues`"
+                            .to_owned()
+                    })?;
+                let actual_total = u64::try_from(results.total_issues()).unwrap_or(u64::MAX);
+                if declared_total != actual_total {
+                    return Err(format!(
+                        "saved dead-code envelope declares {declared_total} findings but contains {actual_total}"
+                    ));
+                }
+            }
+            // Grouped saved envelopes are flattened in group order. Restore the
+            // analyzer's canonical order before building any presentation surface
+            // so owner/section grouping cannot reorder otherwise identical findings.
+            results.sort();
             let mut issues = api_codeclimate_issues(&results, root, &rules);
             annotate_dead_code_owner(&mut issues, resolver);
-            Some(issues)
+            Ok(issues)
         }
         EnvelopeKind::Dupes => {
-            let report = serde_json::from_value::<DuplicationReport>(envelope.clone()).ok()?;
+            let report = parse_saved_section::<DuplicationReport>(envelope, "dupes envelope")?;
             let mut issues = api_duplication_codeclimate_issues(&report, root);
             annotate_duplication_groups(&mut issues, &report, root, resolver);
-            Some(issues)
+            Ok(issues)
         }
         EnvelopeKind::Health => {
-            let report = fallow_output::health_report_from_saved_value(envelope)?;
+            let report =
+                fallow_output::health_report_from_saved_value(envelope).ok_or_else(|| {
+                    "saved health envelope is incompatible with this Fallow version".to_owned()
+                })?;
             let mut issues = api_health_codeclimate_issues(&report, root);
             annotate_health_groups(&mut issues, resolver);
-            Some(issues)
+            Ok(issues)
         }
-        EnvelopeKind::Audit => saved_multi_analysis_codeclimate(
-            envelope,
-            root,
-            &rules,
-            "/dead_code",
-            "/duplication",
-            "/complexity",
+        EnvelopeKind::Audit => {
+            let mut issues = saved_multi_analysis_codeclimate(
+                envelope,
+                root,
+                &rules,
+                "/dead_code",
+                "/duplication",
+                "/complexity",
+                resolver,
+            )?;
+            if let Some(diff_risk) =
+                parse_optional_section::<fallow_output::DiffRiskReport>(envelope, "/diff_risk")?
+            {
+                issues.extend(fallow_api::build_diff_risk_codeclimate(&diff_risk));
+            }
+            Ok(issues)
+        }
+        EnvelopeKind::Combined => saved_multi_analysis_codeclimate(
+            envelope, root, &rules, "/check", "/dupes", "/health", resolver,
         ),
-        EnvelopeKind::Combined => {
-            saved_multi_analysis_codeclimate(envelope, root, &rules, "/check", "/dupes", "/health")
+        EnvelopeKind::Fix => Ok(Vec::new()),
+        EnvelopeKind::Security => Err(format!(
+            "saved {} envelopes cannot be rendered as CodeClimate issues",
+            envelope_kind_label(kind)
+        )),
+    }
+}
+
+pub fn validate_saved_schema(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(value) = envelope.get("schema_version") else {
+        // Early Fallow envelopes did not consistently carry a schema version.
+        // Their typed shape remains the compatibility check below.
+        return Ok(());
+    };
+    let Some(version) = value.as_u64() else {
+        return Err(format!(
+            "saved {} envelope has a non-numeric `schema_version`",
+            envelope_kind_label(kind)
+        ));
+    };
+    let Some(current) = current_schema_version(kind) else {
+        return Ok(());
+    };
+    if version == 0 || version > u64::from(current) {
+        return Err(format!(
+            "unsupported saved {} schema version {version}; this Fallow version supports versions 1 through {current}",
+            envelope_kind_label(kind)
+        ));
+    }
+    if version == u64::from(current) {
+        validate_current_saved_envelope(kind, envelope)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SavedFieldType {
+    Array,
+    Boolean,
+    Object,
+    String,
+    UnsignedInteger,
+}
+
+impl SavedFieldType {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Array => "an array",
+            Self::Boolean => "a boolean",
+            Self::Object => "an object",
+            Self::String => "a string",
+            Self::UnsignedInteger => "a non-negative integer",
         }
+    }
+
+    fn matches(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::Array => value.is_array(),
+            Self::Boolean => value.is_boolean(),
+            Self::Object => value.is_object(),
+            Self::String => value.is_string(),
+            Self::UnsignedInteger => value.as_u64().is_some(),
+        }
+    }
+}
+
+fn require_saved_field<'a>(
+    kind: EnvelopeKind,
+    object: &'a serde_json::Value,
+    field: &str,
+    field_type: SavedFieldType,
+) -> Result<&'a serde_json::Value, String> {
+    let Some(value) = object.get(field) else {
+        return Err(format!(
+            "saved {} envelope is missing required field `{field}`",
+            envelope_kind_label(kind)
+        ));
+    };
+    if !field_type.matches(value) {
+        return Err(format!(
+            "saved {} envelope field `{field}` must be {}",
+            envelope_kind_label(kind),
+            field_type.label()
+        ));
+    }
+    Ok(value)
+}
+
+fn require_saved_nested_field(
+    kind: EnvelopeKind,
+    object: &serde_json::Value,
+    object_name: &str,
+    field: &str,
+    field_type: SavedFieldType,
+) -> Result<(), String> {
+    let Some(value) = object.get(field) else {
+        return Err(format!(
+            "saved {} envelope is missing required field `{object_name}.{field}`",
+            envelope_kind_label(kind)
+        ));
+    };
+    if !field_type.matches(value) {
+        return Err(format!(
+            "saved {} envelope field `{object_name}.{field}` must be {}",
+            envelope_kind_label(kind),
+            field_type.label()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_current_saved_envelope(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+) -> Result<(), String> {
+    crate::report::ci::saved_type_aware_metadata(envelope)?;
+    require_saved_field(kind, envelope, "version", SavedFieldType::String)?;
+    require_saved_field(
+        kind,
+        envelope,
+        "elapsed_ms",
+        SavedFieldType::UnsignedInteger,
+    )?;
+
+    match kind {
+        EnvelopeKind::DeadCode | EnvelopeKind::Architecture => {
+            validate_current_dead_code_envelope(kind, envelope)?;
+        }
+        EnvelopeKind::Dupes => validate_current_duplication_payload(envelope)?,
+        EnvelopeKind::Health => validate_current_health_payload(envelope)?,
+        EnvelopeKind::Audit => {
+            validate_current_audit_envelope(kind, envelope)?;
+            validate_current_analysis_sections(
+                kind,
+                envelope,
+                &[
+                    ("/dead_code", EnvelopeKind::DeadCode),
+                    ("/duplication", EnvelopeKind::Dupes),
+                    ("/complexity", EnvelopeKind::Health),
+                ],
+            )?;
+        }
+        EnvelopeKind::Combined => validate_current_analysis_sections(
+            kind,
+            envelope,
+            &[
+                ("/check", EnvelopeKind::DeadCode),
+                ("/dupes", EnvelopeKind::Dupes),
+                ("/health", EnvelopeKind::Health),
+            ],
+        )?,
+        EnvelopeKind::Security | EnvelopeKind::Fix => {}
+    }
+    Ok(())
+}
+
+fn validate_current_dead_code_envelope(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+) -> Result<(), String> {
+    let declared_total_value = require_saved_field(
+        kind,
+        envelope,
+        "total_issues",
+        SavedFieldType::UnsignedInteger,
+    )?;
+    let declared_total = declared_total_value.as_u64().ok_or_else(|| {
+        "saved dead-code envelope field `total_issues` must be a non-negative integer".to_owned()
+    })?;
+    if envelope
+        .get(crate::cli_report::NORMALIZED_GROUPED_DEAD_CODE_MARKER)
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        require_saved_field(kind, envelope, "summary", SavedFieldType::Object)?;
+    }
+    let results = parse_saved_section::<AnalysisResults>(envelope, "dead-code envelope")?;
+    let actual_total = u64::try_from(results.total_issues()).unwrap_or(u64::MAX);
+    if declared_total != actual_total {
+        return Err(format!(
+            "saved dead-code envelope declares {declared_total} findings but contains {actual_total}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_current_analysis_sections(
+    parent_kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+    sections: &[(&str, EnvelopeKind)],
+) -> Result<(), String> {
+    for &(pointer, section_kind) in sections {
+        let Some(section) = envelope.pointer(pointer) else {
+            continue;
+        };
+        if section.is_null() {
+            continue;
+        }
+        let result = match section_kind {
+            EnvelopeKind::DeadCode => validate_current_dead_code_section(section),
+            EnvelopeKind::Dupes => validate_current_duplication_payload(section),
+            EnvelopeKind::Health => validate_current_health_payload(section),
+            EnvelopeKind::Architecture
+            | EnvelopeKind::Audit
+            | EnvelopeKind::Combined
+            | EnvelopeKind::Security
+            | EnvelopeKind::Fix => {
+                return Err("saved analysis section uses an unsupported envelope kind".to_owned());
+            }
+        };
+        result.map_err(|error| {
+            format!(
+                "saved {} section `{pointer}` is incompatible with this Fallow version: {error}",
+                envelope_kind_label(parent_kind)
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_current_dead_code_section(section: &serde_json::Value) -> Result<(), String> {
+    let version = section
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "missing a numeric `schema_version`".to_owned())?;
+    let expected = u64::from(fallow_output::CHECK_SCHEMA_VERSION);
+    if version != expected {
+        return Err(format!("schema version is {version}; expected {expected}"));
+    }
+    validate_current_saved_envelope(EnvelopeKind::DeadCode, section)
+}
+
+fn validate_current_duplication_payload(payload: &serde_json::Value) -> Result<(), String> {
+    require_saved_field(
+        EnvelopeKind::Dupes,
+        payload,
+        "clone_groups",
+        SavedFieldType::Array,
+    )?;
+    require_saved_field(
+        EnvelopeKind::Dupes,
+        payload,
+        "clone_families",
+        SavedFieldType::Array,
+    )?;
+    require_saved_field(
+        EnvelopeKind::Dupes,
+        payload,
+        "stats",
+        SavedFieldType::Object,
+    )?;
+    parse_saved_section::<DuplicationReport>(payload, "duplication report")?;
+    Ok(())
+}
+
+fn validate_current_health_payload(payload: &serde_json::Value) -> Result<(), String> {
+    require_saved_field(
+        EnvelopeKind::Health,
+        payload,
+        "findings",
+        SavedFieldType::Array,
+    )?;
+    require_saved_field(
+        EnvelopeKind::Health,
+        payload,
+        "summary",
+        SavedFieldType::Object,
+    )?;
+    fallow_output::health_report_from_saved_value(payload)
+        .ok_or_else(|| "saved health report is incompatible with this Fallow version".to_owned())?;
+    Ok(())
+}
+
+fn validate_current_audit_envelope(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+) -> Result<(), String> {
+    let command = require_saved_field(kind, envelope, "command", SavedFieldType::String)?;
+    if command.as_str() != Some("audit") {
+        return Err("saved audit envelope field `command` must be `audit`".to_owned());
+    }
+    let verdict = require_saved_field(kind, envelope, "verdict", SavedFieldType::String)?;
+    if !matches!(verdict.as_str(), Some("pass" | "warn" | "fail")) {
+        return Err(
+            "saved audit envelope field `verdict` must be `pass`, `warn`, or `fail`".to_owned(),
+        );
+    }
+    require_saved_field(
+        kind,
+        envelope,
+        "changed_files_count",
+        SavedFieldType::UnsignedInteger,
+    )?;
+    require_saved_field(kind, envelope, "base_ref", SavedFieldType::String)?;
+
+    let summary = require_saved_field(kind, envelope, "summary", SavedFieldType::Object)?;
+    for field in [
+        "dead_code_issues",
+        "complexity_findings",
+        "duplication_clone_groups",
+    ] {
+        require_saved_nested_field(
+            kind,
+            summary,
+            "summary",
+            field,
+            SavedFieldType::UnsignedInteger,
+        )?;
+    }
+    require_saved_nested_field(
+        kind,
+        summary,
+        "summary",
+        "dead_code_has_errors",
+        SavedFieldType::Boolean,
+    )?;
+
+    let attribution = require_saved_field(kind, envelope, "attribution", SavedFieldType::Object)?;
+    let gate = attribution.get("gate").ok_or_else(|| {
+        "saved audit envelope is missing required field `attribution.gate`".to_owned()
+    })?;
+    if !matches!(gate.as_str(), Some("new-only" | "all")) {
+        return Err(
+            "saved audit envelope field `attribution.gate` must be `new-only` or `all`".to_owned(),
+        );
+    }
+    for field in [
+        "dead_code_introduced",
+        "dead_code_inherited",
+        "complexity_introduced",
+        "complexity_inherited",
+        "duplication_introduced",
+        "duplication_inherited",
+        "styling_introduced",
+        "styling_inherited",
+        "duplication_demoted",
+    ] {
+        require_saved_nested_field(
+            kind,
+            attribution,
+            "attribution",
+            field,
+            SavedFieldType::UnsignedInteger,
+        )?;
+    }
+    Ok(())
+}
+
+fn saved_schema_is_legacy(kind: EnvelopeKind, envelope: &serde_json::Value) -> bool {
+    let Some(version) = envelope
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return true;
+    };
+    current_schema_version(kind).is_some_and(|current| version < u64::from(current))
+}
+
+fn current_schema_version(kind: EnvelopeKind) -> Option<u32> {
+    match kind {
+        EnvelopeKind::DeadCode => Some(fallow_output::CHECK_SCHEMA_VERSION),
+        EnvelopeKind::Architecture => Some(fallow_output::ARCHITECTURE_SCHEMA_VERSION),
+        EnvelopeKind::Dupes => Some(fallow_output::DUPES_SCHEMA_VERSION),
+        EnvelopeKind::Health => Some(fallow_output::HEALTH_SCHEMA_VERSION),
+        EnvelopeKind::Audit => Some(fallow_output::AUDIT_SCHEMA_VERSION),
+        EnvelopeKind::Combined => Some(fallow_output::COMBINED_SCHEMA_VERSION),
         EnvelopeKind::Security | EnvelopeKind::Fix => None,
     }
+}
+
+const fn envelope_kind_label(kind: EnvelopeKind) -> &'static str {
+    match kind {
+        EnvelopeKind::DeadCode => "dead-code",
+        EnvelopeKind::Architecture => "architecture",
+        EnvelopeKind::Dupes => "dupes",
+        EnvelopeKind::Health => "health",
+        EnvelopeKind::Audit => "audit",
+        EnvelopeKind::Security => "security",
+        EnvelopeKind::Combined => "combined",
+        EnvelopeKind::Fix => "fix",
+    }
+}
+
+fn parse_saved_section<T: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<T, String> {
+    serde_json::from_value(value.clone())
+        .map_err(|error| format!("saved {label} is incompatible with this Fallow version: {error}"))
 }
 
 fn annotate_dead_code_owner(issues: &mut [CodeClimateIssue], resolver: Option<&OwnershipResolver>) {
@@ -245,6 +706,10 @@ fn annotate_saved_fallback_grouping(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "audit and combined envelopes supply three named native section pointers"
+)]
 fn saved_multi_analysis_codeclimate(
     envelope: &serde_json::Value,
     root: &Path,
@@ -252,36 +717,64 @@ fn saved_multi_analysis_codeclimate(
     dead_code_pointer: &str,
     duplication_pointer: &str,
     health_pointer: &str,
-) -> Option<Vec<CodeClimateIssue>> {
-    let dead_code = parse_optional_section::<AnalysisResults>(envelope, dead_code_pointer).ok()?;
-    let duplication =
-        parse_optional_section::<DuplicationReport>(envelope, duplication_pointer).ok()?;
+    resolver: Option<&OwnershipResolver>,
+) -> Result<Vec<CodeClimateIssue>, String> {
+    let dead_code = parse_optional_section::<AnalysisResults>(envelope, dead_code_pointer)?;
+    let duplication = parse_optional_section::<DuplicationReport>(envelope, duplication_pointer)?;
     let health = match envelope.pointer(health_pointer) {
-        Some(value) => Some(fallow_output::health_report_from_saved_value(value)?),
-        None => None,
+        Some(value) if !value.is_null() => Some(
+            fallow_output::health_report_from_saved_value(value).ok_or_else(|| {
+                format!("saved section `{health_pointer}` is incompatible with this Fallow version")
+            })?,
+        ),
+        Some(_) | None => None,
     };
 
     let mut issues = Vec::new();
     if let Some(results) = dead_code {
-        issues.extend(api_codeclimate_issues(&results, root, rules));
+        let mut dead_code_issues = api_codeclimate_issues(&results, root, rules);
+        annotate_dead_code_owner(&mut dead_code_issues, resolver);
+        issues.extend(dead_code_issues);
     }
     if let Some(report) = duplication {
-        issues.extend(api_duplication_codeclimate_issues(&report, root));
+        let mut duplication_issues = api_duplication_codeclimate_issues(&report, root);
+        annotate_duplication_groups(&mut duplication_issues, &report, root, resolver);
+        issues.extend(duplication_issues);
     }
     if let Some(report) = health {
-        issues.extend(api_health_codeclimate_issues(&report, root));
+        let mut health_issues = api_health_codeclimate_issues(&report, root);
+        annotate_health_groups(&mut health_issues, resolver);
+        issues.extend(health_issues);
     }
-    Some(issues)
+    Ok(issues)
 }
 
 fn parse_optional_section<T: serde::de::DeserializeOwned>(
     envelope: &serde_json::Value,
     pointer: &str,
-) -> Result<Option<T>, serde_json::Error> {
-    let Some(value) = envelope.pointer(pointer) else {
+) -> Result<Option<T>, String> {
+    let Some(value) = envelope.pointer(pointer).filter(|value| !value.is_null()) else {
         return Ok(None);
     };
-    serde_json::from_value(value.clone()).map(Some)
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| {
+            format!("saved section `{pointer}` is incompatible with this Fallow version: {error}")
+        })
+}
+
+fn native_category(rule_id: &str) -> &'static str {
+    if rule_id == "fallow/code-duplication" {
+        "Duplication"
+    } else if rule_id.starts_with("fallow/high-") || rule_id == "fallow/complexity" {
+        "Complexity"
+    } else if rule_id.starts_with("fallow/css-") {
+        "Style"
+    } else if rule_id.contains("untested") {
+        "Coverage"
+    } else {
+        "Bug Risk"
+    }
 }
 
 const fn annotation_codeclimate_severity(level: AnnotationLevel) -> CodeClimateSeverity {
@@ -297,20 +790,6 @@ fn sarif_level_to_codeclimate(level: &str) -> CodeClimateSeverity {
         "error" => CodeClimateSeverity::Major,
         "warning" => CodeClimateSeverity::Minor,
         _ => CodeClimateSeverity::Info,
-    }
-}
-
-fn native_category(rule_id: &str) -> &'static str {
-    if rule_id == "fallow/code-duplication" {
-        "Duplication"
-    } else if rule_id.starts_with("fallow/high-") || rule_id == "fallow/complexity" {
-        "Complexity"
-    } else if rule_id.starts_with("fallow/css-") {
-        "Style"
-    } else if rule_id.contains("untested") {
-        "Coverage"
-    } else {
-        "Bug Risk"
     }
 }
 
@@ -331,6 +810,9 @@ fn envelope_fingerprint(rule_id: &str, path: &str, line: u32, message: &str) -> 
         return codeclimate_fingerprint_hash(&[rule_id, subject]);
     }
     let line = line.to_string();
+    if rule_id.starts_with("fallow/css-") {
+        return codeclimate_fingerprint_hash(&[rule_id, path, &line, message]);
+    }
     if let Some(subject) = first_quoted_subject(message) {
         codeclimate_fingerprint_hash(&[rule_id, path, &line, subject])
     } else {
@@ -344,101 +826,12 @@ fn first_quoted_subject(message: &str) -> Option<&str> {
     (!subject.is_empty()).then_some(subject)
 }
 
-/// Map fallow severity to CodeClimate severity.
-#[cfg(test)]
-fn severity_to_codeclimate(s: Severity) -> CodeClimateSeverity {
-    match s {
-        Severity::Error => CodeClimateSeverity::Major,
-        Severity::Warn => CodeClimateSeverity::Minor,
-        Severity::Off => unreachable!(),
-    }
-}
-
 /// Compute a relative path string with forward-slash normalization.
 ///
 /// Uses `normalize_uri` to ensure forward slashes on all platforms
 /// and percent-encode brackets for Next.js dynamic routes.
 fn cc_path(path: &Path, root: &Path) -> String {
     normalize_uri(&relative_path(path, root).display().to_string())
-}
-
-#[cfg(test)]
-fn fingerprint_hash(parts: &[&str]) -> String {
-    codeclimate_fingerprint_hash(parts)
-}
-
-#[cfg(test)]
-fn coverage_intelligence_check_name(
-    recommendation: fallow_output::CoverageIntelligenceRecommendation,
-) -> &'static str {
-    match recommendation {
-        fallow_output::CoverageIntelligenceRecommendation::AddTestOrSplitBeforeMerge => {
-            "fallow/coverage-intelligence-risky-change"
-        }
-        fallow_output::CoverageIntelligenceRecommendation::DeleteAfterConfirmingOwner => {
-            "fallow/coverage-intelligence-delete"
-        }
-        fallow_output::CoverageIntelligenceRecommendation::ReviewBeforeChanging => {
-            "fallow/coverage-intelligence-review"
-        }
-        fallow_output::CoverageIntelligenceRecommendation::RefactorCarefullyKeepBehavior => {
-            "fallow/coverage-intelligence-refactor"
-        }
-    }
-}
-
-#[cfg(test)]
-const fn health_finding_severity(severity: fallow_output::FindingSeverity) -> CodeClimateSeverity {
-    match severity {
-        fallow_output::FindingSeverity::Critical => CodeClimateSeverity::Critical,
-        fallow_output::FindingSeverity::High => CodeClimateSeverity::Major,
-        fallow_output::FindingSeverity::Moderate => CodeClimateSeverity::Minor,
-    }
-}
-
-#[cfg(test)]
-const fn runtime_coverage_check_name(
-    verdict: fallow_output::RuntimeCoverageVerdict,
-) -> &'static str {
-    match verdict {
-        fallow_output::RuntimeCoverageVerdict::SafeToDelete => "fallow/runtime-safe-to-delete",
-        fallow_output::RuntimeCoverageVerdict::ReviewRequired => "fallow/runtime-review-required",
-        fallow_output::RuntimeCoverageVerdict::LowTraffic => "fallow/runtime-low-traffic",
-        fallow_output::RuntimeCoverageVerdict::CoverageUnavailable => {
-            "fallow/runtime-coverage-unavailable"
-        }
-        fallow_output::RuntimeCoverageVerdict::Active
-        | fallow_output::RuntimeCoverageVerdict::Unknown => "fallow/runtime-coverage",
-    }
-}
-
-#[cfg(test)]
-const fn runtime_coverage_severity(
-    verdict: fallow_output::RuntimeCoverageVerdict,
-) -> CodeClimateSeverity {
-    match verdict {
-        fallow_output::RuntimeCoverageVerdict::SafeToDelete => CodeClimateSeverity::Critical,
-        fallow_output::RuntimeCoverageVerdict::ReviewRequired => CodeClimateSeverity::Major,
-        _ => CodeClimateSeverity::Minor,
-    }
-}
-
-#[cfg(test)]
-const fn coverage_intelligence_severity(
-    verdict: fallow_output::CoverageIntelligenceVerdict,
-) -> Option<CodeClimateSeverity> {
-    match verdict {
-        fallow_output::CoverageIntelligenceVerdict::RiskyChangeDetected
-        | fallow_output::CoverageIntelligenceVerdict::HighConfidenceDelete => {
-            Some(CodeClimateSeverity::Major)
-        }
-        fallow_output::CoverageIntelligenceVerdict::ReviewRequired
-        | fallow_output::CoverageIntelligenceVerdict::RefactorCarefully => {
-            Some(CodeClimateSeverity::Minor)
-        }
-        fallow_output::CoverageIntelligenceVerdict::Clean
-        | fallow_output::CoverageIntelligenceVerdict::Unknown => None,
-    }
 }
 
 /// Fetch CodeClimate issues from the API-owned dead-code output builder.
@@ -554,30 +947,46 @@ mod tests {
     use fallow_types::results::*;
     use std::path::PathBuf;
 
-    /// Compute graduated severity for health findings based on threshold ratio.
-    /// Kept for unit test coverage of the original CodeClimate severity model.
-    fn health_severity(value: u16, threshold: u16) -> &'static str {
-        if threshold == 0 {
-            return "minor";
-        }
-        let ratio = f64::from(value) / f64::from(threshold);
-        if ratio > 2.5 {
-            "critical"
-        } else if ratio > 1.5 {
-            "major"
-        } else {
-            "minor"
-        }
+    fn current_dead_code_section() -> serde_json::Value {
+        let mut section =
+            serde_json::to_value(AnalysisResults::default()).expect("serialize analysis results");
+        section["schema_version"] = serde_json::json!(fallow_output::CHECK_SCHEMA_VERSION);
+        section["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+        section["elapsed_ms"] = serde_json::json!(0);
+        section["total_issues"] = serde_json::json!(0);
+        section["summary"] = serde_json::json!({});
+        section
     }
 
-    #[test]
-    fn codeclimate_empty_results_produces_empty_array() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let arr = output.as_array().unwrap();
-        assert!(arr.is_empty());
+    fn current_audit_envelope(dead_code: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": fallow_output::AUDIT_SCHEMA_VERSION,
+            "version": env!("CARGO_PKG_VERSION"),
+            "command": "audit",
+            "verdict": "pass",
+            "changed_files_count": 0,
+            "base_ref": "main",
+            "elapsed_ms": 0,
+            "summary": {
+                "dead_code_issues": 0,
+                "dead_code_has_errors": false,
+                "complexity_findings": 0,
+                "duplication_clone_groups": 0
+            },
+            "attribution": {
+                "gate": "new-only",
+                "dead_code_introduced": 0,
+                "dead_code_inherited": 0,
+                "complexity_introduced": 0,
+                "complexity_inherited": 0,
+                "duplication_introduced": 0,
+                "duplication_inherited": 0,
+                "styling_introduced": 0,
+                "styling_inherited": 0,
+                "duplication_demoted": 0
+            },
+            "dead_code": dead_code
+        })
     }
 
     #[test]
@@ -587,7 +996,10 @@ mod tests {
             "unused_files": [{ "path": "src/dead.ts" }]
         });
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let manifest_dir = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        );
+        let root = manifest_dir
             .parent()
             .and_then(Path::parent)
             .expect("workspace root");
@@ -597,6 +1009,195 @@ mod tests {
         assert_eq!(issues[0].check_name, "fallow/unused-file");
         assert_eq!(issues[0].location.path, "src/dead.ts");
         assert_eq!(issues[0].location.lines.begin, 1);
+    }
+
+    #[test]
+    fn malformed_current_dead_code_envelope_does_not_fall_back_to_partial_issues() {
+        let envelope = serde_json::json!({
+            "kind": "dead-code",
+            "schema_version": fallow_output::CHECK_SCHEMA_VERSION,
+            "version": env!("CARGO_PKG_VERSION"),
+            "elapsed_ms": 0,
+            "total_issues": 1,
+            "summary": {},
+            "unused_files": [{ "path": "src/dead.ts" }],
+            "unused_exports": "invalid"
+        });
+        let manifest_dir = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        );
+        let root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+
+        let error = envelope_codeclimate_issues_with_config(
+            EnvelopeKind::DeadCode,
+            &envelope,
+            root,
+            None,
+            None,
+        )
+        .expect_err("current malformed envelope must fail closed");
+        assert!(error.contains("incompatible with this Fallow version"));
+    }
+
+    #[test]
+    fn current_dead_code_envelope_rejects_an_inconsistent_finding_total() {
+        let mut envelope = serde_json::to_value(AnalysisResults::default())
+            .expect("serialize empty analysis results");
+        envelope["schema_version"] = serde_json::json!(fallow_output::CHECK_SCHEMA_VERSION);
+        envelope["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+        envelope["elapsed_ms"] = serde_json::json!(0);
+        envelope["total_issues"] = serde_json::json!(1);
+        envelope["summary"] = serde_json::json!({});
+
+        let error = envelope_codeclimate_issues_with_config(
+            EnvelopeKind::DeadCode,
+            &envelope,
+            Path::new("/project"),
+            None,
+            None,
+        )
+        .expect_err("inconsistent current finding total must fail closed");
+        assert_eq!(
+            error,
+            "saved dead-code envelope declares 1 findings but contains 0"
+        );
+    }
+
+    #[test]
+    fn current_parent_envelopes_reject_truncated_dead_code_sections() {
+        let mut truncated = current_dead_code_section();
+        truncated
+            .as_object_mut()
+            .expect("dead-code object")
+            .remove("summary");
+
+        let combined = serde_json::json!({
+            "schema_version": fallow_output::COMBINED_SCHEMA_VERSION,
+            "version": env!("CARGO_PKG_VERSION"),
+            "elapsed_ms": 0,
+            "check": truncated.clone()
+        });
+        let audit = current_audit_envelope(&truncated);
+
+        for (kind, pointer, envelope) in [
+            (EnvelopeKind::Combined, "/check", combined),
+            (EnvelopeKind::Audit, "/dead_code", audit),
+        ] {
+            let error = validate_saved_schema(kind, &envelope)
+                .expect_err("truncated current child envelope must fail closed");
+            assert!(error.contains(&format!("section `{pointer}`")), "{error}");
+            assert!(
+                error.contains("missing required field `summary`"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_parent_envelopes_reject_malformed_analysis_payloads() {
+        let combined = serde_json::json!({
+            "schema_version": fallow_output::COMBINED_SCHEMA_VERSION,
+            "version": env!("CARGO_PKG_VERSION"),
+            "elapsed_ms": 0,
+            "health": { "findings": "invalid", "summary": {} }
+        });
+        let mut audit = current_audit_envelope(&current_dead_code_section());
+        audit["duplication"] = serde_json::json!({
+            "clone_groups": [],
+            "clone_families": [],
+            "stats": "invalid"
+        });
+
+        for (kind, pointer, envelope) in [
+            (EnvelopeKind::Combined, "/health", combined),
+            (EnvelopeKind::Audit, "/duplication", audit),
+        ] {
+            let error = validate_saved_schema(kind, &envelope)
+                .expect_err("malformed current child payload must fail closed");
+            assert!(error.contains(&format!("section `{pointer}`")), "{error}");
+        }
+    }
+
+    #[test]
+    fn current_parent_envelopes_accept_null_optional_sections() {
+        let combined = serde_json::json!({
+            "schema_version": fallow_output::COMBINED_SCHEMA_VERSION,
+            "version": env!("CARGO_PKG_VERSION"),
+            "elapsed_ms": 0,
+            "check": null,
+            "dupes": null,
+            "health": null
+        });
+
+        validate_saved_schema(EnvelopeKind::Combined, &combined)
+            .expect("null optional sections are valid");
+        let issues = saved_native_codeclimate_issues(
+            EnvelopeKind::Combined,
+            &combined,
+            Path::new("/project"),
+            None,
+            None,
+        )
+        .expect("null optional sections render empty");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn current_envelope_rejects_malformed_type_aware_metadata() {
+        let mut envelope = current_dead_code_section();
+        envelope["_meta"] = serde_json::json!({
+            "type_aware": {
+                "required_completeness": "complete",
+                "queries": "not-an-array"
+            }
+        });
+
+        let error = validate_saved_schema(EnvelopeKind::DeadCode, &envelope)
+            .expect_err("malformed current type-aware metadata must fail closed");
+        assert!(error.contains("saved type-aware metadata at `/_meta/type_aware`"));
+    }
+
+    #[test]
+    fn every_current_saved_analysis_envelope_requires_its_root_header() {
+        for (kind, schema_version) in [
+            (EnvelopeKind::DeadCode, fallow_output::CHECK_SCHEMA_VERSION),
+            (EnvelopeKind::Dupes, fallow_output::DUPES_SCHEMA_VERSION),
+            (EnvelopeKind::Health, fallow_output::HEALTH_SCHEMA_VERSION),
+            (EnvelopeKind::Audit, fallow_output::AUDIT_SCHEMA_VERSION),
+            (
+                EnvelopeKind::Combined,
+                fallow_output::COMBINED_SCHEMA_VERSION,
+            ),
+        ] {
+            let error = validate_saved_schema(
+                kind,
+                &serde_json::json!({ "schema_version": schema_version }),
+            )
+            .expect_err("current envelope without its root header must fail closed");
+            assert_eq!(
+                error,
+                format!(
+                    "saved {} envelope is missing required field `version`",
+                    envelope_kind_label(kind)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn saved_fix_envelope_preserves_empty_codeclimate_compatibility() {
+        let issues = envelope_codeclimate_issues_with_config(
+            EnvelopeKind::Fix,
+            &serde_json::json!({ "actions": [] }),
+            Path::new("/project"),
+            None,
+            None,
+        )
+        .expect("saved fix CodeClimate compatibility");
+        assert!(issues.is_empty());
     }
 
     #[test]
@@ -716,6 +1317,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let mut direct = api_codeclimate_issues(&results, root.path(), &rules);
@@ -726,13 +1329,14 @@ mod tests {
         envelope["kind"] = serde_json::json!("dead-code");
         fallow_output::strip_root_prefix(&mut envelope, &format!("{}/", root.path().display()));
 
-        let saved = envelope_codeclimate_issues_with_context(
+        let saved = envelope_codeclimate_issues_with_config(
             EnvelopeKind::DeadCode,
             &envelope,
             root.path(),
             None,
             Some(&resolver),
-        );
+        )
+        .expect("saved envelope should reconstruct");
 
         assert_eq!(
             codeclimate_issues_to_value(&saved),
@@ -777,21 +1381,11 @@ mod tests {
     }
 
     #[test]
-    fn codeclimate_produces_array_of_issues() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        assert!(output.is_array());
-        let arr = output.as_array().unwrap();
-        assert!(!arr.is_empty());
-    }
-
-    #[test]
     fn codeclimate_missing_suppression_reason_uses_reason_rule_severity() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/file.ts"),
             line: 1,
             col: 0,
@@ -803,6 +1397,7 @@ mod tests {
             },
             missing_reason: true,
             actions: StaleSuppression::actions_for(true),
+            effective_severity: None,
         });
         let rules = RulesConfig {
             stale_suppressions: Severity::Off,
@@ -827,20 +1422,24 @@ mod tests {
             kind_known: true,
         };
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/file.ts"),
             line: 1,
             col: 0,
             origin: origin.clone(),
             missing_reason: false,
             actions: StaleSuppression::actions_for(false),
+            effective_severity: None,
         });
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/file.ts"),
             line: 1,
             col: 0,
             origin,
             missing_reason: true,
             actions: StaleSuppression::actions_for(true),
+            effective_severity: None,
         });
         let rules = RulesConfig {
             stale_suppressions: Severity::Warn,
@@ -853,30 +1452,6 @@ mod tests {
         assert_eq!(output[0]["check_name"], "fallow/stale-suppression");
         assert_eq!(output[1]["check_name"], "fallow/missing-suppression-reason");
         assert_ne!(output[0]["fingerprint"], output[1]["fingerprint"]);
-    }
-
-    #[test]
-    fn codeclimate_issue_has_required_fields() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results
-            .unused_files
-            .push(UnusedFileFinding::with_actions(UnusedFile {
-                path: root.join("src/dead.ts"),
-            }));
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let issue = &output.as_array().unwrap()[0];
-
-        assert_eq!(issue["type"], "issue");
-        assert_eq!(issue["check_name"], "fallow/unused-file");
-        assert!(issue["description"].is_string());
-        assert!(issue["categories"].is_array());
-        assert!(issue["severity"].is_string());
-        assert!(issue["fingerprint"].is_string());
-        assert!(issue["location"].is_object());
-        assert!(issue["location"]["path"].is_string());
-        assert!(issue["location"]["lines"].is_object());
     }
 
     #[test]
@@ -915,26 +1490,13 @@ mod tests {
                 col: 4,
                 span_start: 120,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
         let issue = &output[0];
         assert_eq!(issue["location"]["lines"]["begin"], 10);
-    }
-
-    #[test]
-    fn codeclimate_unused_file_line_defaults_to_1() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results
-            .unused_files
-            .push(UnusedFileFinding::with_actions(UnusedFile {
-                path: root.join("src/dead.ts"),
-            }));
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let issue = &output[0];
-        assert_eq!(issue["location"]["lines"]["begin"], 1);
     }
 
     #[test]
@@ -967,6 +1529,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: true,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
@@ -1062,29 +1626,6 @@ mod tests {
     }
 
     #[test]
-    fn codeclimate_fingerprints_are_deterministic() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let rules = RulesConfig::default();
-        let output1 = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let output2 = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-
-        let fps1: Vec<&str> = output1
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["fingerprint"].as_str().unwrap())
-            .collect();
-        let fps2: Vec<&str> = output2
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["fingerprint"].as_str().unwrap())
-            .collect();
-        assert_eq!(fps1, fps2);
-    }
-
-    #[test]
     fn codeclimate_fingerprints_are_unique() {
         let root = PathBuf::from("/project");
         let results = sample_results(&root);
@@ -1136,70 +1677,23 @@ mod tests {
                 path: root.join("package.json"),
                 line: 0,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
         assert_eq!(output[0]["location"]["lines"]["begin"], 1);
     }
 
-    #[test]
-    fn fingerprint_hash_different_inputs_differ() {
-        let h1 = fingerprint_hash(&["a", "b"]);
-        let h2 = fingerprint_hash(&["a", "c"]);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn fingerprint_hash_order_matters() {
-        let h1 = fingerprint_hash(&["a", "b"]);
-        let h2 = fingerprint_hash(&["b", "a"]);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn fingerprint_hash_separator_prevents_collision() {
-        let h1 = fingerprint_hash(&["ab", "c"]);
-        let h2 = fingerprint_hash(&["a", "bc"]);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn fingerprint_hash_is_16_hex_chars() {
-        let h = fingerprint_hash(&["test"]);
-        assert_eq!(h.len(), 16);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn severity_error_maps_to_major() {
-        assert_eq!(
-            severity_to_codeclimate(Severity::Error),
-            CodeClimateSeverity::Major
-        );
-    }
-
-    #[test]
-    fn severity_warn_maps_to_minor() {
-        assert_eq!(
-            severity_to_codeclimate(Severity::Warn),
-            CodeClimateSeverity::Minor
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "internal error: entered unreachable code")]
-    fn severity_off_is_unreachable() {
-        let _ = severity_to_codeclimate(Severity::Off);
-    }
-
     /// Production-mode regression: rules can flip to `Severity::Off` while
     /// the matching findings slice arrives empty (the analyzer's own off-
     /// rule short-circuit clears the vec, but the generic-iterator helpers
-    /// in `codeclimate.rs` previously called `severity_to_codeclimate`
-    /// before checking emptiness and panicked at `Severity::Off`).
+    /// previously called `severity_to_codeclimate` before checking
+    /// emptiness and panicked at `Severity::Off`).
     /// `fallow dead-code --format codeclimate --production` on any project
     /// with a `--production`-suppressed dep / export / member rule used to
-    /// exit 101 with `entered unreachable code` at `ci/severity.rs:28`.
+    /// exit 101 with `entered unreachable code` at the `Severity::Off` arm
+    /// of `severity_to_codeclimate`. Both those helpers and that mapper now
+    /// live in `crates/api/src/dead_code_codeclimate.rs`.
     /// This test exercises all three previously-vulnerable helpers
     /// (`push_dep_cc_issues`, `push_unused_export_issues`,
     /// `push_unused_member_issues`) through `api_codeclimate_issues`.
@@ -1219,36 +1713,6 @@ mod tests {
         };
         let issues = api_codeclimate_issues(&results, &root, &rules);
         assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn health_severity_zero_threshold_returns_minor() {
-        assert_eq!(health_severity(100, 0), "minor");
-    }
-
-    #[test]
-    fn health_severity_at_threshold_returns_minor() {
-        assert_eq!(health_severity(10, 10), "minor");
-    }
-
-    #[test]
-    fn health_severity_1_5x_threshold_returns_minor() {
-        assert_eq!(health_severity(15, 10), "minor");
-    }
-
-    #[test]
-    fn health_severity_above_1_5x_returns_major() {
-        assert_eq!(health_severity(16, 10), "major");
-    }
-
-    #[test]
-    fn health_severity_at_2_5x_returns_major() {
-        assert_eq!(health_severity(25, 10), "major");
-    }
-
-    #[test]
-    fn health_severity_above_2_5x_returns_critical() {
-        assert_eq!(health_severity(26, 10), "critical");
     }
 
     #[test]
@@ -1418,16 +1882,12 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: fallow_output::ExceededThreshold::Crap,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: Some(60.0),
+                    mutation: None,
                     coverage_pct: Some(25.0),
-                    coverage_tier: None,
-                    coverage_source: None,
-                    inherited_from: None,
-                    component_rollup: None,
-                    contributions: Vec::new(),
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -1445,32 +1905,6 @@ mod tests {
         let description = issues[0]["description"].as_str().unwrap();
         assert!(description.contains("CRAP score"), "desc: {description}");
         assert!(description.contains("coverage 25%"), "desc: {description}");
-    }
-
-    // ---------------------------------------------------------------------------
-    // coverage_intelligence_check_name: all four recommendation arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn coverage_intelligence_check_name_review_before_changing() {
-        use fallow_output::CoverageIntelligenceRecommendation;
-        assert_eq!(
-            coverage_intelligence_check_name(
-                CoverageIntelligenceRecommendation::ReviewBeforeChanging
-            ),
-            "fallow/coverage-intelligence-review"
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_check_name_refactor_carefully() {
-        use fallow_output::CoverageIntelligenceRecommendation;
-        assert_eq!(
-            coverage_intelligence_check_name(
-                CoverageIntelligenceRecommendation::RefactorCarefullyKeepBehavior
-            ),
-            "fallow/coverage-intelligence-refactor"
-        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1497,16 +1931,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Both,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -1540,16 +1975,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Cyclomatic,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -1586,16 +2022,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Cognitive,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -1629,16 +2066,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::All,
+                    effective_severity: None,
                     severity: FindingSeverity::Critical,
                     crap: Some(110.0),
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -1836,147 +2274,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // health_finding_severity: Critical -> Critical, Moderate -> Minor
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn health_finding_severity_critical_maps_to_critical() {
-        use fallow_output::FindingSeverity;
-        assert_eq!(
-            health_finding_severity(FindingSeverity::Critical),
-            CodeClimateSeverity::Critical
-        );
-    }
-
-    #[test]
-    fn health_finding_severity_moderate_maps_to_minor() {
-        use fallow_output::FindingSeverity;
-        assert_eq!(
-            health_finding_severity(FindingSeverity::Moderate),
-            CodeClimateSeverity::Minor
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // runtime_coverage_check_name: all verdict arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn runtime_coverage_check_name_safe_to_delete() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::SafeToDelete),
-            "fallow/runtime-safe-to-delete"
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_check_name_low_traffic() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::LowTraffic),
-            "fallow/runtime-low-traffic"
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_check_name_coverage_unavailable() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::CoverageUnavailable),
-            "fallow/runtime-coverage-unavailable"
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_check_name_active_and_unknown_use_generic() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::Active),
-            "fallow/runtime-coverage"
-        );
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::Unknown),
-            "fallow/runtime-coverage"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // runtime_coverage_severity: verdict arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn runtime_coverage_severity_safe_to_delete_is_critical() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::SafeToDelete),
-            CodeClimateSeverity::Critical
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_severity_review_required_is_major() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::ReviewRequired),
-            CodeClimateSeverity::Major
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_severity_other_verdicts_are_minor() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::LowTraffic),
-            CodeClimateSeverity::Minor
-        );
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::Active),
-            CodeClimateSeverity::Minor
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // coverage_intelligence_severity: all verdict arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn coverage_intelligence_severity_review_required_is_minor() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::ReviewRequired),
-            Some(CodeClimateSeverity::Minor)
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_severity_refactor_carefully_is_minor() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::RefactorCarefully),
-            Some(CodeClimateSeverity::Minor)
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_severity_clean_is_none() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::Clean),
-            None
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_severity_unknown_is_none() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::Unknown),
-            None
-        );
-    }
-
-    // ---------------------------------------------------------------------------
     // push_dep_cc_issues: workspace context included in description
     // ---------------------------------------------------------------------------
 
@@ -1992,6 +2289,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 10,
                 used_in_workspaces: vec![root.join("packages/app")],
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
@@ -2707,6 +3005,7 @@ mod tests {
                     evidence: RuntimeCoverageEvidence {
                         static_status: "unused".to_string(),
                         test_coverage: "not_covered".to_string(),
+                        test_only_reference: None,
                         v8_tracking: "tracked".to_string(),
                         untracked_reason: None,
                         observation_days: 30,
@@ -2779,6 +3078,7 @@ mod tests {
                     evidence: RuntimeCoverageEvidence {
                         static_status: "used".to_string(),
                         test_coverage: "not_covered".to_string(),
+                        test_only_reference: None,
                         v8_tracking: "untracked".to_string(),
                         untracked_reason: Some("worker_thread".to_string()),
                         observation_days: 7,
@@ -2819,6 +3119,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/a.ts"),
                         start_line: 10,
                         end_line: 20,
@@ -2827,6 +3128,7 @@ mod tests {
                         fragment: "const x = 1;\nconst y = 2;".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/b.ts"),
                         start_line: 30,
                         end_line: 40,
@@ -2852,12 +3154,18 @@ mod tests {
         assert_eq!(issues[0]["location"]["path"].as_str().unwrap(), "src/a.ts");
         assert_eq!(issues[1]["location"]["path"].as_str().unwrap(), "src/b.ts");
         assert_eq!(issues[0]["location"]["lines"]["begin"], 10);
+        assert_eq!(issues[0]["location"]["lines"]["end"], 20);
         assert_eq!(issues[1]["location"]["lines"]["begin"], 30);
+        assert_eq!(issues[1]["location"]["lines"]["end"], 40);
+        assert_eq!(issues[0]["other_locations"][0]["path"], "src/b.ts");
+        assert_eq!(issues[0]["other_locations"][0]["lines"]["begin"], 30);
+        assert_eq!(issues[0]["other_locations"][0]["lines"]["end"], 40);
+        assert_eq!(issues[1]["other_locations"][0]["path"], "src/a.ts");
         assert_eq!(issues[0]["categories"][0], "Duplication");
     }
 
     #[test]
-    fn duplication_codeclimate_description_includes_group_number_and_line_count() {
+    fn duplication_codeclimate_description_uses_stable_clone_handle_not_ordinal() {
         use fallow_types::duplicates::{
             CloneGroup, CloneInstance, DuplicationReport, DuplicationStats,
         };
@@ -2866,6 +3174,7 @@ mod tests {
             clone_groups: vec![
                 CloneGroup {
                     instances: vec![CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/a.ts"),
                         start_line: 1,
                         end_line: 10,
@@ -2879,6 +3188,7 @@ mod tests {
                 },
                 CloneGroup {
                     instances: vec![CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/b.ts"),
                         start_line: 5,
                         end_line: 12,
@@ -2900,13 +3210,47 @@ mod tests {
         let issues = output.as_array().unwrap();
         assert_eq!(issues.len(), 2);
         let desc0 = issues[0]["description"].as_str().unwrap();
-        assert!(desc0.contains("group 1"), "first group: {desc0}");
+        assert!(desc0.starts_with("Code clone dup:"), "first group: {desc0}");
+        assert!(!desc0.contains("group 1"), "ordinal leaked: {desc0}");
         assert!(desc0.contains("8 lines"), "first group line count: {desc0}");
         let desc1 = issues[1]["description"].as_str().unwrap();
-        assert!(desc1.contains("group 2"), "second group: {desc1}");
+        assert!(
+            desc1.starts_with("Code clone dup:"),
+            "second group: {desc1}"
+        );
+        assert!(!desc1.contains("group 2"), "ordinal leaked: {desc1}");
         assert!(
             desc1.contains("6 lines"),
             "second group line count: {desc1}"
+        );
+
+        let mut reordered = report;
+        reordered.clone_groups.reverse();
+        let reordered_output =
+            codeclimate_issues_to_value(&api_duplication_codeclimate_issues(&reordered, &root));
+        let descriptions_by_path = |issues: &serde_json::Value| {
+            issues
+                .as_array()
+                .expect("issues array")
+                .iter()
+                .map(|issue| {
+                    (
+                        issue["location"]["path"]
+                            .as_str()
+                            .expect("location path")
+                            .to_owned(),
+                        issue["description"]
+                            .as_str()
+                            .expect("description")
+                            .to_owned(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            descriptions_by_path(&output),
+            descriptions_by_path(&reordered_output),
+            "clone handles must not depend on report order"
         );
     }
 
@@ -2935,6 +3279,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/x.ts"),
                         start_line: 1,
                         end_line: 5,
@@ -2943,6 +3288,7 @@ mod tests {
                         fragment: "hello".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/y.ts"),
                         start_line: 10,
                         end_line: 14,
@@ -3019,6 +3365,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: true,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
@@ -3036,15 +3384,15 @@ mod tests {
             .map(|contract| contract.code)
             .collect();
 
-        assert_eq!(
-            BTreeSet::from(["duplicate-prop-shape", "prop-drilling", "thin-wrapper"]),
-            missing
-        );
+        assert_eq!(BTreeSet::<&str>::new(), missing);
 
         let check_names: BTreeSet<String> = fallow_output::issue_output_contracts()
             .flat_map(|contract| contract.codeclimate_check_names)
             .collect();
         assert!(check_names.contains("fallow/stale-suppression"));
         assert!(check_names.contains("fallow/missing-suppression-reason"));
+        assert!(check_names.contains("fallow/prop-drilling"));
+        assert!(check_names.contains("fallow/thin-wrapper"));
+        assert!(check_names.contains("fallow/duplicate-prop-shape"));
     }
 }

@@ -1,5 +1,7 @@
 mod entry_points;
+mod entry_report;
 mod infrastructure;
+mod orphan_declarations;
 mod parse_scripts;
 mod walk;
 
@@ -11,18 +13,22 @@ use rustc_hash::FxHashSet;
 pub use entry_points::{
     CategorizedEntryPoints, compile_glob_set, discover_dynamically_loaded_entry_points,
     discover_entry_points, discover_plugin_entry_point_sets, discover_plugin_entry_points,
-    discover_workspace_entry_points,
 };
 pub(crate) use entry_points::{
-    EntryPointDiscovery, discover_entry_points_with_warnings_from_pkg,
-    discover_workspace_entry_points_with_warnings_from_pkg, resolve_entry_path,
-    warn_skipped_entry_summary,
+    DiscoveredPaths, EntryPointDiscovery, ScriptWorkspaces, collect_workspace_packages,
+    discover_plugin_entry_point_sets_timed, discover_root_entry_points,
+    discover_workspace_package_entry_points, resolve_entry_path_with_discovered,
+    resolve_entry_path_with_tracking, warn_skipped_entry_summary, workspace_runtime_script_seeds,
 };
+pub(crate) use entry_report::{record_entry_pattern_effect, summarize_entry_points};
 pub use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
 pub(crate) use infrastructure::discover_infrastructure_entry_points;
+pub(crate) use orphan_declarations::find_orphan_module_declaration_files;
+pub(crate) use parse_scripts::CommandRefContext;
 pub use walk::{
-    HiddenDirScope, PRODUCTION_EXCLUDE_PATTERNS, SOURCE_EXTENSIONS, discover_files,
-    discover_files_and_config_candidates, discover_files_with_additional_hidden_dirs,
+    DiscoveredSources, HiddenDirMatch, HiddenDirScope, PRODUCTION_EXCLUDE_PATTERNS,
+    SOURCE_EXTENSIONS, discover_files, discover_files_and_config_candidates,
+    discover_files_config_candidates_and_diagnostics, discover_files_with_additional_hidden_dirs,
     is_allowed_hidden_dir,
 };
 
@@ -54,6 +60,21 @@ pub fn collect_plugin_hidden_dir_scopes(
     }
 
     scopes
+}
+
+/// The compiled set of plugin entry patterns, or `None` with a warning when it
+/// does not compile. Without the set no plugin entry point applies, so the
+/// run must not stay silent.
+fn plugin_glob_set_or_warn(
+    built: Result<globset::GlobSet, globset::Error>,
+) -> Option<globset::GlobSet> {
+    built
+        .inspect_err(|err| {
+            tracing::warn!(
+                "plugin entry patterns could not be compiled, so no plugin entry point applies: {err}"
+            );
+        })
+        .ok()
 }
 
 /// Combined plugin-derived and script-derived hidden directory scopes.
@@ -118,7 +139,8 @@ fn push_plugin_hidden_dir_scope(
 #[must_use]
 pub fn discover_files_with_plugin_scopes(config: &ResolvedConfig) -> Vec<DiscoveredFile> {
     let root_pkg = fallow_config::load_dir_package_json(&config.root);
-    let workspaces = fallow_config::discover_workspaces(&config.root);
+    let workspaces =
+        fallow_config::discover_workspaces_with_patterns(&config.root, &config.workspace_patterns);
     let scopes = collect_hidden_dir_scopes(config, root_pkg.as_ref(), &workspaces);
     discover_files_with_additional_hidden_dirs(config, &scopes)
 }
@@ -146,24 +168,42 @@ pub const ALLOWED_HIDDEN_DIRS: &[&str] = &[
 /// happens to read or write into one of these directories (e.g. `nx run ... && cp
 /// dist/foo .nx/cache/`) must not pull the entire directory into source discovery.
 const SCRIPT_SCOPE_DENYLIST: &[&str] = &[
+    ".angular",
+    ".astro",
+    ".cache",
+    ".contentlayer",
+    ".docusaurus",
+    ".expo",
+    ".fallow",
     ".git",
+    ".hg",
+    ".husky",
+    ".idea",
+    ".jj",
+    ".netlify",
     ".next",
     ".nuxt",
-    ".output",
-    ".svelte-kit",
-    ".turbo",
     ".nx",
-    ".cache",
+    ".output",
     ".parcel-cache",
-    ".vercel",
-    ".netlify",
-    ".yarn",
+    ".pnpm",
     ".pnpm-store",
-    ".docusaurus",
+    ".react-router",
+    ".rollup.cache",
+    ".sst",
+    ".svelte-kit",
+    ".svn",
+    ".swc",
+    ".tanstack",
+    ".turbo",
+    ".velite",
+    ".vercel",
+    ".vinxi",
     ".vscode",
-    ".idea",
-    ".fallow",
-    ".husky",
+    ".wrangler",
+    ".wxt",
+    ".yalc",
+    ".yarn",
 ];
 
 /// Collect package-scoped hidden directory traversal rules from
@@ -217,8 +257,8 @@ fn build_script_scope(pkg: &PackageJson, root: &Path) -> Option<HiddenDirScope> 
     for (script_name, script_value) in scripts {
         for cmd in crate::scripts::parse_script(script_value) {
             for path in cmd.config_args.iter().chain(cmd.file_args.iter()) {
-                for hidden in extract_hidden_segments(path) {
-                    if SCRIPT_SCOPE_DENYLIST.contains(&hidden.as_str()) {
+                for hidden in extract_hidden_dir_paths(path) {
+                    if hidden_dir_path_is_denied(&hidden) {
                         continue;
                     }
                     if seen.insert(hidden.clone()) {
@@ -238,38 +278,70 @@ fn build_script_scope(pkg: &PackageJson, root: &Path) -> Option<HiddenDirScope> 
     if dirs.is_empty() {
         None
     } else {
-        Some(HiddenDirScope::new(root.to_path_buf(), dirs))
+        Some(HiddenDirScope::new_exact_paths(root.to_path_buf(), dirs))
     }
 }
 
-/// Extract hidden (dot-prefixed) directory segments from a relative path.
+/// Whether the last component of a root-relative hidden directory path is on
+/// [`SCRIPT_SCOPE_DENYLIST`].
+///
+/// The denylist names directories, so it is matched against the directory's
+/// own name rather than the path that reaches it. Each hidden component on a
+/// path is tested separately, so a denied `.git` under an admitted `.tools`
+/// keeps `.tools` traversable and stops there.
+fn hidden_dir_path_is_denied(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| SCRIPT_SCOPE_DENYLIST.contains(&name))
+}
+
+/// Extract the root-relative path of every hidden (dot-prefixed) directory
+/// component on a relative path.
 ///
 /// Returns an empty vec when the path is absolute or contains any `..`
 /// component, so scopes cannot escape a package root. Trailing file
 /// components are not included (a path like `.config/eslint.config.js`
 /// yields `[".config"]`, not `[".config", "eslint.config.js"]`).
 ///
+/// Each hidden directory on the path gets its own entry, because the walker
+/// filters one component at a time and every hidden level has to be admitted
+/// for the next one to be reached: `.foo/.bar/x.js` yields `[".foo",
+/// ".foo/.bar"]`. A hidden directory under a visible parent keeps that parent
+/// in its entry, so `tools/.bar/x.js` yields `["tools/.bar"]` and admits
+/// nothing named `.bar` anywhere else in the tree (issue #461).
+///
 /// A bare single-component path like `.env` is treated as a file (not a
 /// directory) and yields empty. Real-world tools that accept a directory
 /// as the value of `-c` are vanishingly rare; the common case is a file
 /// path. Conflating the two would over-eagerly scope hidden filenames.
-fn extract_hidden_segments(path: &str) -> Vec<String> {
+fn extract_hidden_dir_paths(path: &str) -> Vec<String> {
     let p = Path::new(path);
     if p.is_absolute() {
         return Vec::new();
     }
     let components: Vec<Component> = p.components().collect();
-    if components.iter().any(|c| matches!(c, Component::ParentDir)) {
+    // `RootDir` as well as `ParentDir`: on Windows a rooted path with no drive
+    // prefix (`\.config\build.js`) reports `is_absolute() == false` while
+    // carrying a leading `RootDir`, so the absolute check above does not catch
+    // it. Mirrors the guard in `fallow_engine::discover`.
+    if components
+        .iter()
+        .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+    {
         return Vec::new();
     }
     let mut out = Vec::new();
+    let mut prefix = std::path::PathBuf::new();
     let upto = components.len().saturating_sub(1);
     for component in &components[..upto] {
-        if let Component::Normal(name) = component {
-            let s = name.to_string_lossy();
-            if s.starts_with('.') && s.len() > 1 {
-                out.push(s.into_owned());
-            }
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        prefix.push(name);
+        let s = name.to_string_lossy();
+        if s.starts_with('.') && s.len() > 1 {
+            out.push(prefix.to_string_lossy().into_owned());
         }
     }
     out
@@ -277,6 +349,8 @@ fn extract_hidden_segments(path: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::MAIN_SEPARATOR;
+
     use super::*;
 
     #[test]
@@ -317,24 +391,6 @@ mod tests {
     }
 
     #[test]
-    fn file_id_re_exported() {
-        let id = FileId(42);
-        assert_eq!(id.0, 42);
-    }
-
-    #[test]
-    fn source_extensions_re_exported() {
-        assert!(SOURCE_EXTENSIONS.contains(&"ts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"tsx"));
-    }
-
-    #[test]
-    fn compile_glob_set_re_exported() {
-        let result = compile_glob_set(&["**/*.ts".to_string()]);
-        assert!(result.is_some());
-    }
-
-    #[test]
     fn script_scope_denylist_all_start_with_dot() {
         for dir in SCRIPT_SCOPE_DENYLIST {
             assert!(
@@ -342,6 +398,12 @@ mod tests {
                 "denylisted dir '{dir}' must start with '.'"
             );
         }
+    }
+
+    #[test]
+    fn script_scope_denylist_includes_pnpm_and_pnpm_store() {
+        assert!(SCRIPT_SCOPE_DENYLIST.contains(&".pnpm"));
+        assert!(SCRIPT_SCOPE_DENYLIST.contains(&".pnpm-store"));
     }
 
     #[test]
@@ -363,71 +425,76 @@ mod tests {
     }
 
     #[test]
-    fn extract_hidden_segments_single_segment() {
+    fn extract_hidden_dir_paths_single_segment() {
         assert_eq!(
-            extract_hidden_segments(".config/eslint.config.js"),
+            extract_hidden_dir_paths(".config/eslint.config.js"),
             vec![".config".to_string()]
         );
     }
 
     #[test]
-    fn extract_hidden_segments_with_leading_dot_slash() {
+    fn extract_hidden_dir_paths_with_leading_dot_slash() {
         assert_eq!(
-            extract_hidden_segments("./.config/eslint.config.js"),
+            extract_hidden_dir_paths("./.config/eslint.config.js"),
             vec![".config".to_string()]
         );
     }
 
     #[test]
-    fn extract_hidden_segments_nested_hidden() {
+    fn extract_hidden_dir_paths_nested_hidden() {
+        // Every hidden level needs its own entry: the walker filters one
+        // component at a time, so `.foo` must be admitted for `.foo/.bar` to
+        // be reached at all.
         assert_eq!(
-            extract_hidden_segments(".foo/.bar/x.js"),
-            vec![".foo".to_string(), ".bar".to_string()]
+            extract_hidden_dir_paths(".foo/.bar/x.js"),
+            vec![".foo".to_string(), format!(".foo{MAIN_SEPARATOR}.bar")]
         );
     }
 
     #[test]
-    fn extract_hidden_segments_hidden_inside_normal_parent() {
+    fn extract_hidden_dir_paths_hidden_inside_normal_parent() {
+        // The visible parent stays in the entry, so this admits `sub/.config`
+        // and nothing else named `.config` elsewhere in the tree (issue #461).
         assert_eq!(
-            extract_hidden_segments("sub/.config/eslint.config.js"),
-            vec![".config".to_string()]
+            extract_hidden_dir_paths("sub/.config/eslint.config.js"),
+            vec![format!("sub{MAIN_SEPARATOR}.config")]
         );
     }
 
     #[test]
-    fn extract_hidden_segments_no_hidden_returns_empty() {
-        assert!(extract_hidden_segments("src/index.ts").is_empty());
+    fn extract_hidden_dir_paths_no_hidden_returns_empty() {
+        assert!(extract_hidden_dir_paths("src/index.ts").is_empty());
     }
 
     #[test]
-    fn extract_hidden_segments_skips_trailing_filename() {
-        assert!(extract_hidden_segments(".env").is_empty());
-        assert!(extract_hidden_segments("src/.eslintrc.js").is_empty());
+    fn extract_hidden_dir_paths_skips_trailing_filename() {
+        assert!(extract_hidden_dir_paths(".env").is_empty());
+        assert!(extract_hidden_dir_paths("src/.eslintrc.js").is_empty());
     }
 
     #[test]
-    fn extract_hidden_segments_skips_paths_with_parent_dir() {
-        assert!(extract_hidden_segments("../.config/eslint.config.js").is_empty());
-        assert!(extract_hidden_segments(".config/../other/x.js").is_empty());
-        assert!(extract_hidden_segments("../../.config/eslint.config.js").is_empty());
+    fn extract_hidden_dir_paths_skips_paths_with_parent_dir() {
+        assert!(extract_hidden_dir_paths("../.config/eslint.config.js").is_empty());
+        assert!(extract_hidden_dir_paths(".config/../other/x.js").is_empty());
+        assert!(extract_hidden_dir_paths("../../.config/eslint.config.js").is_empty());
     }
 
     #[test]
-    fn extract_hidden_segments_skips_absolute_paths() {
+    fn extract_hidden_dir_paths_skips_absolute_paths() {
         #[cfg(unix)]
         {
-            assert!(extract_hidden_segments("/etc/.config/eslint.config.js").is_empty());
+            assert!(extract_hidden_dir_paths("/etc/.config/eslint.config.js").is_empty());
         }
         #[cfg(windows)]
         {
-            assert!(extract_hidden_segments(r"C:\etc\.config\eslint.config.js").is_empty());
+            assert!(extract_hidden_dir_paths(r"C:\etc\.config\eslint.config.js").is_empty());
         }
     }
 
     #[test]
-    fn extract_hidden_segments_ignores_bare_dot() {
-        assert!(extract_hidden_segments(".").is_empty());
-        assert!(extract_hidden_segments("./src/index.ts").is_empty());
+    fn extract_hidden_dir_paths_ignores_bare_dot() {
+        assert!(extract_hidden_dir_paths(".").is_empty());
+        assert!(extract_hidden_dir_paths("./src/index.ts").is_empty());
     }
 
     #[expect(
@@ -651,5 +718,20 @@ mod tests {
             !names.contains(&"packages/other/.config/eslint.config.js".to_string()),
             "unscoped workspace must not get .config traversed"
         );
+    }
+
+    #[test]
+    fn plugin_glob_set_or_warn_returns_none_for_a_failed_build() {
+        let failed = globset::Glob::new("src/[").map(|_| globset::GlobSet::empty());
+        assert!(failed.is_err(), "an unclosed class must not compile");
+        assert!(plugin_glob_set_or_warn(failed).is_none());
+    }
+
+    #[test]
+    fn plugin_glob_set_or_warn_keeps_a_built_set() {
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("src/app.ts").expect("valid glob"));
+        let set = plugin_glob_set_or_warn(builder.build()).expect("set builds");
+        assert!(set.is_match("src/app.ts"));
     }
 }

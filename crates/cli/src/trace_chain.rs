@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fallow_config::{OutputFormat, ProductionAnalysis};
-use fallow_types::trace_chain::{SymbolChainQuery, SymbolChainTrace, TraceDirections};
+use fallow_types::semantic::SemanticNamespace;
+use fallow_types::trace_chain::{
+    StarExportAmbiguity, SymbolChainQuery, SymbolChainTrace, TraceDirections,
+};
 
 use crate::error::emit_error;
 use crate::report;
@@ -106,14 +109,11 @@ pub fn run_trace(opts: &TraceChainOptions<'_>) -> ExitCode {
     emit_trace(trace, opts)
 }
 
-/// Split a `FILE:SYMBOL` target. The symbol is everything after the LAST `:` so
-/// Windows drive-letter paths and nested colons survive.
+/// Split a `FILE:SYMBOL` target into owned halves, on the shared selector
+/// contract in [`crate::selector`].
 fn parse_target(target: &str) -> Option<(String, String)> {
-    let (file, symbol) = target.rsplit_once(':')?;
-    if file.trim().is_empty() || symbol.trim().is_empty() {
-        return None;
-    }
-    Some((file.to_string(), symbol.to_string()))
+    crate::selector::parse_file_symbol_selector(target)
+        .map(|(file, symbol)| (file.to_string(), symbol.to_string()))
 }
 
 fn emit_trace(trace: SymbolChainTrace, opts: &TraceChainOptions<'_>) -> ExitCode {
@@ -121,7 +121,6 @@ fn emit_trace(trace: SymbolChainTrace, opts: &TraceChainOptions<'_>) -> ExitCode
         OutputFormat::Json => {
             let value = match fallow_output::serialize_trace_json_output(
                 trace,
-                crate::output_runtime::current_root_envelope_mode(),
                 crate::output_runtime::telemetry_analysis_run_id().as_deref(),
             ) {
                 Ok(value) => value,
@@ -150,6 +149,14 @@ fn print_human(trace: &SymbolChainTrace, quiet: bool) {
     outln!("  found:  {}", trace.symbol_found);
     outln!("  depth:  {}", trace.depth);
     outln!();
+    // Prose, like `trace.reason` below: `--quiet` drops the explanation from
+    // human output. Both stay in the JSON payload either way.
+    if let Some(ambiguity) = trace.star_export_ambiguity.as_ref().filter(|_| !quiet) {
+        for line in ambiguity_lines(ambiguity) {
+            outln!("{line}");
+        }
+        outln!();
+    }
     if let Some(callers) = trace.callers.as_ref() {
         outln!("Callers (up): {}", callers.len());
         for hop in callers {
@@ -193,6 +200,36 @@ fn print_human(trace: &SymbolChainTrace, quiet: bool) {
     }
 }
 
+/// Render an `export *` collision: what it means, which origins collide, and
+/// what to do about it. Without this the human output shows only `found: false`,
+/// which reads as a typo rather than a barrel mistake.
+fn ambiguity_lines(ambiguity: &StarExportAmbiguity) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Ambiguous `export *` ({}): this file exports nothing under this name",
+        namespace_label(&ambiguity.namespaces)
+    )];
+    lines.extend(
+        ambiguity
+            .sources
+            .iter()
+            .map(|source| format!("  declared in {}", source.display())),
+    );
+    lines.push("  fix: keep one declaration, or re-export the intended one by name".to_string());
+    lines
+}
+
+/// Render the collision's namespaces as the space a reader recognizes.
+fn namespace_label(namespaces: &[SemanticNamespace]) -> String {
+    namespaces
+        .iter()
+        .map(|namespace| match namespace {
+            SemanticNamespace::Type => "type space",
+            SemanticNamespace::Value => "value space",
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,9 +248,70 @@ mod tests {
     }
 
     #[test]
+    fn ambiguity_lines_name_the_colliding_origins_and_the_fix() {
+        let lines = ambiguity_lines(&StarExportAmbiguity {
+            sources: vec![PathBuf::from("src/left.ts"), PathBuf::from("src/right.ts")],
+            namespaces: vec![SemanticNamespace::Value],
+        });
+
+        assert!(lines[0].contains("value space"));
+        assert!(lines[0].contains("exports nothing under this name"));
+        assert!(lines.iter().any(|line| line.contains("src/left.ts")));
+        assert!(lines.iter().any(|line| line.contains("src/right.ts")));
+        assert!(lines.last().is_some_and(|line| line.contains("fix:")));
+    }
+
+    #[test]
+    fn ambiguity_lines_report_a_collision_in_both_namespaces() {
+        let lines = ambiguity_lines(&StarExportAmbiguity {
+            sources: vec![PathBuf::from("src/left.ts")],
+            namespaces: vec![SemanticNamespace::Type, SemanticNamespace::Value],
+        });
+
+        assert!(
+            lines[0].contains("type space and value space"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn ambiguity_lines_report_a_type_space_only_collision() {
+        let lines = ambiguity_lines(&StarExportAmbiguity {
+            sources: vec![PathBuf::from("src/left.ts"), PathBuf::from("src/right.ts")],
+            namespaces: vec![SemanticNamespace::Type],
+        });
+
+        assert!(lines[0].contains("type space"), "{}", lines[0]);
+        assert!(!lines[0].contains("value space"), "{}", lines[0]);
+    }
+
+    #[test]
     fn parse_target_rejects_empty_halves() {
         assert!(parse_target("src/utils.ts:").is_none());
         assert!(parse_target(":foo").is_none());
         assert!(parse_target("no-colon").is_none());
+    }
+
+    /// Characterisation of the whole `FILE:SYMBOL` table, including the rows no
+    /// other test pinned: an empty spec, a bare colon, and whitespace-only
+    /// halves. `trace` shares one parser with `inspect --symbol` and
+    /// `check --trace`, so this table is the contract all three answer to.
+    #[test]
+    fn parse_target_pins_the_whole_selector_table() {
+        assert_eq!(parse_target(""), None);
+        assert_eq!(parse_target(":"), None);
+        assert_eq!(parse_target(" : "), None);
+        assert_eq!(parse_target("\t:foo"), None);
+        assert_eq!(
+            parse_target("a:b:c"),
+            Some(("a:b".to_string(), "c".to_string()))
+        );
+        // Halves that survive the emptiness guard are returned VERBATIM: the
+        // trim is a guard, not a normalisation.
+        assert_eq!(
+            parse_target(" src/a.ts : foo "),
+            Some((" src/a.ts ".to_string(), " foo ".to_string()))
+        );
     }
 }

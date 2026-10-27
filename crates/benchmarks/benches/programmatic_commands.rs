@@ -3,54 +3,37 @@
     clippy::expect_used,
     reason = "benches use unwrap and expect to keep fixture setup concise"
 )]
+#![allow(
+    clippy::significant_drop_tightening,
+    reason = "the external Criterion macro owns the benchmark lifecycle"
+)]
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fallow_api::{
-    AnalysisOptions, AuditOptions, CombinedOptions, ComplexityOptions, DeadCodeOptions,
-    DuplicationMode, DuplicationOptions, EditorAnalysisSession, EngineHealthRunner, run_audit,
-    run_circular_dependencies, run_combined, run_dead_code, run_duplication,
-    run_health_with_runner,
+    AuditOptions, ComplexityOptions, DeadCodeOptions, DuplicationMode, DuplicationOptions,
+    EngineHealthRunner, run_audit, run_dead_code, run_duplication, run_health_with_runner,
 };
-use fallow_extract::{
-    cache::{CacheStore, module_to_cached},
-    parse_all_files, parse_single_file,
-};
-use fallow_types::discover::{DiscoveredFile, FileId};
+use fallow_extract::parse_all_files;
 use tempfile::TempDir;
 
-const BENCH_THREADS: usize = 4;
+mod support;
+
+use support::{
+    CommandInput, analysis_options, create_editor_session_workspace_project,
+    create_warm_hash_workspace_project, create_workspace_project,
+    run_programmatic_combined_session, write_file,
+};
+
 const LARGE_AUDIT_PACKAGE_COUNT: usize = 8;
 const LARGE_AUDIT_MODULES_PER_PACKAGE: usize = 20;
 
-struct CommandInput {
-    _temp_dir: TempDir,
-    root: PathBuf,
-}
-
-struct ExtractCacheInput {
-    _temp_dir: TempDir,
-    files: Vec<DiscoveredFile>,
-    cache: CacheStore,
-}
-
-struct EditorSessionInput {
-    _temp_dir: TempDir,
-    session: EditorAnalysisSession,
-}
-
-fn write_file(root: &Path, path: &str, source: impl AsRef<str>) {
-    let path = root.join(path);
-    std::fs::create_dir_all(path.parent().expect("fixture file has parent")).unwrap();
-    std::fs::write(path, source.as_ref()).unwrap();
-}
-
 fn run_git(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
         .current_dir(root)
         .args(args)
         .status()
@@ -95,53 +78,6 @@ fn package_json(name: &str, dependencies: &[(&str, &str)], extra_fields: &str) -
   }}{extra_fields}
 }}"#
     )
-}
-
-fn analysis_options(root: &Path, no_cache: bool) -> AnalysisOptions {
-    AnalysisOptions {
-        root: Some(root.to_path_buf()),
-        no_cache,
-        threads: Some(BENCH_THREADS),
-        ..AnalysisOptions::default()
-    }
-}
-
-fn is_source_path(path: &Path) -> bool {
-    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-        return false;
-    };
-
-    matches!(extension, "css" | "js" | "jsx" | "ts" | "tsx")
-}
-
-fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).expect("benchmark fixture directory is readable") {
-        let entry = entry.expect("benchmark fixture entry is readable");
-        let path = entry.path();
-        if path.is_dir() {
-            collect_source_paths(&path, paths);
-        } else if is_source_path(&path) {
-            paths.push(path);
-        }
-    }
-}
-
-fn discovered_source_files(root: &Path) -> Vec<DiscoveredFile> {
-    let mut paths = Vec::new();
-    collect_source_paths(root, &mut paths);
-    paths.sort();
-
-    paths
-        .into_iter()
-        .enumerate()
-        .map(|(index, path)| DiscoveredFile {
-            id: FileId(u32::try_from(index).expect("benchmark fixture file count fits in u32")),
-            size_bytes: fs::metadata(&path)
-                .expect("benchmark fixture metadata is readable")
-                .len(),
-            path,
-        })
-        .collect()
 }
 
 fn create_library_project() -> CommandInput {
@@ -406,107 +342,6 @@ export const unusedDashboardExport = () => ({ visits: 0 });
     }
 }
 
-fn create_workspace_project() -> CommandInput {
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().to_path_buf();
-
-    write_file(
-        &root,
-        "package.json",
-        r#"{
-  "name": "bench-workspace",
-  "private": true,
-  "packageManager": "pnpm@10.0.0",
-  "workspaces": ["apps/*", "packages/*"],
-  "dependencies": {}
-}"#,
-    );
-    write_file(
-        &root,
-        "pnpm-workspace.yaml",
-        r#"
-packages:
-  - "apps/*"
-  - "packages/*"
-"#,
-    );
-    write_file(
-        &root,
-        "apps/web/package.json",
-        r#"{"name":"@bench/web","main":"src/index.ts","dependencies":{"@bench/config":"workspace:*","@bench/shared":"workspace:*","@bench/ui":"workspace:*"}}"#,
-    );
-    write_file(
-        &root,
-        "apps/admin/package.json",
-        r#"{"name":"@bench/admin","main":"src/index.ts","dependencies":{"@bench/shared":"workspace:*","@bench/ui":"workspace:*"}}"#,
-    );
-    write_file(
-        &root,
-        "packages/shared/package.json",
-        r#"{"name":"@bench/shared","main":"src/index.ts"}"#,
-    );
-    write_file(
-        &root,
-        "packages/ui/package.json",
-        r#"{"name":"@bench/ui","main":"src/index.ts","dependencies":{"react":"19.0.0"}}"#,
-    );
-    write_file(
-        &root,
-        "packages/config/package.json",
-        r#"{"name":"@bench/config","main":"src/index.ts"}"#,
-    );
-    write_file(
-        &root,
-        "apps/web/src/index.ts",
-        r#"
-import { featureFlags } from "@bench/config";
-import { formatUser } from "@bench/shared";
-import { Card } from "@bench/ui";
-
-export const render = (name: string) => Card({ title: `${formatUser(name)}:${featureFlags.checkout}` });
-"#,
-    );
-    write_file(
-        &root,
-        "apps/admin/src/index.ts",
-        r#"
-import { formatUser } from "@bench/shared";
-import { Card } from "@bench/ui";
-
-export const renderAdmin = (name: string) => Card({ title: `admin:${formatUser(name)}` });
-"#,
-    );
-    write_file(
-        &root,
-        "packages/shared/src/index.ts",
-        r"
-export const formatUser = (name: string): string => name.trim();
-export const unusedSharedHelper = (name: string): string => name.toUpperCase();
-",
-    );
-    write_file(
-        &root,
-        "packages/ui/src/index.ts",
-        r#"
-export const Card = ({ title }: { title: string }) => `<section>${title}</section>`;
-export const UnusedCard = () => "<section>unused</section>";
-"#,
-    );
-    write_file(
-        &root,
-        "packages/config/src/index.ts",
-        r#"
-export const featureFlags = { checkout: "new" } as const;
-export const unusedExperiment = { search: "legacy" } as const;
-"#,
-    );
-
-    CommandInput {
-        _temp_dir: temp_dir,
-        root,
-    }
-}
-
 fn create_duplication_project() -> CommandInput {
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path().to_path_buf();
@@ -559,56 +394,6 @@ export const middleware = (request: Request): Response => {
   const tenant = request.headers.get("x-tenant") ?? "default";
   return Response.json({ tenant });
 };
-"#,
-    );
-
-    CommandInput {
-        _temp_dir: temp_dir,
-        root,
-    }
-}
-
-fn create_circular_project() -> CommandInput {
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().to_path_buf();
-
-    write_file(
-        &root,
-        "package.json",
-        package_json("bench-circulars", &[], ""),
-    );
-    for domain in ["orders", "billing", "users"] {
-        for i in 0..10 {
-            let next = (i + 1) % 10;
-            write_file(
-                &root,
-                &format!("src/domains/{domain}/node{i}.ts"),
-                format!(
-                    r#"
-import {{ value{next} }} from "./node{next}";
-
-export const value{i} = value{next} + {i};
-"#
-                ),
-            );
-        }
-        write_file(
-            &root,
-            &format!("src/domains/{domain}/index.ts"),
-            r#"
-export { value0 } from "./node0";
-"#,
-        );
-    }
-    write_file(
-        &root,
-        "src/index.ts",
-        r#"
-import { value0 as orderValue } from "./domains/orders";
-import { value0 as billingValue } from "./domains/billing";
-import { value0 as userValue } from "./domains/users";
-
-console.log(orderValue, billingValue, userValue);
 "#,
     );
 
@@ -760,30 +545,6 @@ fn create_warm_metadata_workspace_project() -> CommandInput {
     };
     let _ = run_dead_code(&options).expect("warm cache priming succeeds");
     input
-}
-
-fn create_warm_hash_workspace_project() -> ExtractCacheInput {
-    let CommandInput {
-        _temp_dir: temp_dir,
-        root,
-    } = create_workspace_project();
-    let files = discovered_source_files(&root);
-    let mut cache = CacheStore::new();
-
-    for file in &files {
-        let module = parse_single_file(file).expect("benchmark fixture parses");
-        let cached = module_to_cached(
-            &module,
-            fallow_types::source_fingerprint::SourceFingerprint::new(1, 1),
-        );
-        cache.insert(&file.path, cached);
-    }
-
-    ExtractCacheInput {
-        _temp_dir: temp_dir,
-        files,
-        cache,
-    }
 }
 
 fn create_warm_complexity_health_project() -> CommandInput {
@@ -1028,43 +789,6 @@ fn run_programmatic_combined(input: &CommandInput) {
     let _ = run_health_with_runner(&health, &EngineHealthRunner).expect("combined health succeeds");
 }
 
-fn run_programmatic_combined_session(input: &CommandInput) {
-    let duplication = DuplicationOptions {
-        mode: Some(DuplicationMode::Mild),
-        min_tokens: Some(35),
-        min_lines: Some(5),
-        min_occurrences: Some(2),
-        ..DuplicationOptions::default()
-    };
-    let health = ComplexityOptions {
-        complexity: true,
-        file_scores: true,
-        score: true,
-        ..ComplexityOptions::default()
-    };
-
-    let options = CombinedOptions {
-        analysis: analysis_options(&input.root, true),
-        duplication_options: duplication,
-        health_options: health,
-        ..CombinedOptions::default()
-    };
-
-    let _ = run_combined(&options).expect("combined succeeds");
-}
-
-fn create_editor_session_workspace_project() -> EditorSessionInput {
-    let CommandInput {
-        _temp_dir: temp_dir,
-        root,
-    } = create_workspace_project();
-    let session = EditorAnalysisSession::load(&root, None).expect("editor session loads");
-    EditorSessionInput {
-        _temp_dir: temp_dir,
-        session,
-    }
-}
-
 fn dead_code_package_library_exports(c: &mut Criterion) {
     c.bench_function("dead_code_package_library_exports", |bencher| {
         bencher.iter_batched_ref(
@@ -1246,22 +970,6 @@ fn duplication_next_route_callbacks_repeated_auth(c: &mut Criterion) {
     );
 }
 
-fn circular_dependencies_domain_graph_cycles(c: &mut Criterion) {
-    c.bench_function("circular_dependencies_domain_graph_cycles", |bencher| {
-        bencher.iter_batched_ref(
-            create_circular_project,
-            |input| {
-                let options = DeadCodeOptions {
-                    analysis: analysis_options(&input.root, true),
-                    ..DeadCodeOptions::default()
-                };
-                run_circular_dependencies(&options)
-            },
-            BatchSize::LargeInput,
-        );
-    });
-}
-
 fn health_complex_service_scoring(c: &mut Criterion) {
     c.bench_function("health_complex_service_scoring", |bencher| {
         bencher.iter_batched_ref(
@@ -1335,7 +1043,6 @@ criterion_group!(
     combined_workspace_programmatic_session_reuse,
     editor_workspace_repeated_session_analysis,
     duplication_next_route_callbacks_repeated_auth,
-    circular_dependencies_domain_graph_cycles,
     health_complex_service_scoring,
     health_complex_service_warm_complexity_hit,
     health_css_tailwind_design_system

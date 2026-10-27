@@ -31,13 +31,13 @@ fn deno_ambient_workspace_names_do_not_leak_into_npm_members() {
     let dependency_map = workspace_dependency_map(&workspaces, &config);
     let deno_deps = dependency_map
         .iter()
-        .find(|(root, _)| root == &deno_root)
-        .map(|(_, deps)| deps)
+        .find(|ws| ws.root == deno_root)
+        .map(|ws| &ws.deps)
         .unwrap();
     let npm_deps = dependency_map
         .iter()
-        .find(|(root, _)| root == &npm_root)
-        .map(|(_, deps)| deps)
+        .find(|ws| ws.root == npm_root)
+        .map(|ws| &ws.deps)
         .unwrap();
 
     assert!(deno_deps.contains("@scope/deno-lib"));
@@ -137,6 +137,7 @@ fn builtin_modules_not_reported_as_unlisted() {
                 imported_name: ImportedName::Named("readFile".to_string()),
                 local_name: "readFile".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 25),
                 source_span: oxc_span::Span::default(),
@@ -157,6 +158,7 @@ fn builtin_modules_not_reported_as_unlisted() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
     let pkg = make_pkg(&[], &[], &[]);
@@ -201,6 +203,7 @@ fn virtual_modules_not_reported_as_unlisted() {
                 imported_name: ImportedName::Named("register".to_string()),
                 local_name: "register".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 30),
                 source_span: oxc_span::Span::default(),
@@ -221,6 +224,7 @@ fn virtual_modules_not_reported_as_unlisted() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
     let pkg = make_pkg(&[], &[], &[]);
@@ -301,6 +305,7 @@ fn undeclared_workspace_commonjs_require_retains_import_site() {
                 imported_name: ImportedName::Namespace,
                 local_name: "utils".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(42, 73),
                 source_span: oxc_span::Span::new(64, 76),
@@ -458,6 +463,7 @@ fn unlisted_dep_detected_across_multiple_files() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
@@ -478,6 +484,7 @@ fn unlisted_dep_detected_across_multiple_files() {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         },
         ResolvedModule {
             file_id: FileId(1),
@@ -490,6 +497,7 @@ fn unlisted_dep_detected_across_multiple_files() {
                     imported_name: ImportedName::Named("bar".to_string()),
                     local_name: "bar".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
@@ -510,6 +518,7 @@ fn unlisted_dep_detected_across_multiple_files() {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         },
     ];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -559,6 +568,7 @@ fn dynamic_import_unlisted_dep_has_import_site() {
                 imported_name: ImportedName::SideEffect,
                 local_name: String::new(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(14, 40),
                 source_span: oxc_span::Span::default(),
@@ -578,6 +588,7 @@ fn dynamic_import_unlisted_dep_has_import_site() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
     let pkg = make_pkg(&[], &[], &[]);
@@ -603,10 +614,12 @@ fn dynamic_import_unlisted_dep_has_import_site() {
     assert_eq!(unlisted[0].imported_from[0].col, 2);
 }
 
+/// The generic suffix mechanism stays available to external plugins even
+/// though no built-in plugin declares `/__mocks__` anymore (issue #2226).
 #[test]
-fn vitest_mocks_package_not_reported_as_unlisted_via_suffix() {
+fn scoped_mocks_package_not_reported_as_unlisted_via_declared_suffix() {
     let (graph, resolved_modules) = build_graph_with_npm_imports(&[("@aws-sdk/__mocks__", false)]);
-    let pkg = make_pkg(&[], &["vitest"], &[]);
+    let pkg = make_pkg(&[], &[], &[]);
     let config = test_config(PathBuf::from("/project"));
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
@@ -911,7 +924,8 @@ fn ignore_dependencies_suppresses_unlisted() {
     let (graph, resolved_modules) = build_graph_with_npm_imports(&[("axios", false)]);
     let pkg = make_pkg(&[], &[], &[]); // axios is NOT listed
     let mut config = test_config(PathBuf::from("/project"));
-    config.ignore_dependencies = vec!["axios".to_string()];
+    config.ignore_dependencies =
+        fallow_config::IgnoreDependencyMatcher::compile(&["axios".to_string()]);
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unlisted = find_unlisted_dependencies(
@@ -931,7 +945,31 @@ fn ignore_dependencies_suppresses_unlisted() {
 }
 
 #[test]
-fn workspace_file_does_not_use_root_manifest_for_unlisted_check() {
+fn ignore_dependencies_glob_suppresses_unlisted() {
+    let (graph, resolved_modules) =
+        build_graph_with_npm_imports(&[("@runtime/sqlite", false), ("axios", false)]);
+    let pkg = make_pkg(&[], &[], &[]);
+    let mut config = test_config(PathBuf::from("/project"));
+    config.ignore_dependencies =
+        fallow_config::IgnoreDependencyMatcher::compile(&["@runtime/*".to_string()]);
+    let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
+
+    let unlisted = find_unlisted_dependencies(
+        &graph,
+        &pkg,
+        &config,
+        &[],
+        None,
+        &resolved_modules,
+        &line_offsets,
+    );
+
+    let names: Vec<&str> = unlisted.iter().map(|d| d.package_name.as_str()).collect();
+    assert_eq!(names, vec!["axios"]);
+}
+
+#[test]
+fn production_file_of_publishable_workspace_does_not_use_root_manifest() {
     let case = workspace_import_case("react", false, None);
     let pkg = make_pkg(&["react"], &[], &[]);
     let config = test_config(case.root);
@@ -949,7 +987,130 @@ fn workspace_file_does_not_use_root_manifest_for_unlisted_check() {
 
     assert!(
         unlisted.iter().any(|dep| dep.package_name == "react"),
-        "workspace imports must be checked against their own package.json, not root deps"
+        "a production file of a publishable workspace must declare its packages in its own package.json"
+    );
+}
+
+fn unlisted_names_for(case: &WorkspaceImportCase, root_pkg: &PackageJson) -> Vec<String> {
+    let config = test_config(case.root.clone());
+    let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
+    find_unlisted_dependencies(
+        &case.graph,
+        root_pkg,
+        &config,
+        &case.workspaces,
+        None,
+        &case.resolved_modules,
+        &line_offsets,
+    )
+    .into_iter()
+    .map(|dep| dep.package_name)
+    .collect()
+}
+
+#[test]
+fn private_workspace_file_uses_root_manifest() {
+    let case = workspace_case(&WorkspaceCaseSpec {
+        package_name: "react",
+        workspaces: &[("packages/app", r#"{"name":"app","private":true}"#)],
+        file: "packages/app/src/index.ts",
+        is_entry: true,
+    });
+
+    assert!(
+        unlisted_names_for(&case, &make_pkg(&["react"], &[], &[])).is_empty(),
+        "a private workspace may use a package that the root manifest declares"
+    );
+    assert_eq!(
+        unlisted_names_for(&case, &make_pkg(&[], &[], &[])),
+        vec!["react".to_string()],
+        "the package stays unlisted when no manifest in the chain declares it"
+    );
+}
+
+#[test]
+fn test_file_of_publishable_workspace_uses_root_dev_dependency() {
+    let case = workspace_case(&WorkspaceCaseSpec {
+        package_name: "test-helper",
+        workspaces: &[("packages/app", r#"{"name":"app","version":"1.0.0"}"#)],
+        file: "packages/app/src/index.test.ts",
+        is_entry: true,
+    });
+
+    assert!(
+        unlisted_names_for(&case, &make_pkg(&[], &["test-helper"], &[])).is_empty(),
+        "a test file may use a devDependency that the root manifest declares"
+    );
+}
+
+#[test]
+fn nested_workspace_script_uses_ancestor_workspace_manifest() {
+    let case = workspace_case(&WorkspaceCaseSpec {
+        package_name: "build-kit",
+        workspaces: &[
+            (
+                "apps/tool",
+                r#"{"name":"tool","version":"1.0.0","dependencies":{"build-kit":"1.0.0"}}"#,
+            ),
+            (
+                "apps/tool/packages/cli",
+                r#"{"name":"cli","version":"1.0.0"}"#,
+            ),
+        ],
+        file: "apps/tool/packages/cli/scripts/build.mjs",
+        is_entry: false,
+    });
+
+    assert!(
+        unlisted_names_for(&case, &make_pkg(&[], &[], &[])).is_empty(),
+        "a build script of a nested workspace may use the ancestor workspace's declaration"
+    );
+}
+
+#[test]
+fn nested_publishable_production_file_does_not_use_ancestor_workspace_manifest() {
+    let case = workspace_case(&WorkspaceCaseSpec {
+        package_name: "build-kit",
+        workspaces: &[
+            (
+                "apps/tool",
+                r#"{"name":"tool","version":"1.0.0","dependencies":{"build-kit":"1.0.0"}}"#,
+            ),
+            (
+                "apps/tool/packages/cli",
+                r#"{"name":"cli","version":"1.0.0"}"#,
+            ),
+        ],
+        file: "apps/tool/packages/cli/src/index.ts",
+        is_entry: true,
+    });
+
+    assert_eq!(
+        unlisted_names_for(&case, &make_pkg(&[], &[], &[])),
+        vec!["build-kit".to_string()],
+        "a production file of a publishable nested workspace keeps the strict check"
+    );
+}
+
+#[test]
+fn private_workspace_does_not_use_sibling_manifest() {
+    let case = workspace_case(&WorkspaceCaseSpec {
+        package_name: "react",
+        workspaces: &[
+            ("packages/app", r#"{"name":"app","private":true}"#),
+            (
+                "packages/other",
+                r#"{"name":"other","dependencies":{"react":"1.0.0"}}"#,
+            ),
+        ],
+        file: "packages/app/src/index.ts",
+        is_entry: true,
+    });
+
+    assert_eq!(
+        unlisted_names_for(&case, &make_pkg(&[], &[], &[])),
+        vec!["react".to_string()],
+        "the walk covers ancestors only, never a sibling workspace"
     );
 }
 
@@ -989,46 +1150,79 @@ struct WorkspaceImportCase {
     workspaces: Vec<WorkspaceInfo>,
 }
 
+struct WorkspaceCaseSpec<'a> {
+    package_name: &'a str,
+    /// Workspace root relative to the repo root, and its `package.json`.
+    workspaces: &'a [(&'a str, &'a str)],
+    /// The importing file, relative to the repo root.
+    file: &'a str,
+    /// Whether the file is a runtime entry point (`main`).
+    is_entry: bool,
+}
+
 fn workspace_import_case(
     package_name: &str,
     is_type_only: bool,
     sibling_package_json: Option<&str>,
 ) -> WorkspaceImportCase {
+    let mut workspaces = vec![("packages/app", r#"{"name":"app"}"#)];
+    if let Some(package_json) = sibling_package_json {
+        workspaces.push(("packages/types-owner", package_json));
+    }
+    build_workspace_case(
+        &WorkspaceCaseSpec {
+            package_name,
+            workspaces: &workspaces,
+            file: "packages/app/src/index.ts",
+            is_entry: true,
+        },
+        is_type_only,
+    )
+}
+
+fn workspace_case(spec: &WorkspaceCaseSpec<'_>) -> WorkspaceImportCase {
+    build_workspace_case(spec, false)
+}
+
+fn build_workspace_case(spec: &WorkspaceCaseSpec<'_>, is_type_only: bool) -> WorkspaceImportCase {
+    let package_name = spec.package_name;
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().join("repo");
-    let app_root = root.join("packages/app");
-    std::fs::create_dir_all(app_root.join("src")).expect("create workspace source");
-    std::fs::write(app_root.join("package.json"), r#"{"name":"app"}"#)
-        .expect("write app package json");
 
-    let mut workspaces = vec![WorkspaceInfo {
-        root: app_root.clone(),
-        name: "app".to_string(),
-        is_internal_dependency: false,
-    }];
-
-    if let Some(package_json) = sibling_package_json {
-        let sibling_root = root.join("packages/types-owner");
-        std::fs::create_dir_all(sibling_root.join("src")).expect("create sibling source");
-        std::fs::write(sibling_root.join("package.json"), package_json)
-            .expect("write sibling package json");
+    let mut workspaces = Vec::new();
+    for (relative_root, package_json) in spec.workspaces {
+        let ws_root = root.join(relative_root);
+        std::fs::create_dir_all(&ws_root).expect("create workspace root");
+        std::fs::write(ws_root.join("package.json"), package_json)
+            .expect("write workspace package json");
+        let manifest: serde_json::Value =
+            serde_json::from_str(package_json).expect("workspace package json parses");
         workspaces.push(WorkspaceInfo {
-            root: sibling_root,
-            name: "types-owner".to_string(),
+            root: ws_root,
+            name: manifest["name"]
+                .as_str()
+                .expect("workspace package json has a name")
+                .to_string(),
             is_internal_dependency: false,
         });
     }
 
-    let file_path = app_root.join("src/index.ts");
+    let file_path = root.join(spec.file);
+    std::fs::create_dir_all(file_path.parent().expect("file has a parent"))
+        .expect("create source directory");
     let files = vec![DiscoveredFile {
         id: FileId(0),
         path: file_path.clone(),
         size_bytes: 100,
     }];
-    let entry_points = vec![EntryPoint {
-        path: file_path.clone(),
-        source: EntryPointSource::PackageJsonMain,
-    }];
+    let entry_points = if spec.is_entry {
+        vec![EntryPoint {
+            path: file_path.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }]
+    } else {
+        Vec::new()
+    };
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: file_path,
@@ -1040,6 +1234,7 @@ fn workspace_import_case(
                 imported_name: ImportedName::Named("value".to_string()),
                 local_name: "value".to_string(),
                 is_type_only,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 35),
                 source_span: oxc_span::Span::default(),
@@ -1060,6 +1255,7 @@ fn workspace_import_case(
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 

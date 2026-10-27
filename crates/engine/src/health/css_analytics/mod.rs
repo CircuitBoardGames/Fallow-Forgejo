@@ -14,6 +14,7 @@ mod cva;
 mod markup_scan;
 mod near_duplicates;
 mod preprocessor;
+mod tailwind_utilities;
 mod theme_tokens;
 mod token_consumers;
 
@@ -50,9 +51,11 @@ pub struct StylingAnalysisArtifacts {
 
 pub(super) fn build_styling_analysis_artifacts(
     files: &[fallow_types::discover::DiscoveredFile],
+    modules: &[fallow_types::extract::ModuleInfo],
     config: &ResolvedConfig,
 ) -> StylingAnalysisArtifacts {
     let ignore_set = super::ignore::build_ignore_set(&config.health.ignore);
+    let scan_css_in_js_sources = modules_use_css_in_js(modules);
     StylingAnalysisArtifacts {
         reference_surface: css_reference_surface(files, config, &ignore_set),
         class_inventory: css_class_inventory(files, config, &ignore_set),
@@ -65,8 +68,18 @@ pub(super) fn build_styling_analysis_artifacts(
                 output_changed_files: None,
                 ws_roots: None,
             },
+            scan_css_in_js_sources,
         ),
     }
+}
+
+fn modules_use_css_in_js(modules: &[fallow_types::extract::ModuleInfo]) -> bool {
+    modules.iter().any(|module| {
+        module
+            .imports
+            .iter()
+            .any(|import| !import.is_type_only && is_css_in_js_style_source(&import.source))
+    })
 }
 
 /// Compute structural CSS analytics, honoring the same ignore / changed-since /
@@ -324,11 +337,12 @@ impl CssTokenSets {
 
     /// Fold one stylesheet's Tailwind v4 `@theme` tokens, `@apply` body tokens,
     /// and `@theme`-interior `var()` reads into the project-wide sets (the inputs
-    /// to the unused-theme-token candidate). `scan_theme_blocks` /
-    /// `extract_apply_tokens` fast-path out on sources with no `@theme` / `@apply`,
-    /// so this is near-free for non-Tailwind stylesheets.
+    /// to the unused-theme-token candidate). `scan_stylesheet_tokens` masks the
+    /// source once, and only when it has a `@theme`, `@apply` or `var(`, so this
+    /// is near-free for non-Tailwind stylesheets.
     fn record_theme(&mut self, source: &str, rel: &str) {
-        let scan = crate::css::scan_theme_blocks(source);
+        let tokens = crate::css::scan_stylesheet_tokens(source);
+        let scan = tokens.theme;
         for token in scan.tokens {
             self.theme_token_definers
                 .entry(token.name)
@@ -343,15 +357,21 @@ impl CssTokenSets {
             self.theme_var_reads_located
                 .push((name, rel.to_owned(), line));
         }
-        self.apply_tokens
-            .extend(crate::css::extract_apply_tokens(source));
+        self.apply_tokens.extend(
+            tokens
+                .apply_tokens_located
+                .iter()
+                .map(|(token, _line)| token.clone()),
+        );
         self.apply_uses_located.extend(
-            crate::css::extract_apply_tokens_located(source)
+            tokens
+                .apply_tokens_located
                 .into_iter()
                 .map(|(token, line)| (token, rel.to_owned(), line)),
         );
         self.css_var_reads_located.extend(
-            crate::css::extract_css_var_reads_located(source)
+            tokens
+                .css_var_reads_located
                 .into_iter()
                 .map(|(name, line)| (name, rel.to_owned(), line)),
         );
@@ -853,6 +873,7 @@ pub(super) struct CssAnalyticsComputation {
 fn walk_css_files(
     files: &[fallow_types::discover::DiscoveredFile],
     ctx: HealthScanCtx<'_>,
+    scan_css_in_js_sources: bool,
 ) -> CssWalkAccum {
     use fallow_output::{CssAnalyticsSummary, ScopedUnusedClasses};
 
@@ -864,12 +885,13 @@ fn walk_css_files(
     // rule, which are not listed individually), finalized after the walk.
     let mut tokens = CssTokenSets::default();
     let mut scoring = CssGradeScoring::default();
-    let css_in_js = project_uses_css_in_js(&ctx.config.root);
-
     for file in files {
-        let Some((relative, kind)) = css_report_scan_target(file, ctx, css_in_js) else {
+        let Some((relative, kind)) = css_report_scan_target(file, ctx) else {
             continue;
         };
+        if kind == CssScanKind::CssInJs && !scan_css_in_js_sources {
+            continue;
+        }
         let Ok(source) = std::fs::read_to_string(&file.path) else {
             continue;
         };
@@ -915,8 +937,14 @@ fn record_css_scan_item(
     let Some(mut analytics) = crate::css::compute_css_analytics(&item.source) else {
         return false;
     };
-    record_css_analytics_summary(summary, &analytics);
     tokens.record_theme(item.source.as_ref(), rel);
+    for layer in &item.layers {
+        if let Some(layer_analytics) = crate::css::compute_css_analytics(layer) {
+            merge_css_analytics(&mut analytics, layer_analytics);
+        }
+        tokens.record_theme(layer, rel);
+    }
+    record_css_analytics_summary(summary, &analytics);
 
     match item.policy {
         GradePolicy::Atomic => {
@@ -1020,20 +1048,32 @@ pub(super) fn compute_css_analytics_report_with_artifacts(
     // Collect CSS-in-JS token definers ONCE per run (parsing every candidate
     // definer file from disk). Both the comparable-token candidate pass and the
     // consumer blast-radius pass borrow this, instead of each recomputing it.
-    // `None` mirrors the old `!project_uses_css_in_js` short-circuit exactly.
-    let css_in_js_definers = project_uses_css_in_js(&config.root).then(|| {
+    let has_css_in_js_definer_source = modules.iter().any(|module| {
+        module.imports.iter().any(|import| {
+            !import.is_type_only
+                && (is_css_in_js_token_lib(&import.source)
+                    || is_theme_provider_source(&import.source))
+        })
+    });
+    let css_in_js_definers = has_css_in_js_definer_source.then(|| {
         let path_by_id: rustc_hash::FxHashMap<fallow_types::discover::FileId, &std::path::Path> =
             files.iter().map(|f| (f.id, f.path.as_path())).collect();
         collect_css_in_js_definers(modules, &path_by_id, config)
     });
 
-    let walk = css_report_walk(files, ctx, styling_artifacts);
+    let scan_css_in_js_sources = modules_use_css_in_js(modules);
+    let walk = css_report_walk(files, ctx, styling_artifacts, scan_css_in_js_sources);
     let walk_ref = walk.as_ref();
     let mut summary = walk_ref.summary.clone();
     let mut raw_style_values = walk_ref.tokens.raw_style_values.clone();
     let styling_token_candidates =
-        css_report_token_candidates(&walk_ref.tokens, config, css_in_js_definers.as_ref());
-    annotate_raw_style_value_nearest_tokens(&mut raw_style_values, &styling_token_candidates);
+        StylingTokenCandidateCache::new(&walk_ref.tokens, config, css_in_js_definers.as_ref());
+    if !raw_style_values.is_empty() {
+        annotate_raw_style_value_nearest_tokens(
+            &mut raw_style_values,
+            styling_token_candidates.get(),
+        );
+    }
     let metrics =
         finalize_css_token_metrics(&walk_ref.tokens, &mut summary, files, config, ignore_set);
     let candidates = scan_markup_css_candidates(&mut MarkupCssCandidateInput {
@@ -1082,6 +1122,7 @@ fn css_report_walk<'a>(
     files: &[fallow_types::discover::DiscoveredFile],
     ctx: HealthScanCtx<'_>,
     styling_artifacts: Option<&'a StylingAnalysisArtifacts>,
+    scan_css_in_js_sources: bool,
 ) -> CssReportWalk<'a> {
     let HealthScanCtx {
         changed_files,
@@ -1095,7 +1136,7 @@ fn css_report_walk<'a>(
     {
         CssReportWalk::Cached(&artifacts.whole_scope_walk)
     } else {
-        CssReportWalk::Fresh(Box::new(walk_css_files(files, ctx)))
+        CssReportWalk::Fresh(Box::new(walk_css_files(files, ctx, scan_css_in_js_sources)))
     }
 }
 
@@ -1120,6 +1161,46 @@ fn css_report_token_candidates(
     candidates.extend(comparable_project_vocabulary_candidates(tokens));
     candidates.sort_by(|a, b| theme_token_sort_key(a).cmp(&theme_token_sort_key(b)));
     candidates
+}
+
+struct StylingTokenCandidateCache<'a> {
+    candidates: std::cell::OnceCell<Vec<ComparableThemeTokenCandidate>>,
+    tokens: &'a CssTokenSets,
+    config: &'a ResolvedConfig,
+    css_in_js_definers: Option<&'a CssInJsDefiners>,
+}
+
+impl<'a> StylingTokenCandidateCache<'a> {
+    fn new(
+        tokens: &'a CssTokenSets,
+        config: &'a ResolvedConfig,
+        css_in_js_definers: Option<&'a CssInJsDefiners>,
+    ) -> Self {
+        Self {
+            candidates: std::cell::OnceCell::new(),
+            tokens,
+            config,
+            css_in_js_definers,
+        }
+    }
+
+    fn get(&self) -> &[ComparableThemeTokenCandidate] {
+        self.candidates.get_or_init(|| {
+            css_report_token_candidates(self.tokens, self.config, self.css_in_js_definers)
+        })
+    }
+
+    fn is_definitely_empty(&self) -> bool {
+        if let Some(candidates) = self.candidates.get() {
+            return candidates.is_empty();
+        }
+        self.tokens.theme_token_definers.is_empty()
+            && self.tokens.custom_property_definers.is_empty()
+            && self.tokens.raw_style_values.len() < 2
+            && self
+                .css_in_js_definers
+                .is_none_or(|definers| definers.entries.iter().all(|entry| entry.leaves.is_empty()))
+    }
 }
 
 fn css_report_token_consumers(

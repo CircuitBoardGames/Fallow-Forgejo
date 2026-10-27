@@ -5,8 +5,8 @@ name: Test
 # `.forgejo/workflows` is what the forge reads instead, so none of those run and the upstream files
 # stay untouched for clean syncs.
 #
-# SCOPE IS DELIBERATELY `cargo test` AND CLIPPY from upstream ci.yml's `check` job: its three clippy
-# passes, run verbatim (`-D warnings`, so any warning fails), and its test suite. Its NAPI build and
+# SCOPE IS DELIBERATELY `cargo test` AND CLIPPY from upstream ci.yml's `check` job: its clippy
+# passes (two since upstream merged the feature passes), run verbatim (`-D warnings`, so any warning fails), and its test suite. Its NAPI build and
 # contract-drift gates are not ported. The runner executes on the
 # AIroborOS host (labels ubuntu-latest:host, Nice=10), which also serves the forge, the site and the
 # agents, and a Rust workspace build is the heaviest thing this forge would run. Add steps when the
@@ -49,7 +49,11 @@ jobs:
           if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
           fi
-          "$HOME/.cargo/bin/rustup" toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          # The channel is read from rust-toolchain.toml, as upstream's setup-rust action does, so an
+          # upstream toolchain bump needs no edit here (a hard-coded 1.97.1 went stale at 1.99.0).
+          channel=$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ {print $2; exit}' rust-toolchain.toml)
+          [ -n "$channel" ] || { echo "no channel in rust-toolchain.toml"; exit 1; }
+          "$HOME/.cargo/bin/rustup" toolchain install "$channel" --profile minimal --component clippy,rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # The CLI's audit tests spawn the type-aware sidecar (node), so its dependencies must exist
       # before `cargo test` -- upstream's check job does this; the first forge run without it failed
@@ -80,10 +84,8 @@ jobs:
             echo "CARGO_INCREMENTAL=0"; } >> "$GITHUB_ENV"
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy (test-sidecar-key feature)
-        run: cargo clippy -p fallow-cli --features test-sidecar-key --all-targets -- -D warnings
-      - name: Clippy (schema-emit feature)
-        run: cargo clippy -p fallow-cli --features schema-emit --bin fallow-schema-emit --tests -- -D warnings
+      - name: Clippy (test-sidecar-key and schema-emit features)
+        run: cargo clippy -p fallow-cli --features test-sidecar-key,schema-emit --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace --lib --bins --tests --examples
       # The hit rate goes in the log, and the job's server does not outlive it. Never fails: a cancelled

@@ -9,11 +9,7 @@ use std::process::ExitCode;
 use fallow_config::{FallowConfig, OutputFormat};
 
 use crate::error::emit_error;
-
-/// Exit code for `--path` when no config file was found (there is no path to
-/// print). The default resolved-config view instead succeeds and prints the
-/// effective defaults, because a zero-config project is fully supported.
-const EXIT_NO_CONFIG: u8 = 3;
+use crate::exit_codes::RESOURCE_UNAVAILABLE_EXIT_CODE as EXIT_NO_CONFIG;
 
 /// Run the `fallow config` subcommand.
 ///
@@ -94,7 +90,7 @@ pub fn run_config_with_options(input: RunConfigInput<'_>) -> ExitCode {
                     eprintln!("loaded config: {}", path.display());
                 }
                 match input.json_style.serialize(&config) {
-                    Ok(json) => println!("{json}"),
+                    Ok(json) => crate::report::sink::stdoutln!("{json}"),
                     Err(e) => {
                         return emit_error(&format!("failed to serialize config: {e}"), 2, output);
                     }
@@ -118,7 +114,7 @@ pub fn run_config_with_options(input: RunConfigInput<'_>) -> ExitCode {
             }
             match input.json_style.serialize(&FallowConfig::default()) {
                 Ok(json) => {
-                    println!("{json}");
+                    crate::report::sink::stdoutln!("{json}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => emit_error(&format!("failed to serialize config: {e}"), 2, output),

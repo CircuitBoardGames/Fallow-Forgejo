@@ -3,7 +3,7 @@ use std::path::Path;
 use fallow_types::discover::FileId;
 use fallow_types::extract::ModuleInfo;
 
-use crate::parse::parse_source_to_module;
+use crate::parse_source_to_module;
 
 fn parse_sfc(source: &str, filename: &str) -> ModuleInfo {
     parse_source_to_module(FileId(0), Path::new(filename), source, 0, false)
@@ -11,6 +11,42 @@ fn parse_sfc(source: &str, filename: &str) -> ModuleInfo {
 
 fn parse_sfc_with_complexity(source: &str, filename: &str) -> ModuleInfo {
     parse_source_to_module(FileId(0), Path::new(filename), source, 0, true)
+}
+
+#[test]
+fn vue_scripts_stably_deduplicate_local_type_declarations() {
+    let source = r#"
+<script lang="ts">
+interface Shared {}
+namespace Scope {}
+type Alias = string;
+</script>
+<script setup lang="ts">
+interface Shared { value: string }
+namespace Scope { export const value = 1 }
+type Alias = number;
+</script>
+"#;
+    let info = parse_sfc(source, "Merged.vue");
+
+    let declarations: Vec<(&str, Option<usize>)> = info
+        .local_type_declarations
+        .iter()
+        .map(|declaration| {
+            (
+                declaration.name.as_str(),
+                usize::try_from(declaration.span.start).ok(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        declarations,
+        [
+            ("Shared", source.find("Shared")),
+            ("Scope", source.find("Scope")),
+            ("Alias", source.find("Alias")),
+        ]
+    );
 }
 
 #[test]
@@ -948,6 +984,71 @@ const items = ref<T[]>([]);
     assert_eq!(info.imports[0].source, "vue");
 }
 
+/// The `generic="..."` attribute re-parses an augmented body and recomputes the
+/// whole binding verdict, so the `import X = require('./x')` lane has to travel
+/// with it. Without that the binding kept crediting its target on a
+/// `generic="..."` script while the plain `<script setup>` next to it reported,
+/// which made the verdict depend on which parse path the file happened to take
+/// (issue #2365).
+#[test]
+fn vue_generic_attr_reports_an_unreferenced_import_equals_binding() {
+    let generic = parse_sfc(
+        r#"
+<script setup lang="ts" generic="T extends { id: string }">
+import GenTarget = require('./gen-target');
+defineProps<{ item: T }>();
+</script>
+"#,
+        "Generic.vue",
+    );
+    assert!(
+        generic
+            .unused_import_bindings
+            .contains(&"GenTarget".to_string()),
+        "an unreferenced import-equals binding reports on the generic= path too, got: {:?}",
+        generic.unused_import_bindings,
+    );
+
+    // The plain `<script setup>` twin takes the other parse path and must reach
+    // the same verdict.
+    let plain = parse_sfc(
+        r#"
+<script setup lang="ts">
+import PlainTarget = require('./plain-target');
+defineProps<{ item: string }>();
+</script>
+"#,
+        "Plain.vue",
+    );
+    assert!(
+        plain
+            .unused_import_bindings
+            .contains(&"PlainTarget".to_string()),
+        "the plain script path reports the same way, got: {:?}",
+        plain.unused_import_bindings,
+    );
+
+    // Positive control: a referenced binding is not reported on either path, so
+    // the assertions above are not passing because every binding lands there.
+    let referenced = parse_sfc(
+        r#"
+<script setup lang="ts" generic="T extends { id: string }">
+import UsedTarget = require('./used-target');
+defineProps<{ item: T }>();
+console.log(UsedTarget.alpha);
+</script>
+"#,
+        "Used.vue",
+    );
+    assert!(
+        !referenced
+            .unused_import_bindings
+            .contains(&"UsedTarget".to_string()),
+        "a referenced binding is not unused, got: {:?}",
+        referenced.unused_import_bindings,
+    );
+}
+
 #[test]
 fn vue_generic_attr_marks_type_only_import_as_type_referenced() {
     let info = parse_sfc(
@@ -1606,6 +1707,46 @@ const helper = () => { if (flag) return 1; return 0; };
 }
 
 #[test]
+fn svelte_top_level_snippet_adds_its_own_unit() {
+    let info = parse_sfc_with_complexity(
+        r"<script>
+const helper = () => { if (flag) return 1; return 0; };
+</script>
+{#snippet rowBody(row)}
+  {#if row.active}
+    {#each row.cells as cell}
+      <p>{cell.length > 3 ? 'wide' : 'thin'}</p>
+    {/each}
+  {:else}
+    <p>-</p>
+  {/if}
+{/snippet}
+{#each rows as row (row.id)}
+  {@render rowBody(row)}
+{/each}
+",
+        "SvelteSnippet.svelte",
+    );
+
+    let snippet = info
+        .complexity
+        .iter()
+        .find(|fc| fc.name == "<snippet:rowBody>")
+        .expect("a top-level snippet becomes its own module.complexity unit");
+    let template = info
+        .complexity
+        .iter()
+        .find(|fc| fc.name == "<template>")
+        .expect("the parent template keeps its own unit");
+    assert!(snippet.cyclomatic > 1, "{snippet:?}");
+    assert!(
+        template.cyclomatic < snippet.cyclomatic,
+        "the parent no longer accumulates the snippet body: template {template:?} vs snippet {snippet:?}"
+    );
+    assert!(info.complexity.iter().any(|fc| fc.name == "helper"));
+}
+
+#[test]
 fn vue_markup_only_template_adds_no_synthetic_entry() {
     let info = parse_sfc_with_complexity(
         r#"<script setup>
@@ -2221,5 +2362,49 @@ export class UserS {
         }),
         "the typed-property fact should survive the SFC merge, found: {:?}",
         info.semantic_facts
+    );
+}
+
+#[test]
+fn vue_script_setup_top_level_await_import_stays_lazy() {
+    let source = r#"
+<script>
+const { a } = await import("./module-level");
+</script>
+<script setup>
+const { b } = await import("./setup-level");
+</script>
+"#;
+    let info = parse_sfc(source, "Lazy.vue");
+    assert_eq!(
+        crate::tests::eager_dynamic_import_sources(&info),
+        ["./module-level"]
+    );
+    assert!(
+        info.dynamic_imports
+            .iter()
+            .any(|import| import.source == "./setup-level")
+    );
+}
+
+#[test]
+fn svelte_instance_top_level_await_import_stays_lazy() {
+    let source = r#"
+<script module>
+const { a } = await import("./module-level");
+</script>
+<script>
+const { b } = await import("./instance-level");
+</script>
+"#;
+    let info = parse_sfc(source, "Lazy.svelte");
+    assert_eq!(
+        crate::tests::eager_dynamic_import_sources(&info),
+        ["./module-level"]
+    );
+    assert!(
+        info.dynamic_imports
+            .iter()
+            .any(|import| import.source == "./instance-level")
     );
 }

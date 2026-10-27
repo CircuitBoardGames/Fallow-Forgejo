@@ -1,5 +1,6 @@
 //! Typed client for the batched type-aware semantic protocol.
 
+mod empty;
 mod queries;
 mod reconcile;
 
@@ -28,17 +29,24 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::manifest::BACKEND_VERSION;
 use super::manifest::{
-    ANALYSIS_OPERATION as OPERATION, BACKEND_FAMILY, BACKEND_VERSION, QUERY_OPERATIONS,
-    SEMANTIC_SCHEMA_VERSION, WIRE_PROTOCOL_VERSION as PROTOCOL_VERSION,
+    ANALYSIS_OPERATION as OPERATION, BACKEND_FAMILY, QUERY_OPERATIONS, SEMANTIC_SCHEMA_VERSION,
+    WIRE_PROTOCOL_VERSION as PROTOCOL_VERSION, selected_backend,
 };
 use super::transport::{TypeAwareError, TypeAwareOutcome};
+use empty::empty_semantic_outcome;
 use queries::{build_dead_code_queries, query_supports_guarded_fix};
 use reconcile::apply_dead_code_response;
 #[cfg(test)]
 use reconcile::semantic_only_candidate_stays_hidden;
 
 const EVIDENCE_LIMIT: usize = 40;
+/// A type-coupling result is one project-wide report, not one symbol, so it
+/// carries more evidence than [`EVIDENCE_LIMIT`]. The sidecar rejects a larger
+/// value. The bound keeps the response well below the semantic byte limit.
+const TYPE_COUPLING_EVIDENCE_LIMIT: usize = 10_000;
 const MAX_SEMANTIC_QUERIES: usize = 25_000;
 const MAX_PRIVATE_LEAK_CANDIDATES: usize = 25_000;
 
@@ -79,6 +87,7 @@ enum SemanticQuery {
         id: usize,
         entry_points: Vec<String>,
         include_cycles: bool,
+        evidence_limit: usize,
     },
 }
 
@@ -667,8 +676,12 @@ fn refine_dead_code_results_with_transport(
         return Ok(None);
     }
     if queries.is_empty() {
+        let (backend_family, _) = selected_backend().map_err(TypeAwareError::from)?;
         discard_unverified_semantic_candidates(results);
-        return Ok(Some(empty_semantic_outcome(requested_capabilities)));
+        return Ok(Some(empty_semantic_outcome(
+            requested_capabilities,
+            backend_family,
+        )));
     }
     let request = SemanticRequest {
         protocol_version: PROTOCOL_VERSION,
@@ -702,34 +715,6 @@ fn refine_dead_code_results_with_transport(
         requested_capabilities,
     )
     .map(Some)
-}
-
-fn empty_semantic_outcome(mut capabilities: Vec<SemanticCapability>) -> SemanticDeadCodeOutcome {
-    capabilities.sort_unstable();
-    capabilities.dedup();
-    let identity = SemanticAnalysisIdentity {
-        mode: SemanticAnalysisMode::TypeAware,
-        semantic_schema_version: SEMANTIC_SCHEMA_VERSION,
-        capabilities,
-        project_config_hash: DEFERRED_PROJECT_CONFIG_HASH.to_string(),
-        backend_family: BACKEND_FAMILY.to_string(),
-        completeness: SemanticCompleteness::Complete,
-    };
-    SemanticDeadCodeOutcome {
-        type_aware: TypeAwareOutcome {
-            meta: TypeAwareMeta {
-                identity: Some(identity),
-                executed: false,
-                protocol_version: PROTOCOL_VERSION,
-                sidecar_version: None,
-                backend: BACKEND_FAMILY.to_string(),
-                backend_version: None,
-                ..TypeAwareMeta::default()
-            },
-            warnings: Vec::new(),
-        },
-        type_coupling: None,
-    }
 }
 
 /// Resolve exact checker-backed references for one exported symbol.
@@ -1128,6 +1113,7 @@ pub fn type_coupling(
             id: 0,
             entry_points,
             include_cycles: true,
+            evidence_limit: TYPE_COUPLING_EVIDENCE_LIMIT,
         },
     )?;
     let result = response.results.first().ok_or_else(|| {
@@ -1447,15 +1433,16 @@ fn validate_response(
             env!("CARGO_PKG_VERSION"),
         )));
     }
-    if response.backend != BACKEND_FAMILY {
+    let (backend_family, backend_version) = selected_backend().map_err(TypeAwareError::from)?;
+    if response.backend != backend_family {
         return Err(TypeAwareError::from(format!(
-            "unsupported type-aware backend {}",
+            "unsupported type-aware backend {}; expected {backend_family}",
             response.backend
         )));
     }
-    if response.backend_version != BACKEND_VERSION {
+    if response.backend_version != backend_version {
         return Err(TypeAwareError::from(format!(
-            "unsupported type-aware backend version {}; expected {BACKEND_VERSION}",
+            "unsupported type-aware backend version {}; expected {backend_version}",
             response.backend_version
         )));
     }
@@ -1887,6 +1874,7 @@ const fn unresolved_gap(reason: Option<SemanticGapReason>) -> bool {
             SemanticGapReason::NoProject
                 | SemanticGapReason::AmbiguousProject
                 | SemanticGapReason::BlockingDiagnostics
+                | SemanticGapReason::SvelteVirtualModuleExports
                 | SemanticGapReason::UnknownSymbol
                 | SemanticGapReason::IncompleteProjectCoverage
                 | SemanticGapReason::FrameworkContractProvenance
@@ -2084,6 +2072,9 @@ const fn gap_reason_phrase(reason: Option<SemanticGapReason>) -> &'static str {
         Some(SemanticGapReason::NoProject) => "no owning TypeScript project",
         Some(SemanticGapReason::AmbiguousProject) => "ambiguous owning projects",
         Some(SemanticGapReason::BlockingDiagnostics) => "blocking structural diagnostics",
+        Some(SemanticGapReason::SvelteVirtualModuleExports) => {
+            "unavailable Svelte virtual-module exports"
+        }
         Some(SemanticGapReason::UnknownSymbol) => "an unresolved exact declaration",
         Some(SemanticGapReason::UnknownEntryPoint) => "an unresolved public entry point",
         Some(SemanticGapReason::EvidenceLimit) => "the configured evidence limit",
@@ -2132,13 +2123,19 @@ fn record_candidate_decision(
                 Some(SemanticGapReason::BlockingDiagnostics) => {
                     stats.abstention_reasons.blocking_diagnostics += 1;
                 }
+                Some(SemanticGapReason::SvelteVirtualModuleExports) => {
+                    stats.abstention_reasons.svelte_virtual_module_exports += 1;
+                }
                 Some(SemanticGapReason::UnknownSymbol) => {
                     stats.abstention_reasons.unknown_symbol += 1;
                 }
                 Some(SemanticGapReason::Capacity) => {
                     stats.abstention_reasons.capacity += 1;
                 }
-                _ => stats.abstention_reasons.unsupported_syntax += 1,
+                Some(SemanticGapReason::UnsupportedSyntax) => {
+                    stats.abstention_reasons.unsupported_syntax += 1;
+                }
+                _ => {}
             }
         }
         SemanticCandidateDecisionKind::RetainedAbstained => {
@@ -2148,13 +2145,19 @@ fn record_candidate_decision(
                 Some(SemanticGapReason::BlockingDiagnostics) => {
                     stats.abstention_reasons.blocking_diagnostics += 1;
                 }
+                Some(SemanticGapReason::SvelteVirtualModuleExports) => {
+                    stats.abstention_reasons.svelte_virtual_module_exports += 1;
+                }
                 Some(SemanticGapReason::UnknownSymbol) => {
                     stats.abstention_reasons.unknown_symbol += 1;
                 }
                 Some(SemanticGapReason::Capacity) => {
                     stats.abstention_reasons.capacity += 1;
                 }
-                _ => stats.abstention_reasons.unsupported_syntax += 1,
+                Some(SemanticGapReason::UnsupportedSyntax) => {
+                    stats.abstention_reasons.unsupported_syntax += 1;
+                }
+                _ => {}
             }
         }
     }
@@ -2548,6 +2551,7 @@ mod tests {
                     id: 4,
                     entry_points: vec!["src/config.ts".to_string()],
                     include_cycles: true,
+                    evidence_limit: TYPE_COUPLING_EVIDENCE_LIMIT,
                 },
             ],
         }
@@ -2689,6 +2693,8 @@ mod tests {
                         col: 0,
                         span_start: 0,
                         is_re_export: false,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                 ),
             );
@@ -2777,6 +2783,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         };
         let type_export = fallow_types::results::UnusedExport {
             path: export_path,
@@ -2786,6 +2794,8 @@ mod tests {
             col: 0,
             span_start: 10,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         };
         AnalysisResults {
             unused_class_members: vec![class_member],
@@ -3043,11 +3053,14 @@ mod tests {
         assert_eq!(paths[1].distance, 2);
         assert_eq!(paths[1].relation, "affected");
 
-        let outcome = empty_semantic_outcome(vec![
-            SemanticCapability::SymbolUse,
-            SemanticCapability::ApiSurface,
-            SemanticCapability::SymbolUse,
-        ]);
+        let outcome = empty_semantic_outcome(
+            vec![
+                SemanticCapability::SymbolUse,
+                SemanticCapability::ApiSurface,
+                SemanticCapability::SymbolUse,
+            ],
+            BACKEND_FAMILY,
+        );
         assert!(!outcome.type_aware.meta.executed);
         assert!(outcome.type_aware.meta.sidecar_version.is_none());
         assert!(outcome.type_aware.meta.backend_version.is_none());
@@ -3085,7 +3098,7 @@ mod tests {
 
     #[test]
     fn real_semantic_query_replaces_deferred_project_identity() {
-        let empty = empty_semantic_outcome(vec![SemanticCapability::SymbolUse]);
+        let empty = empty_semantic_outcome(vec![SemanticCapability::SymbolUse], BACKEND_FAMILY);
         let mut identity = empty.type_aware.meta.identity;
         merge_semantic_identity(
             &mut identity,
@@ -3401,6 +3414,8 @@ mod tests {
                         col: 0,
                         span_start: 0,
                         is_re_export: false,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                 )
             })
@@ -3425,6 +3440,25 @@ mod tests {
     }
 
     #[test]
+    fn type_coupling_query_requests_the_project_report_evidence_limit() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path();
+        let batch = build_dead_code_queries(
+            root,
+            &AnalysisResults::default(),
+            &[root.join("src/index.ts")],
+            false,
+            false,
+            true,
+        )
+        .expect("type-coupling query batch");
+
+        let wire = serde_json::to_value(&batch.queries).expect("serialize queries");
+        assert_eq!(wire[0]["operation"], "type-coupling");
+        assert_eq!(wire[0]["evidence_limit"], 10_000);
+    }
+
+    #[test]
     fn semantic_queries_preserve_export_namespaces_and_targets() {
         let directory = tempdir().expect("temporary directory");
         let root = directory.path();
@@ -3439,6 +3473,8 @@ mod tests {
                     col: 7,
                     span_start: 14,
                     is_re_export: false,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ),
         );
@@ -3452,6 +3488,8 @@ mod tests {
                     col: 2,
                     span_start: 28,
                     is_re_export: false,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ),
         );
@@ -3838,6 +3876,37 @@ mod tests {
         assert_eq!(stats.contract_preserved, 1);
         assert_eq!(stats.no_static_references, 1);
         assert_eq!(stats.fix_eligible, 1);
+    }
+
+    #[test]
+    fn svelte_virtual_module_gaps_have_a_dedicated_abstention_count() {
+        let decision = SemanticCandidateDecision {
+            query_id: 0,
+            subject: symbol(),
+            decision: SemanticCandidateDecisionKind::RetainedUnresolved,
+            status: SemanticCompleteness::Unavailable,
+            owning_projects: vec!["tsconfig.json".to_string()],
+            evidence: Vec::new(),
+            contract: None,
+            framework_contract: None,
+            closed_world_eligible: false,
+            edit_guard: None,
+            reason_code: Some(SemanticGapReason::SvelteVirtualModuleExports),
+            explanation: "test decision".to_string(),
+            actions: Vec::new(),
+            total_evidence_count: 0,
+            truncated: false,
+            omissions: Vec::new(),
+        };
+        let mut removed = BTreeSet::new();
+        let mut stats = CandidateDecisionStats::default();
+
+        record_candidate_decision(&decision, 0, &mut removed, &mut stats);
+
+        assert!(removed.is_empty());
+        assert_eq!(stats.unresolved, 1);
+        assert_eq!(stats.abstention_reasons.svelte_virtual_module_exports, 1);
+        assert_eq!(stats.abstention_reasons.blocking_diagnostics, 0);
     }
 
     #[test]

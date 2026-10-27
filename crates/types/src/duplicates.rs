@@ -1,8 +1,10 @@
 //! Shared duplicate-code output contracts.
 
 use std::cmp::{Ordering, Reverse};
+use std::collections::hash_map::Entry;
 use std::path::{Component, Path, PathBuf};
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::serde_path;
@@ -23,7 +25,21 @@ pub struct CloneInstance {
     /// 0-based end column.
     pub end_col: usize,
     /// The actual source code fragment.
+    ///
+    /// Omitted from JSON when the caller asked for a location-only payload
+    /// (`fallow dupes --no-fragments`, and the MCP `find_dupes` default). The
+    /// five location fields above address the same text, so a consumer that
+    /// wants the source reads it from the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub fragment: String,
+    /// Whether the file path is a symlink, or lies under a symlinked
+    /// directory, inside the project root. Omitted when `false`.
+    ///
+    /// A clone with a symlinked instance can be the same file under two
+    /// paths, not copied code. `duplicates.ignoreSymlinks` (or
+    /// `fallow dupes --ignore-symlinks`) removes these instances.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_symlink: bool,
 }
 
 /// A group of code clones -- the same (or normalized-equivalent) code appearing
@@ -75,6 +91,13 @@ impl CloneGroup {
     pub fn spread(&self) -> usize {
         clone_group_spread(&self.instances)
     }
+
+    /// Drop the verbatim source text from every instance in this group.
+    pub fn strip_fragments(&mut self) {
+        for instance in &mut self.instances {
+            instance.fragment.clear();
+        }
+    }
 }
 
 const SAME_FILE_SPREAD_STEP: usize = 250;
@@ -115,55 +138,206 @@ pub fn clone_group_spread(instances: &[CloneInstance]) -> usize {
 pub fn clone_location_spread<'a>(
     locations: impl IntoIterator<Item = (&'a Path, usize, usize)>,
 ) -> usize {
-    let mut by_file = locations
-        .into_iter()
-        .map(|(file, start_line, end_line)| CloneLocation {
-            file,
-            start_line,
-            end_line,
-        })
-        .collect::<Vec<_>>();
-    if by_file.len() < 2 {
+    let mut locations = locations.into_iter();
+    let mut small = SmallFileSet::default();
+    let mut location_count = 0;
+    while let Some((file, start_line, end_line)) = locations.next() {
+        location_count += 1;
+        if small.include(file, start_line, end_line) {
+            continue;
+        }
+        let new_file = FileLines::new(file, start_line, end_line);
+        if !small.push(new_file) {
+            return large_location_spread(&small, new_file, locations);
+        }
+    }
+
+    if location_count < 2 {
         return 0;
     }
-
-    by_file.sort_unstable_by(|left, right| left.file.cmp(right.file));
-
-    let mut same_file_max = 0;
-    let mut parent_components = Vec::new();
-    let mut start = 0;
-    while start < by_file.len() {
-        let mut end = start + 1;
-        while end < by_file.len() && by_file[end].file == by_file[start].file {
-            end += 1;
-        }
-
-        parent_components.push(path_parent_components(by_file[start].file));
-        if end - start >= 2 {
-            let min_end = by_file[start..end]
-                .iter()
-                .map(|instance| instance.end_line)
-                .min()
-                .unwrap_or(0);
-            let max_start = by_file[start..end]
-                .iter()
-                .map(|instance| instance.start_line)
-                .max()
-                .unwrap_or(0);
-            let gap = max_start.saturating_sub(min_end).saturating_sub(1);
-            same_file_max = same_file_max.max(gap.div_ceil(SAME_FILE_SPREAD_STEP));
-        }
-        start = end;
-    }
-
-    same_file_max.max(directory_tree_diameter(&parent_components))
+    small.spread()
 }
 
+/// The number of files that [`clone_location_spread`] keeps on the stack.
+/// Most clone groups span two or three files.
+const SMALL_FILE_SET_LIMIT: usize = 8;
+
+/// The line range of the locations in one file.
 #[derive(Clone, Copy)]
-struct CloneLocation<'a> {
+struct FileLines<'a> {
     file: &'a Path,
-    start_line: usize,
-    end_line: usize,
+    min_end: usize,
+    max_start: usize,
+    occurrences: usize,
+}
+
+impl<'a> FileLines<'a> {
+    const fn new(file: &'a Path, start_line: usize, end_line: usize) -> Self {
+        Self {
+            file,
+            min_end: end_line,
+            max_start: start_line,
+            occurrences: 1,
+        }
+    }
+
+    fn include(&mut self, start_line: usize, end_line: usize) {
+        self.min_end = self.min_end.min(end_line);
+        self.max_start = self.max_start.max(start_line);
+        self.occurrences += 1;
+    }
+
+    fn same_file_spread(&self) -> usize {
+        self.max_start
+            .saturating_sub(self.min_end)
+            .saturating_sub(1)
+            .div_ceil(SAME_FILE_SPREAD_STEP)
+    }
+}
+
+/// The files of a small clone group, without a heap allocation.
+#[derive(Default)]
+struct SmallFileSet<'a> {
+    files: [Option<FileLines<'a>>; SMALL_FILE_SET_LIMIT],
+    len: usize,
+}
+
+impl<'a> SmallFileSet<'a> {
+    fn iter(&self) -> impl Iterator<Item = &FileLines<'a>> {
+        self.files[..self.len].iter().flatten()
+    }
+
+    /// Add a location to its file. Returns `false` when the file is new.
+    fn include(&mut self, file: &Path, start_line: usize, end_line: usize) -> bool {
+        let Some(lines) = self.files[..self.len]
+            .iter_mut()
+            .flatten()
+            .find(|lines| lines.file == file)
+        else {
+            return false;
+        };
+        lines.include(start_line, end_line);
+        true
+    }
+
+    /// Add a new file. Returns `false` when the set is full.
+    fn push(&mut self, lines: FileLines<'a>) -> bool {
+        let Some(slot) = self.files.get_mut(self.len) else {
+            return false;
+        };
+        *slot = Some(lines);
+        self.len += 1;
+        true
+    }
+
+    /// The spread of the set: the largest same-file spread or the largest
+    /// directory distance between two files. With few files, the pairwise
+    /// maximum is the tree diameter.
+    fn spread(&self) -> usize {
+        let same_file_max = self
+            .iter()
+            .filter(|lines| lines.occurrences >= 2)
+            .map(FileLines::same_file_spread)
+            .max()
+            .unwrap_or(0);
+        let mut diameter = 0;
+        for (index, left) in self.iter().enumerate() {
+            for right in self.iter().skip(index + 1) {
+                diameter = diameter.max(parent_distance(left.file, right.file));
+            }
+        }
+        same_file_max.max(diameter)
+    }
+}
+
+/// The number of parent-directory steps between two files, read in one pass
+/// over each path.
+fn parent_distance(left: &Path, right: &Path) -> usize {
+    let mut left = left.parent().unwrap_or_else(|| Path::new("")).components();
+    let mut right = right.parent().unwrap_or_else(|| Path::new("")).components();
+    loop {
+        match (left.next(), right.next()) {
+            (Some(left_part), Some(right_part)) if left_part == right_part => {}
+            (Some(_), Some(_)) => return 2 + left.count() + right.count(),
+            (Some(_), None) => return 1 + left.count(),
+            (None, Some(_)) => return 1 + right.count(),
+            (None, None) => return 0,
+        }
+    }
+}
+
+/// The spread of a clone group with more files than [`SmallFileSet`] holds.
+fn large_location_spread<'a>(
+    small: &SmallFileSet<'a>,
+    pending: FileLines<'a>,
+    rest: impl Iterator<Item = (&'a Path, usize, usize)>,
+) -> usize {
+    let mut file_indices: FxHashMap<&'a Path, usize> = FxHashMap::default();
+    let mut by_file: Vec<FileSpread<'a>> = Vec::new();
+    for lines in small.iter().copied().chain(std::iter::once(pending)) {
+        file_indices.insert(lines.file, by_file.len());
+        by_file.push(FileSpread::from_lines(lines));
+    }
+
+    for (file, start_line, end_line) in rest {
+        let next_index = by_file.len();
+        match file_indices.entry(file) {
+            Entry::Occupied(entry) => by_file[*entry.get()].include(start_line, end_line),
+            Entry::Vacant(entry) => {
+                entry.insert(next_index);
+                by_file.push(FileSpread::new(file, start_line, end_line));
+            }
+        }
+    }
+
+    let same_file_max = by_file
+        .iter()
+        .filter(|file| file.occurrences >= 2)
+        .map(FileSpread::same_file_spread)
+        .max()
+        .unwrap_or(0);
+
+    same_file_max.max(directory_tree_diameter(&by_file))
+}
+
+struct FileSpread<'a> {
+    parent_components: Vec<Component<'a>>,
+    min_end: usize,
+    max_start: usize,
+    occurrences: usize,
+}
+
+impl<'a> FileSpread<'a> {
+    fn from_lines(lines: FileLines<'a>) -> Self {
+        Self {
+            parent_components: path_parent_components(lines.file),
+            min_end: lines.min_end,
+            max_start: lines.max_start,
+            occurrences: lines.occurrences,
+        }
+    }
+
+    fn new(file: &'a Path, start_line: usize, end_line: usize) -> Self {
+        Self {
+            parent_components: path_parent_components(file),
+            min_end: end_line,
+            max_start: start_line,
+            occurrences: 1,
+        }
+    }
+
+    fn include(&mut self, start_line: usize, end_line: usize) {
+        self.min_end = self.min_end.min(end_line);
+        self.max_start = self.max_start.max(start_line);
+        self.occurrences += 1;
+    }
+
+    fn same_file_spread(&self) -> usize {
+        self.max_start
+            .saturating_sub(self.min_end)
+            .saturating_sub(1)
+            .div_ceil(SAME_FILE_SPREAD_STEP)
+    }
 }
 
 /// Compare clone groups in shared spread-aware priority order.
@@ -204,7 +378,7 @@ fn path_parent_components(path: &Path) -> Vec<Component<'_>> {
         .collect()
 }
 
-fn directory_tree_diameter(paths: &[Vec<Component<'_>>]) -> usize {
+fn directory_tree_diameter(paths: &[FileSpread<'_>]) -> usize {
     if paths.len() < 2 {
         return 0;
     }
@@ -213,11 +387,16 @@ fn directory_tree_diameter(paths: &[Vec<Component<'_>>]) -> usize {
     farthest_path(paths, endpoint).1
 }
 
-fn farthest_path(paths: &[Vec<Component<'_>>], origin: usize) -> (usize, usize) {
+fn farthest_path(paths: &[FileSpread<'_>], origin: usize) -> (usize, usize) {
     paths
         .iter()
         .enumerate()
-        .map(|(index, path)| (index, component_distance(&paths[origin], path)))
+        .map(|(index, path)| {
+            (
+                index,
+                component_distance(&paths[origin].parent_components, &path.parent_components),
+            )
+        })
         .max_by_key(|&(index, distance)| (distance, index))
         .unwrap_or((origin, 0))
 }
@@ -279,6 +458,21 @@ fn clone_group_rank_key(group: &CloneGroup) -> CloneGroupRankKey {
 
 fn sort_clone_groups(groups: &mut [CloneGroup]) {
     groups.sort_by_cached_key(clone_group_rank_key);
+}
+
+/// Sort clone groups into the order of [`DuplicationReport::sort`]: instances
+/// by file path and line, groups by spread-aware priority.
+///
+/// A clone family builds its suggestions from its groups, so it sorts them
+/// with this function first. Then the suggestions follow the group order on
+/// every surface.
+pub fn sort_clone_groups_in_report_order(groups: &mut [CloneGroup]) {
+    for group in groups.iter_mut() {
+        group
+            .instances
+            .sort_by(|a, b| a.file.cmp(&b.file).then(a.start_line.cmp(&b.start_line)));
+    }
+    sort_clone_groups(groups);
 }
 
 /// The kind of refactoring suggested for a clone family.
@@ -380,22 +574,82 @@ impl DuplicationReport {
     /// Clone groups use spread-aware priority order, instances use file path and
     /// line order, and clone families use their file set.
     pub fn sort(&mut self) {
-        for group in &mut self.clone_groups {
-            group
-                .instances
-                .sort_by(|a, b| a.file.cmp(&b.file).then(a.start_line.cmp(&b.start_line)));
-        }
-        sort_clone_groups(&mut self.clone_groups);
-
+        sort_clone_groups_in_report_order(&mut self.clone_groups);
         for family in &mut self.clone_families {
-            for group in &mut family.groups {
-                group
-                    .instances
-                    .sort_by(|a, b| a.file.cmp(&b.file).then(a.start_line.cmp(&b.start_line)));
-            }
-            sort_clone_groups(&mut family.groups);
+            sort_clone_groups_in_report_order(&mut family.groups);
         }
         self.clone_families.sort_by(|a, b| a.files.cmp(&b.files));
+    }
+
+    /// Number of clone groups actually carried in `clone_groups[]`.
+    #[must_use]
+    pub fn clone_groups_shown(&self) -> usize {
+        self.clone_groups.len()
+    }
+
+    /// Number of scoped-corpus clone groups withheld from `clone_groups[]`.
+    ///
+    /// Non-zero only when a presentation cap such as `--top` truncated the
+    /// array; scope filters (diff, workspace, baseline) recompute `stats`, so
+    /// they leave nothing omitted.
+    #[must_use]
+    pub fn clone_groups_omitted(&self) -> usize {
+        self.stats
+            .clone_groups
+            .saturating_sub(self.clone_groups.len())
+    }
+
+    /// Number of clone groups the measured corpus holds, shown plus omitted.
+    ///
+    /// Reads `stats.clone_groups` except on a report whose stats were never
+    /// populated, where it falls back to the array length so a caller never
+    /// renders a total smaller than the rows beneath it.
+    #[must_use]
+    pub fn clone_groups_total(&self) -> usize {
+        self.clone_groups_shown() + self.clone_groups_omitted()
+    }
+
+    /// Number of clone families actually carried in `clone_families[]`.
+    #[must_use]
+    pub fn clone_families_shown(&self) -> usize {
+        self.clone_families.len()
+    }
+
+    /// Number of scoped-corpus clone families withheld from
+    /// `clone_families[]`.
+    ///
+    /// `--top` truncates `clone_groups[]` and rebuilds the families from what
+    /// survives, so the family array narrows with the group array. Scope
+    /// filters (diff, workspace, baseline) rebuild the families and then
+    /// recompute `stats`, so they leave nothing omitted.
+    #[must_use]
+    pub fn clone_families_omitted(&self) -> usize {
+        self.stats
+            .clone_families
+            .saturating_sub(self.clone_families.len())
+    }
+
+    /// Number of clone families the measured corpus holds, shown plus omitted.
+    #[must_use]
+    pub fn clone_families_total(&self) -> usize {
+        self.clone_families_shown() + self.clone_families_omitted()
+    }
+
+    /// Drop the verbatim source text from every clone instance, including the
+    /// copies nested in `clone_families[].groups[]`.
+    ///
+    /// Fingerprints, suggested names, refactoring suggestions and actions are
+    /// all derived before serialization, so removing the text only shrinks the
+    /// payload.
+    pub fn strip_fragments(&mut self) {
+        for group in &mut self.clone_groups {
+            group.strip_fragments();
+        }
+        for family in &mut self.clone_families {
+            for group in &mut family.groups {
+                group.strip_fragments();
+            }
+        }
     }
 }
 
@@ -415,11 +669,17 @@ pub struct DuplicationStats {
     pub total_tokens: usize,
     /// Tokens in redundant clone copies, excluding one retained copy per group.
     pub duplicated_tokens: usize,
-    /// Number of clone groups in the reported `clone_groups[]` array after
-    /// filtering and optional `--top` truncation.
+    /// Number of clone groups the scoped corpus contains after filtering.
+    /// `--top` does not change it; compare it with `clone_groups_shown` on the
+    /// envelope to see how much of the corpus the array carries.
     pub clone_groups: usize,
-    /// Total clone instances across all reported groups after filtering and
-    /// optional `--top` truncation.
+    /// Number of clone families the scoped corpus contains after filtering.
+    /// `--top` truncates `clone_families[]` along with `clone_groups[]` but
+    /// does not change this counter; compare it with `clone_families_shown` on
+    /// the envelope to see how much of the corpus the array carries.
+    pub clone_families: usize,
+    /// Total clone instances across the scoped corpus after filtering.
+    /// `--top` does not change it.
     pub clone_instances: usize,
     /// Percentage of duplicated lines (0.0 to 100.0). `--top` does not change
     /// this scoped corpus metric.
@@ -460,9 +720,10 @@ mod tests {
         spread
     }
 
-    fn instance(file: &str, start_line: usize, end_line: usize) -> CloneInstance {
+    fn instance(file: impl Into<PathBuf>, start_line: usize, end_line: usize) -> CloneInstance {
         CloneInstance {
-            file: PathBuf::from(file),
+            is_symlink: false,
+            file: file.into(),
             start_line,
             end_line,
             start_col: 0,
@@ -564,6 +825,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spread_matches_reference_for_repeated_mixed_and_nested_files() {
+        let instances = vec![
+            instance("src/a.ts", 900, 920),
+            instance("packages/a/src/nested/b.ts", 40, 60),
+            instance("src/a.ts", 1, 20),
+            instance("/repo/apps/web/c.ts", 300, 325),
+            instance("packages/b/test/d.ts", 70, 90),
+            instance("/repo/apps/web/c.ts", 1, 25),
+        ];
+
+        assert_eq!(
+            clone_group_spread(&instances),
+            pairwise_clone_group_spread(&instances)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spread_matches_reference_for_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(b"/repo/packages/\x80/src/a.ts".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"/repo/packages/\x81/src/b.ts".to_vec()));
+        let instances = vec![
+            instance(first.clone(), 1, 20),
+            instance(second, 100, 120),
+            instance(first, 800, 820),
+        ];
+
+        assert_eq!(
+            clone_group_spread(&instances),
+            pairwise_clone_group_spread(&instances)
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn directory_diameter_handles_windows_prefixes() {
@@ -596,8 +894,10 @@ mod tests {
         proptest! {
             #[test]
             fn optimized_spread_matches_pairwise_reference(
-                entries in prop::collection::vec((0_u8..8, 1_usize..4_000, 1_usize..500), 0..80)
+                entries in prop::collection::vec((0_u8..16, 1_usize..4_000, 1_usize..500), 0..80)
             ) {
+                // More paths than the small file set holds, so a group can
+                // move to the large path. Two spellings name an earlier path.
                 let paths = [
                     "src/a.ts",
                     "src/b.ts",
@@ -607,6 +907,14 @@ mod tests {
                     "/repo/apps/web/f.ts",
                     "/repo/crates/core/g.ts",
                     "h.ts",
+                    "src//a.ts",
+                    "./src/b.ts",
+                    "packages/c/src/i.ts",
+                    "packages/c/src/deep/j.ts",
+                    "apps/web/k.ts",
+                    "apps/api/src/l.ts",
+                    "tools/m.ts",
+                    "n.ts",
                 ];
                 let instances = entries
                     .into_iter()

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 import { test } from "node:test";
 import {
   assertSigningKeyParity,
@@ -23,6 +25,7 @@ The base64 form of the public key above (\`${value.toString("base64")}\`) is can
 const surfaces = (overrides = {}) => ({
   vscodeSource: embedded("BINARY_SIGNING_PUBLIC_KEY"),
   npmVerifierSource: embedded("EMBEDDED_PUBLIC_KEY"),
+  companionVerifierSource: embedded("PUBLIC_KEY"),
   securityPolicy: securityPolicy(),
   ...overrides,
 });
@@ -64,6 +67,13 @@ test("either embedded consumer fails with its named surface", () => {
         surfaces({ npmVerifierSource: embedded("EMBEDDED_PUBLIC_KEY", changed) }),
       ),
     /npm verifier: embedded public key differs from VS Code/u,
+  );
+  assert.throws(
+    () =>
+      assertSigningKeyParity(
+        surfaces({ companionVerifierSource: embedded("PUBLIC_KEY", changed) }),
+      ),
+    /similar-code companion verifier: embedded public key differs from VS Code/u,
   );
 });
 
@@ -107,4 +117,30 @@ test("release public key accepts parity and rejects drift", () => {
     () => assertSigningKeyParity(surfaces({ releasePublicKey: changed.toString("base64") })),
     /release environment: public key differs from committed public key/u,
   );
+});
+
+test("signing-key-parity.mjs checks the release key when Node starts it", () => {
+  // An all-zero key is fake, so the release check must report drift.
+  const fakeKey = Buffer.alloc(32).toString("base64");
+  const result = spawnSync(process.execPath, ["scripts/signing-key-parity.mjs", "--release-env"], {
+    cwd: resolve(import.meta.dirname, ".."),
+    encoding: "utf8",
+    env: { ED25519_BINARY_SIGNING_PUBLIC_KEY: fakeKey, PATH: process.env.PATH ?? "" },
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /release environment: public key differs from committed public key/u);
+});
+
+test("signing-key-parity.mjs --release-env fails when the release key is absent", () => {
+  const result = spawnSync(process.execPath, ["scripts/signing-key-parity.mjs", "--release-env"], {
+    cwd: resolve(import.meta.dirname, ".."),
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" },
+  });
+
+  assert.equal(result.status, 1, result.stdout);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /release environment: ED25519_BINARY_SIGNING_PUBLIC_KEY is missing/u);
 });

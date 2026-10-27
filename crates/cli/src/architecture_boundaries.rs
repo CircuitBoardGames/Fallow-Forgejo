@@ -54,6 +54,7 @@ fn architecture_invariants_doc_tracks_guarded_boundaries() {
         "`fallow-core` is a backend implementation crate",
         "`fallow-process` is an independent infrastructure foundation",
         "must not fork their own timeout, process-tree setup",
+        "owns git ref and root detection",
     ] {
         assert!(
             doc.contains(required),
@@ -480,6 +481,26 @@ fn api_and_cli_use_duplicate_output_contracts_from_types() {
     }
 }
 
+/// `env!` writes the checkout path into the compiled crate. A build cache then
+/// cannot share the crate between worktrees, so tests read the variable at run
+/// time.
+#[test]
+fn sources_read_manifest_dir_at_run_time() {
+    let forbidden = concat!("env!(\"", "CARGO_MANIFEST_DIR", "\")");
+    let offenders: Vec<String> = rust_sources_under(["crates"])
+        .into_iter()
+        .filter(|source_path| {
+            read_source_without_line_comments(source_path)
+                .unwrap_or_else(|error| panic!("read {source_path}: {error}"))
+                .contains(forbidden)
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "read CARGO_MANIFEST_DIR with std::env::var_os at run time, not {forbidden}: {offenders:?}"
+    );
+}
+
 #[test]
 fn api_and_cli_use_trace_output_contracts_from_types() {
     let trace_contract_types = [
@@ -624,27 +645,6 @@ fn api_and_cli_do_not_use_removed_engine_root_adapter_exports() {
                 "{source_path} must use the typed fallow-engine module path instead of removed root export {forbidden}"
             );
         }
-    }
-}
-
-#[test]
-fn cli_json_root_outputs_use_runtime_envelope_mode() {
-    let allowed = [
-        "crates/cli/src/architecture_boundaries.rs",
-        "crates/cli/src/output_runtime.rs",
-        "crates/cli/src/output_envelope.rs",
-    ];
-    for source_path in rust_sources_under(["crates/cli/src"]) {
-        if allowed.contains(&source_path.as_str()) {
-            continue;
-        }
-        let source = read_source_without_line_comments(&source_path)
-            .unwrap_or_else(|error| panic!("read {source_path}: {error}"));
-        let forbidden = "RootEnvelopeMode::Tagged";
-        assert!(
-            !source.contains(forbidden),
-            "{source_path} must use output_runtime::current_root_envelope_mode() for root JSON output"
-        );
     }
 }
 
@@ -880,7 +880,7 @@ fn list_surfaces_reuse_session_discovery() {
         if source_path == "crates/cli/src/list.rs" {
             assert!(
                 source.contains("session.workspaces()")
-                    && source.contains("session.current_workspace_diagnostics()"),
+                    && source.contains("session.workspace_diagnostics()"),
                 "{source_path} must reuse AnalysisSession workspace metadata when a session already exists"
             );
         }
@@ -919,12 +919,16 @@ fn coverage_inventory_reuses_session_discovery() {
         source.contains("AnalysisSession::from_resolved_config"),
         "coverage upload-inventory must create one AnalysisSession for inventory discovery"
     );
+    // Whitespace-collapsed so the assertion pins the parameter, not the line
+    // wrapping rustfmt happens to choose for the signature.
+    let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        source.contains("fn collect_inventory(\n    session: &AnalysisSession"),
+        collapsed.contains("fn collect_inventory( session: &AnalysisSession"),
         "coverage inventory collection must receive the shared AnalysisSession"
     );
     assert!(
-        source.contains("fn collect_caller_edges(\n    session: &AnalysisSession"),
+        collapsed.contains("fn collect_caller_edges(session: &AnalysisSession")
+            || collapsed.contains("fn collect_caller_edges( session: &AnalysisSession"),
         "caller-edge collection must reuse the inventory AnalysisSession"
     );
     assert!(
@@ -1000,7 +1004,7 @@ fn session_backed_api_runtimes_defer_workspace_scope_to_session() {
     ] {
         let source = read_source_without_line_comments(source_path).expect("read runtime source");
         assert!(
-            source.contains("resolve_programmatic_analysis_context_deferred_workspace"),
+            source.contains("resolve_programmatic_analysis_context"),
             "{source_path} must defer workspace scope until an AnalysisSession has workspace metadata"
         );
     }
@@ -1125,6 +1129,42 @@ fn audit_repo_ref_orchestration_routes_through_engine() {
         );
     }
 
+    // The copy that drifted and caused #2699 lived on the CLI side, so the
+    // same rule has to hold for the CLI entry point into the detection. Both
+    // routes resolve the base through the one audit resolver in fallow-api,
+    // which asks the engine.
+    let resolver_path = "crates/api/src/audit_run/base_ref.rs";
+    let resolver = read_source_without_line_comments(resolver_path).expect("read base resolver");
+    assert!(
+        resolver.contains("repo_refs::auto_detect_audit_base_ref")
+            && !resolver.contains("Command::new(\"git\")"),
+        "{resolver_path} must resolve the auto-detected base through the engine"
+    );
+    assert!(
+        production_source.contains("crate::audit_run::resolve_audit_base"),
+        "{source_path} must resolve the base through the shared audit resolver"
+    );
+    let cli_path = "crates/cli/src/audit_base_ref.rs";
+    let cli_source = read_source_without_line_comments(cli_path).expect("read cli base-ref source");
+    assert!(
+        cli_source.contains("fallow_api::audit_run::resolve_audit_base"),
+        "{cli_path} must resolve the base through the shared audit resolver"
+    );
+    for forbidden in [
+        "fn git_stdout",
+        "fn git_ref_exists",
+        "fn git_upstream_ref",
+        "fn git_merge_base",
+        "fn detect_remote_default_ref",
+        "fn get_head_sha",
+        "Command::new(\"git\")",
+    ] {
+        assert!(
+            !cli_source.contains(forbidden),
+            "{cli_path} must not own audit git orchestration helper `{forbidden}`"
+        );
+    }
+
     let decision_surface_path = "crates/api/src/runtime/decision_surface.rs";
     let decision_surface =
         read_source_without_line_comments(decision_surface_path).expect("read decision surface");
@@ -1137,6 +1177,110 @@ fn audit_repo_ref_orchestration_routes_through_engine() {
             && !decision_surface.contains("super::audit::base_analysis_root"),
         "{decision_surface_path} must not depend on audit-internal base-worktree helpers"
     );
+}
+
+/// Each CLI file that spawns git, and the git fact it owns. The engine owns ref
+/// and root detection, so a CLI spawn is for work `repo_refs` does not model.
+/// Two entries are test-only helpers that build repository fixtures.
+const CLI_GIT_SPAWN_OWNERS: &[(&str, &str)] = &[
+    (
+        "crates/cli/src/agent_install/mcp.rs",
+        "whether an installed agent file is tracked",
+    ),
+    (
+        "crates/cli/src/base_worktree.rs",
+        "base worktree lifecycle and the diff base",
+    ),
+    (
+        "crates/cli/src/coverage/analyze.rs",
+        "the origin remote of a coverage upload",
+    ),
+    (
+        "crates/cli/src/coverage/mod.rs",
+        "the committer address of a coverage upload",
+    ),
+    (
+        "crates/cli/src/coverage/upload_common.rs",
+        "the origin remote and working-tree state of a coverage upload",
+    ),
+    (
+        "crates/cli/src/coverage/upload_inventory.rs",
+        "repository fixtures in its own tests",
+    ),
+    (
+        "crates/cli/src/coverage/upload_source_maps.rs",
+        "the origin remote of a source-map upload",
+    ),
+    (
+        "crates/cli/src/regression/baseline.rs",
+        "whether a baseline path is ignored",
+    ),
+];
+
+/// The CLI is a protocol adapter, so `fallow_engine::repo_refs` owns git ref and
+/// root detection. A second CLI copy is how `fallow security --base` and
+/// `fallow audit` drifted into resolving different base analysis roots for one
+/// repository (#2740), after the base-ref detection drifted the same way
+/// (#2699). Legitimate CLI git use stays legitimate: each such file is named in
+/// `CLI_GIT_SPAWN_OWNERS` with the fact it owns.
+#[test]
+fn cli_does_not_own_git_ref_or_root_detection() {
+    let base_worktree_path = "crates/cli/src/base_worktree.rs";
+    for source_path in rust_sources_under(["crates/cli/src"]) {
+        if source_path == "crates/cli/src/architecture_boundaries.rs" {
+            continue;
+        }
+        let source = read_source_without_line_comments(&source_path)
+            .unwrap_or_else(|error| panic!("read {source_path}: {error}"));
+
+        assert!(
+            !source.contains("\"rev-parse\", \"--short\", \"HEAD\""),
+            "{source_path} probes the short HEAD sha; use fallow_engine::repo_refs::short_head_sha"
+        );
+        assert!(
+            !source.contains("\"rev-parse\", \"HEAD\""),
+            "{source_path} probes the full HEAD sha; use fallow_engine::repo_refs::head_sha"
+        );
+        assert!(
+            !source.contains("\"refs/remotes/origin/HEAD\""),
+            "{source_path} probes the remote default branch; use fallow_engine::repo_refs::detect_remote_default_ref"
+        );
+        assert!(
+            !source.contains("fn remap_cache_dir_for_base_worktree"),
+            "{source_path} owns a base-worktree cache remap; use fallow_engine::repo_refs::remap_cache_dir_for_base_worktree"
+        );
+        assert!(
+            source_path == base_worktree_path || !source.contains("--show-toplevel"),
+            "{source_path} resolves the repository top level; use fallow_engine::repo_refs::base_analysis_root, or {base_worktree_path} for worktree lifecycle work"
+        );
+
+        if is_cli_test_source(&source_path) {
+            continue;
+        }
+        assert!(
+            !source.contains("Command::new(\"git\")")
+                || CLI_GIT_SPAWN_OWNERS
+                    .iter()
+                    .any(|(owner, _)| *owner == source_path),
+            "{source_path} spawns git; route ref and root detection through fallow_engine::repo_refs, or name the fact it owns in CLI_GIT_SPAWN_OWNERS"
+        );
+    }
+
+    for (owner, fact) in CLI_GIT_SPAWN_OWNERS {
+        assert!(!fact.is_empty(), "{owner} must state the git fact it owns");
+        let source = read_source_without_line_comments(owner)
+            .unwrap_or_else(|error| panic!("read {owner}: {error}"));
+        assert!(
+            source.contains("Command::new(\"git\")"),
+            "{owner} no longer spawns git; remove its CLI_GIT_SPAWN_OWNERS entry"
+        );
+    }
+}
+
+/// Whether a CLI source file holds tests only. Test helpers may build
+/// repository fixtures with git.
+fn is_cli_test_source(source_path: &str) -> bool {
+    source_path.ends_with("_tests.rs") || source_path.ends_with("/tests.rs")
 }
 
 #[test]
@@ -1315,7 +1459,14 @@ fn lsp_changed_since_scopes_editor_project_analysis_before_duplication() {
     );
     assert!(
         source.contains("analysis.filter_by_changed_files"),
-        "LSP must keep the existing post-analysis changedSince filter for dead-code and inline complexity semantics"
+        "LSP must keep the post-merge changedSince filter for clone groups and inline complexity"
+    );
+    let refine = single_call_site(&source, "refine_type_aware_project(");
+    let scope = single_call_site(&source, "apply_change_scope(");
+    let merge = single_call_site(&source, "merge_project_output(");
+    assert!(
+        refine < scope && scope < merge,
+        "LSP must narrow dead-code findings after the type-aware pass, which reads `unused_files`, and before the merge"
     );
 }
 
@@ -1513,19 +1664,41 @@ fn core_backend_fallow_core_calls_are_explicitly_allowlisted() {
         "fallow_core::plugins::AggregatedPluginResult",
         "fallow_core::plugins::PluginRegistry",
         "fallow_core::plugins::manifest_entries",
+        // Plugin used-export rules have one compiler, in fallow-core, so the
+        // mutation plan and the unused-export check agree on them.
+        "fallow_core::plugins::UsedExportNames",
+        // The built-in plugin roster has one source, in fallow-core. The
+        // engine mirrored it by hand once and the copy drifted.
+        "fallow_core::plugins::registry::builtin_config_patterns",
+        "fallow_core::plugins::registry::builtin_always_used_patterns",
+        "fallow_core::plugins::registry::builtin_plugin_names",
         "fallow_core::plugins::registry::is_external_plugin_active",
+        // The `@types/X` naming rule has one source, in fallow-core, so the
+        // dependency trace and the unused devDependency check agree on it.
+        "fallow_core::plugins::types_package_target",
         // The discovery walk has one implementation, in fallow-core, so its
         // config-candidate basenames stay derived from the plugin registry.
+        "fallow_core::discover::DiscoveredSources",
         "fallow_core::discover::HiddenDirScope",
+        // The scope's match mode crosses the boundary with it: a script-derived
+        // scope that arrived as `AnyDepth` would silently restore the
+        // match-by-name-anywhere behavior issue #461 removed.
+        "fallow_core::discover::HiddenDirMatch",
         "fallow_core::discover::discover_files_and_config_candidates",
+        "fallow_core::discover::discover_files_config_candidates_and_diagnostics",
         // Entry-point discovery has one implementation, in fallow-core.
         "fallow_core::discover::discover_entry_points",
-        "fallow_core::discover::discover_workspace_entry_points",
         "fallow_core::discover::discover_plugin_entry_points",
         // Discovery vocabulary lives with the walk that consumes it.
         "fallow_core::discover::ALLOWED_HIDDEN_DIRS",
         "fallow_core::discover::PRODUCTION_EXCLUDE_PATTERNS",
         "fallow_core::discover::SOURCE_EXTENSIONS",
+        // The built-in module list has one source, in fallow-core, so the
+        // entry weight report and the dependency detectors agree on it.
+        "fallow_core::analyze::is_builtin_module",
+        // Peer-dependency credit has one implementation, in fallow-core, so
+        // `--trace-dependency` and the unused-dependency check agree on it.
+        "fallow_core::analyze::peer_dependency_hosts",
     ];
 
     for line in core_backend.lines() {
@@ -1556,10 +1729,17 @@ fn engine_owns_churn_without_core_adapter() {
             "engine churn must not route through legacy backend path {forbidden}"
         );
     }
-    assert!(
-        churn.contains("crate::git_env::clear_ambient_git_env"),
-        "engine churn git subprocesses must clear ambient git environment"
-    );
+    // Every engine-owned git spawn goes through the `git_env` wrapper, which
+    // clears the ambient repository-state variables and closes stdin. The run
+    // clock reads HEAD's committer timestamp through the same wrapper, so it is
+    // held to the same rule as the churn log itself.
+    for source in ["crates/engine/src/churn.rs", "crates/engine/src/clock.rs"] {
+        let text = read_source_without_line_comments(source).expect("read engine git source");
+        assert!(
+            text.contains("crate::git_env::git_command()"),
+            "{source} git subprocesses must go through the git_env wrapper"
+        );
+    }
 }
 
 #[test]
@@ -1758,10 +1938,19 @@ fn mcp_api_routes_honor_ambient_changed_since_scope() {
         let source = read_source_without_line_comments(source_path)
             .unwrap_or_else(|error| panic!("read {source_path}: {error}"));
         assert!(
-            source.contains("changed_since_from_param("),
-            "{source_path} must apply FALLOW_CHANGED_SINCE when tool params omit changed_since"
+            source.contains("shared_analysis_options(") && !source.contains("EnvScope::Own"),
+            "{source_path} must apply FALLOW_CHANGED_SINCE through shared_analysis_options \
+             when tool params omit changed_since"
         );
     }
+    let helper_path = "crates/mcp/src/tools/api_runtime.rs";
+    let helper = read_source_without_line_comments(helper_path)
+        .unwrap_or_else(|error| panic!("read {helper_path}: {error}"));
+    assert!(
+        helper.contains("EnvScope::Ambient => (None, env_changed_since(), env_diff_file())")
+            && helper.contains("EnvScope::HardRef => (env_changed_since(), None, env_diff_file())"),
+        "{helper_path} must read FALLOW_CHANGED_SINCE for the ambient and hard-ref scopes"
+    );
 }
 
 #[test]
@@ -1964,12 +2153,12 @@ fn api_and_cli_workspace_scope_resolution_routes_through_engine() {
         );
         if source_path == "crates/api/src/analysis_context.rs" {
             assert!(
-                source.contains("resolve_workspace_scope_roots_for_project"),
-                "{source_path} must use the engine-owned project workspace-scope helper"
+                source.contains("fn workspace_roots_for_session("),
+                "{source_path} must resolve workspace scope from the session workspaces"
             );
             assert!(
-                !source.contains("discover_workspace_packages(root)"),
-                "{source_path} must not rediscover workspaces outside the engine workspace-scope helper"
+                !source.contains("discover_workspace_packages"),
+                "{source_path} must not rediscover workspaces without the config patterns"
             );
         }
         for forbidden in [
@@ -1989,6 +2178,383 @@ fn api_and_cli_workspace_scope_resolution_routes_through_engine() {
                 "{source_path} must not own workspace-scope matching helper `{forbidden}`"
             );
         }
+    }
+}
+
+/// Issue #2366: `WorkspaceDiagnosticKind::is_analysis_stage` may only classify
+/// a kind `true` when the dead-code analyze pass re-records it, because that
+/// pass is the single site that clears the previous run's analysis-stage
+/// entries. The exhaustive match in `fallow-types` forces a NEW kind to be
+/// classified, but nothing there notices an EXISTING recorder moving out of
+/// the analyze pass; a re-homed recorder would be cleared on every run and its
+/// kind would silently vanish from every envelope. Pin the recorder set so
+/// re-homing one trips this test instead.
+#[test]
+fn analysis_stage_diagnostics_are_recorded_only_from_the_dead_code_analyze_pass() {
+    // The registry owns the function; this guard names it to pin the set.
+    let exempt = [
+        "crates/config/src/workspace/diagnostics.rs",
+        "crates/cli/src/architecture_boundaries.rs",
+    ];
+    let expected = [
+        "crates/core/src/analyze/mod.rs",
+        "crates/core/src/analyze/unused_catalog/mod.rs",
+        "crates/core/src/analyze/unused_overrides.rs",
+    ];
+
+    let mut callers: Vec<String> = rust_sources_under(["crates"])
+        .into_iter()
+        .filter(|path| !exempt.contains(&path.as_str()))
+        .filter(|path| {
+            read_source_without_line_comments(path)
+                .expect("read crate source")
+                .contains("record_workspace_diagnostics(")
+        })
+        .collect();
+    callers.sort();
+
+    assert_eq!(
+        callers, expected,
+        "record_workspace_diagnostics must stay inside the detectors the dead-code analyze pass \
+         runs; a recorder moved elsewhere loses its kind from every envelope on the next pass"
+    );
+
+    let analyze = read_source_without_line_comments("crates/core/src/analyze/mod.rs")
+        .expect("read core analyze module");
+    assert!(
+        analyze.contains("clear_analysis_stage_diagnostics(&config.root)"),
+        "find_dead_code_full must clear the previous pass's analysis-stage diagnostics before \
+         the detectors re-record this pass's"
+    );
+    for recorder in ["unused_catalog", "unused_overrides"] {
+        assert!(
+            analyze.contains(recorder),
+            "the dead-code analyze pass must reach the {recorder} detector"
+        );
+    }
+}
+
+/// Issue #2736: the plugin stage has exactly one registry writer, and it is the
+/// point where the root and workspace plugin results have converged.
+///
+/// A second writer would either publish a partial set (a workspace result before
+/// the merge) or be wiped by the first one, because the write REPLACES the
+/// stage's set so a fixed config drops out. The stage predicate in `fallow-types`
+/// forces a new KIND to be classified; nothing there notices a new writer, so pin
+/// the writer set here. `fallow list` runs plugins on its own path and
+/// deliberately records nothing, which is the gap this guard also documents.
+#[test]
+fn plugin_stage_diagnostics_have_one_writer_at_the_end_of_the_plugin_run() {
+    let exempt = [
+        "crates/config/src/workspace/diagnostics.rs",
+        "crates/cli/src/architecture_boundaries.rs",
+    ];
+    let mut writers: Vec<String> = rust_sources_under(["crates"])
+        .into_iter()
+        .filter(|path| !exempt.contains(&path.as_str()))
+        .filter(|path| {
+            read_source_without_line_comments(path)
+                .expect("read crate source")
+                .contains("record_plugin_config_diagnostics(")
+        })
+        .collect();
+    writers.sort();
+    assert_eq!(
+        writers,
+        ["crates/core/src/lib.rs"],
+        "the plugin stage writes its diagnostics once, at the end of the plugin run; a second \
+         writer publishes a partial set or is replaced by the first"
+    );
+
+    let core =
+        read_source_without_line_comments("crates/core/src/lib.rs").expect("read core library");
+    // run_plugins has two exits: the early return for a project with no
+    // workspaces, and the tail after the workspace merge. Both exits gate the
+    // auto-import surfaces and then write. This guard matches on the calls, not
+    // on their indentation, which differs between the two exits.
+    const GATE: &str = "gate_auto_import_entry_patterns(&mut result, config, workspaces);";
+    const WRITE: &str = "record_plugin_config_diagnostics(&result, &config.root);";
+    let body = core
+        .split_once("fn run_plugins(")
+        .expect("run_plugins in the core library")
+        .1
+        .split_once("\nfn ")
+        .expect("an item after run_plugins")
+        .0;
+    let gates = body.matches(GATE).count();
+    let exits = body.matches("Ok(result)").count();
+    let pairs = body
+        .split(GATE)
+        .skip(1)
+        .filter(|tail| tail.trim_start().starts_with(WRITE))
+        .count();
+    assert!(gates > 0, "run_plugins must gate the auto-import surfaces");
+    assert_eq!(
+        gates, exits,
+        "every run_plugins exit must gate the auto-import surfaces, the no-workspace early return \
+         included. An exit without the gate drops the Nuxt surfaces from the set"
+    );
+    assert_eq!(
+        pairs, gates,
+        "the plugin-stage write must follow each gate call directly, in the no-workspace early \
+         return and in the tail after the workspace merge. A gated surface that nothing writes \
+         reaches no envelope"
+    );
+}
+
+/// Issue #2366: source-discovery diagnostics must reach an analysis by value
+/// from its own walk, never by reading the process registry back.
+///
+/// Combined mode runs the dead-code and duplication walks under `rayon::join`
+/// whenever a per-analysis `production` split stops them from sharing a file
+/// list. Each walk replaces the registry's source-discovery set for the root,
+/// so a registry read after the walk answers "whichever walk wrote last",
+/// which varies between runs of the same command. Pin both halves: one writer,
+/// and a session snapshot built from that writer's return value.
+#[test]
+fn source_discovery_diagnostics_reach_sessions_by_value_not_through_the_registry() {
+    let exempt = [
+        "crates/config/src/workspace/diagnostics.rs",
+        "crates/cli/src/architecture_boundaries.rs",
+    ];
+    let mut writers: Vec<String> = rust_sources_under(["crates"])
+        .into_iter()
+        .filter(|path| !exempt.contains(&path.as_str()))
+        .filter(|path| {
+            read_source_without_line_comments(path)
+                .expect("read crate source")
+                .contains("replace_source_discovery_diagnostics(")
+        })
+        .collect();
+    writers.sort();
+    assert_eq!(
+        writers,
+        ["crates/core/src/discover/walk.rs"],
+        "the source walk is the only writer of the registry's source-discovery set; a second \
+         writer reintroduces the interleaving that loses one walk's skips"
+    );
+
+    let session =
+        read_source_without_line_comments("crates/engine/src/session.rs").expect("read session");
+    assert!(
+        session.contains("discovery.source_diagnostics()"),
+        "the session snapshot must carry its own walk's source-discovery diagnostics"
+    );
+    assert!(
+        session.contains("!diagnostic.kind.is_source_discovery()"),
+        "the session snapshot must drop the registry's source-discovery entries in favour of \
+         its own walk's list"
+    );
+    assert!(
+        session.contains("registry_diagnostics_to_fold("),
+        "the live registry read in current_workspace_diagnostics must go through the filtered \
+         fold leg; importing a concurrent walk's skips changes the order of the combined \
+         root's union between runs of the same command"
+    );
+}
+
+/// The script-scope denylist exists in two independently live copies with no
+/// shared const: `crates/core/src/discover/mod.rs` for the core discovery
+/// route and `crates/engine/src/discover.rs` for the engine session route.
+/// A dir added to one and not the other leaves the other boundary
+/// auto-scoping it, and no other test in the workspace notices.
+#[test]
+fn script_scope_denylist_copies_stay_in_sync() {
+    fn denylist(path: &str) -> String {
+        let source = read_source_without_line_comments(path).expect("read crate source");
+        let start = source
+            .find("const SCRIPT_SCOPE_DENYLIST: &[&str] = &[")
+            .unwrap_or_else(|| panic!("{path} declares SCRIPT_SCOPE_DENYLIST"));
+        let rest = &source[start..];
+        let end = rest.find("];").expect("denylist is terminated") + 2;
+        rest[..end].to_owned()
+    }
+    assert_eq!(
+        denylist("crates/core/src/discover/mod.rs"),
+        denylist("crates/engine/src/discover.rs"),
+        "the two SCRIPT_SCOPE_DENYLIST copies must stay byte-identical"
+    );
+}
+
+/// Issue #461: the two `extract_hidden_dir_paths` copies decide which
+/// directories a `package.json` script may scope into discovery. They are
+/// written differently (core accumulates the prefix inside the loop, the engine
+/// skips the terminal component by index), so a byte comparison would fail on
+/// formatting rather than on behavior. Pin the guards instead: a copy that
+/// drops one silently widens discovery on the boundary it serves, and the
+/// `RootDir` guard in particular only matters on Windows, where no local run
+/// would catch its absence.
+#[test]
+fn hidden_dir_path_extraction_copies_keep_the_same_guards() {
+    fn body(path: &str) -> String {
+        let source = read_source_without_line_comments(path).expect("read crate source");
+        let start = source
+            .find("fn extract_hidden_dir_paths(path: &str) -> Vec<String> {")
+            .unwrap_or_else(|| panic!("{path} declares extract_hidden_dir_paths"));
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("function is terminated") + 3;
+        rest[..end].to_owned()
+    }
+
+    for path in [
+        "crates/core/src/discover/mod.rs",
+        "crates/engine/src/discover.rs",
+    ] {
+        let body = body(path);
+        assert!(
+            body.contains("is_absolute()"),
+            "{path}: extract_hidden_dir_paths must reject absolute paths"
+        );
+        assert!(
+            body.contains("ParentDir"),
+            "{path}: extract_hidden_dir_paths must reject `..` traversal"
+        );
+        assert!(
+            body.contains("RootDir"),
+            "{path}: extract_hidden_dir_paths must reject a rooted path with no \
+             prefix, which reports is_absolute() == false on Windows"
+        );
+    }
+}
+
+/// Issues #2366, #2392, and #2396: only the session may fold its own discovery
+/// diagnostics with the filtered process-registry leg. Output routes receive
+/// the diagnostics owned by the stage they serialize and must not re-read the
+/// process registry, otherwise call order can leak stale analysis-stage state.
+#[test]
+fn diagnostics_outputs_use_stage_owned_lists_after_the_session_fold() {
+    let registry = read_source_without_line_comments("crates/config/src/workspace/diagnostics.rs")
+        .expect("read diagnostics registry");
+    assert!(
+        registry.contains("pub fn registry_diagnostics_to_fold(")
+            && registry.contains("!diagnostic.kind.is_source_walk_recorded()"),
+        "the registry owns the fold leg and the walk-recorded filter it applies"
+    );
+
+    let session = read_source_without_line_comments("crates/engine/src/session.rs")
+        .expect("read engine session");
+    assert!(
+        session.contains("registry_diagnostics_to_fold("),
+        "the engine session's live read must use the filtered registry leg"
+    );
+
+    for (path, site, owned_marker) in [
+        (
+            "crates/cli/src/report/json.rs",
+            "the CLI audit family's dead-code section",
+            "analysis_diagnostics.to_vec()",
+        ),
+        (
+            "crates/cli/src/combined/output.rs",
+            "the CLI combined root fold",
+            "result.workspace_diagnostics.clone()",
+        ),
+        (
+            "crates/api/src/runtime_json.rs",
+            "the programmatic combined root fold",
+            "dead_code.output.workspace_diagnostics.clone()",
+        ),
+    ] {
+        let source = read_source_without_line_comments(path).expect("read fold site");
+        assert!(
+            !source.contains("registry_diagnostics_to_fold("),
+            "{site} ({path}) must not re-read process-global diagnostics"
+        );
+        assert!(
+            source.contains(owned_marker),
+            "{site} ({path}) must compose diagnostics from stage-owned lists"
+        );
+    }
+}
+
+/// No crate may mutate the process environment, in production or in tests.
+///
+/// `set_var` and `remove_var` are process-global and unsound while any other
+/// thread reads the environment. Cargo's harness runs a crate's tests as
+/// parallel threads in one binary, so a test that sets a variable races every
+/// reader in that binary, including the ones spawning real subprocesses from a
+/// resolved path.
+///
+/// Read an environment variable on a single line in a thin outer function and
+/// move every branch into an inner function that takes the value as an
+/// argument, then point the test at the inner function. `resolve_typed_coverage_inputs`
+/// in `crates/mcp/src/tools/api_runtime.rs` is the reference shape. Passing a
+/// value to a child process with `Command::env` is unaffected and stays the
+/// way to cover a production read end to end.
+#[test]
+fn workspace_sources_never_mutate_the_process_environment() {
+    let allowed = ["crates/cli/src/architecture_boundaries.rs"];
+    let crates_dir = workspace_root().join("crates");
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(&crates_dir).expect("read crates directory") {
+        let entry = entry.expect("read crates directory entry");
+        let crate_dir = entry.path();
+        if !crate_dir.is_dir() {
+            continue;
+        }
+        let crate_name = entry.file_name();
+        let crate_name = crate_name.to_string_lossy();
+        for subdirectory in ["src", "tests"] {
+            let root = crate_dir.join(subdirectory);
+            if !root.is_dir() {
+                continue;
+            }
+            collect_rust_sources(
+                &root,
+                &format!("crates/{crate_name}/{subdirectory}"),
+                &mut sources,
+            );
+        }
+    }
+    sources.sort();
+    assert!(
+        !sources.is_empty(),
+        "environment mutation guard walked no sources"
+    );
+
+    for source_path in sources {
+        if allowed.contains(&source_path.as_str()) {
+            continue;
+        }
+        let source = read_source_without_line_comments(&source_path)
+            .unwrap_or_else(|error| panic!("read {source_path}: {error}"));
+        // Both the path form and the call form. The path alone misses
+        // `use std::env::*` and `use std::env::{self, set_var}`, which put the
+        // call in scope without ever writing `env::set_var`. The call form alone
+        // would miss a re-exported alias. The bare identifier is not usable as a
+        // needle: `reset_variants` in crates/core/src/plugins/sveltekit.rs
+        // contains it.
+        for forbidden in ["env::set_var", "env::remove_var", "set_var(", "remove_var("] {
+            assert!(
+                !source.contains(forbidden),
+                "{source_path} mutates the process environment (matched {forbidden:?}), which is \
+                 unsound under the parallel test harness: the whole workspace shares one \
+                 environment across test threads. Read the variable on one line in a thin outer \
+                 function and take the value as an argument in the inner function the test drives, \
+                 as resolve_typed_coverage_inputs does in crates/mcp/src/tools/api_runtime.rs"
+            );
+        }
+    }
+}
+
+/// Return the byte offset of the one call of `needle` in `source`. A
+/// definition (`fn needle`) is not a call. The guard fails when there is no
+/// call or more than one, because an order check over the first match can
+/// then check the wrong site. Update the guard when a second call is added.
+fn single_call_site(source: &str, needle: &str) -> usize {
+    let calls: Vec<usize> = source
+        .match_indices(needle)
+        .map(|(index, _)| index)
+        .filter(|&index| !source[..index].ends_with("fn "))
+        .collect();
+    match calls.as_slice() {
+        [index] => *index,
+        [] => panic!("expected one call of `{needle}`, found none"),
+        _ => panic!(
+            "expected one call of `{needle}`, found {} at byte offsets {calls:?}; \
+             update this guard to name the call site whose order it checks",
+            calls.len()
+        ),
     }
 }
 
@@ -2082,9 +2648,11 @@ fn read_manifest(path: &str) -> Value {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .parent()
+    .and_then(Path::parent)
+    .expect("workspace root")
+    .to_path_buf()
 }

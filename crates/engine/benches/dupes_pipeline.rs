@@ -3,6 +3,10 @@
     clippy::expect_used,
     reason = "tests and benches use unwrap and expect to keep fixture setup concise"
 )]
+#![allow(
+    clippy::significant_drop_tightening,
+    reason = "the external Criterion macro owns the benchmark lifecycle"
+)]
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -10,6 +14,9 @@ use std::path::PathBuf;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fallow_config::{BoundaryConfig, FallowConfig, OutputFormat};
 use tempfile::TempDir;
+
+#[path = "../../benchmarks/benches/support/threads.rs"]
+mod threads;
 
 struct DupesInput {
     _temp_dir: TempDir,
@@ -22,6 +29,7 @@ fn make_config(root: PathBuf) -> fallow_config::ResolvedConfig {
     FallowConfig {
         type_aware: fallow_config::TypeAwareConfig::default(),
         schema: None,
+        minimum_version: None,
         extends: vec![],
         entry: vec![],
         ignore_patterns: vec![],
@@ -29,6 +37,7 @@ fn make_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -37,7 +46,10 @@ fn make_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
+        similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: fallow_config::RulesConfig::default(),
         boundaries: BoundaryConfig::default(),
@@ -45,6 +57,7 @@ fn make_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         plugins: vec![],
         rule_packs: vec![],
         dynamically_loaded: vec![],
+        markup_extensions: vec![],
         overrides: vec![],
         regression: None,
         audit: fallow_config::AuditConfig::default(),
@@ -56,10 +69,19 @@ fn make_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
-    .resolve(root, OutputFormat::Human, 4, true, true, None)
+    .resolve(
+        root,
+        OutputFormat::Human,
+        threads::bench_threads(),
+        true,
+        true,
+        None,
+    )
 }
 
 /// Generate a synthetic project with duplicated code blocks for dupe detection benchmarks.
@@ -153,16 +175,6 @@ fn create_dupes_input(name: &str, file_count: usize) -> DupesInput {
 
 fn bench_dupes_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("dupes_pipeline");
-
-    group.bench_function("scaling_dupes_full_pipeline_1000_files", |bencher| {
-        bencher.iter_batched_ref(
-            || create_dupes_input("1000", 1000),
-            |input| {
-                fallow_engine::duplicates::find_duplicates(&input.root, &input.files, &input.config)
-            },
-            BatchSize::LargeInput,
-        );
-    });
 
     group.bench_function("dupes_full_pipeline_1000_files", |bencher| {
         bencher.iter_batched_ref(

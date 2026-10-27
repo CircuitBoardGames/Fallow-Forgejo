@@ -3,10 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use dashmap::DashMap;
 use oxc_resolver::Resolver;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde_json::Value;
 
+use fallow_config::TsconfigOutputMap;
 use fallow_types::discover::FileId;
 
 /// Result of resolving an import specifier.
@@ -141,6 +143,9 @@ pub struct ResolvedProject {
     pub modules: Vec<ResolvedModule>,
     /// Proven test-time replacements whose targets resolve inside the project.
     pub replaced_module_targets: Vec<ResolvedReplacedModuleTarget>,
+    /// Deterministic work counts of the resolution that built this project.
+    /// Zero for a project restored from the graph cache.
+    pub work: super::ResolveWork,
 }
 
 /// One project-internal module replacement resolved from its declaring source file.
@@ -256,7 +261,7 @@ pub struct ResolvedModule {
     pub resolved_imports: Vec<ResolvedImport>,
     /// All dynamic imports with resolved targets.
     pub resolved_dynamic_imports: Vec<ResolvedImport>,
-    /// Dynamic import patterns matched against discovered files.
+    /// Dynamic import patterns and their matched target files.
     pub resolved_dynamic_patterns: Vec<(fallow_types::extract::DynamicImportPattern, Vec<FileId>)>,
     /// Static member accesses (e.g., `Status.Active`).
     pub member_accesses: Arc<[fallow_types::extract::MemberAccess]>,
@@ -291,6 +296,21 @@ pub struct ResolvedModule {
     /// and type-literal aliases. See `fallow_types::extract::TypeMemberTypeEntry`
     /// and issue #1785.
     pub type_member_types: Arc<[fallow_types::extract::TypeMemberTypeEntry]>,
+    /// Unresolved bare specifiers whose package `exports` entry names only
+    /// paths that do not exist, in specifier order. The resolver records the
+    /// paths so that the unresolved-import check can test them against the
+    /// ignore rules of the repository. No edge points at these paths.
+    pub missing_export_targets: Vec<MissingExportTarget>,
+}
+
+/// The missing paths that the `exports` map of a project package names for
+/// one unresolved bare specifier.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MissingExportTarget {
+    /// The import specifier, for example `store/enums`.
+    pub specifier: String,
+    /// The absolute paths that the matched `exports` entry names.
+    pub paths: Vec<PathBuf>,
 }
 
 impl Default for ResolvedModule {
@@ -315,6 +335,7 @@ impl Default for ResolvedModule {
             exported_factory_returns: Arc::default(),
             exported_factory_return_object_shapes: Arc::default(),
             type_member_types: Arc::default(),
+            missing_export_targets: vec![],
         }
     }
 }
@@ -356,6 +377,9 @@ impl ResolvedModule {
 pub(super) struct ResolveContext<'a> {
     /// The oxc_resolver instance (configured once, shared across threads).
     pub resolver: &'a Resolver,
+    /// Script and JSON extension inference, with explicit asset targets intact.
+    /// Shares the broad resolver's filesystem and PnP cache.
+    pub script_resolver: &'a Resolver,
     /// CSS-only resolver with package.json `sass` and `style` conditions enabled.
     /// Used only for stylesheet package subpaths so JS/TS imports do not
     /// accidentally prefer CSS export branches.
@@ -384,6 +408,10 @@ pub(super) struct ResolveContext<'a> {
     /// Static directory URL mappings from framework config.
     /// Each tuple is `(absolute_source_dir, normalized_url_mount)`.
     pub static_dir_mappings: &'a [(PathBuf, String)],
+    /// Mounts a framework serves for the whole project, reachable from any HTML
+    /// document, unlike `static_dir_mappings`, which stays scoped to the tool
+    /// whose config declared it.
+    pub framework_static_dir_mappings: &'a [(PathBuf, String)],
     /// Project root directory.
     pub root: &'a Path,
     /// Lazy canonical path → FileId fallback for intra-project symlinks.
@@ -412,7 +440,7 @@ pub(super) struct ResolveContext<'a> {
 /// Session-local cache of `dunce::canonicalize` results keyed by input path.
 #[derive(Default)]
 pub(super) struct CanonicalizeCache {
-    map: Mutex<FxHashMap<PathBuf, Option<PathBuf>>>,
+    map: DashMap<PathBuf, Option<PathBuf>, FxBuildHasher>,
 }
 
 impl CanonicalizeCache {
@@ -420,55 +448,71 @@ impl CanonicalizeCache {
     /// first miss. `None` (a path that fails to canonicalize) is cached too so a
     /// repeated probe of the same missing path does not re-issue the syscall.
     pub fn get(&self, path: &Path) -> Option<PathBuf> {
-        if let Ok(cache) = self.map.lock()
-            && let Some(value) = cache.get(path)
-        {
+        if let Some(value) = self.map.get(path) {
             return value.clone();
         }
         let value = dunce::canonicalize(path).ok();
-        if let Ok(mut cache) = self.map.lock() {
-            cache.insert(path.to_path_buf(), value.clone());
-        }
+        self.map.insert(path.to_path_buf(), value.clone());
         value
+    }
+
+    /// Number of distinct paths this cache canonicalized. Two threads that
+    /// miss the same path at once can both call the filesystem, so this is the
+    /// work the run needs, not an exact syscall count.
+    pub fn distinct_paths(&self) -> usize {
+        self.map.len()
     }
 }
 
 /// Session-local cache for tsconfig helper lookups used during import resolution.
 #[derive(Default)]
 pub(super) struct TsconfigCache {
-    json: Mutex<FxHashMap<PathBuf, Option<Value>>>,
-    chains: Mutex<FxHashMap<PathBuf, Vec<PathBuf>>>,
+    json: DashMap<PathBuf, Option<Arc<Value>>, FxBuildHasher>,
+    chains: DashMap<PathBuf, Arc<[PathBuf]>, FxBuildHasher>,
+    output_maps: DashMap<PathBuf, Arc<TsconfigOutputMap>, FxBuildHasher>,
 }
 
 impl TsconfigCache {
     /// Return a cached parsed tsconfig JSON value, loading it on first miss.
-    pub fn json(&self, path: &Path, load: impl FnOnce(&Path) -> Option<Value>) -> Option<Value> {
-        if let Ok(cache) = self.json.lock()
-            && let Some(value) = cache.get(path)
-        {
+    ///
+    /// Handing back an [`Arc`] rather than a clone matters: a tsconfig chain is
+    /// walked several times per import specifier, and deep-copying every parsed
+    /// document on each hop dominated resolution on large project-reference
+    /// graphs.
+    pub fn json(
+        &self,
+        path: &Path,
+        load: impl FnOnce(&Path) -> Option<Value>,
+    ) -> Option<Arc<Value>> {
+        if let Some(value) = self.json.get(path) {
             return value.clone();
         }
 
-        let value = load(path);
-        if let Ok(mut cache) = self.json.lock() {
-            cache.insert(path.to_path_buf(), value.clone());
-        }
+        let value = load(path).map(Arc::new);
+        self.json.insert(path.to_path_buf(), value.clone());
         value
     }
 
     /// Return the cached tsconfig chain for a source file, if one exists.
-    pub fn chain(&self, from_file: &Path) -> Option<Vec<PathBuf>> {
-        self.chains
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(from_file).cloned())
+    pub fn chain(&self, from_file: &Path) -> Option<Arc<[PathBuf]>> {
+        self.chains.get(from_file).map(|entry| Arc::clone(&entry))
     }
 
     /// Store the computed tsconfig chain for a source file.
-    pub fn store_chain(&self, from_file: &Path, chain: Vec<PathBuf>) {
-        if let Ok(mut cache) = self.chains.lock() {
-            cache.insert(from_file.to_path_buf(), chain);
+    pub fn store_chain(&self, from_file: &Path, chain: Arc<[PathBuf]>) {
+        self.chains.insert(from_file.to_path_buf(), chain);
+    }
+
+    /// Return the output-to-source map of a package root, building it on
+    /// first miss. Each package root reads its tsconfig files once per run.
+    pub fn output_map(&self, package_root: &Path) -> Arc<TsconfigOutputMap> {
+        if let Some(map) = self.output_maps.get(package_root) {
+            return Arc::clone(&map);
         }
+        let map = Arc::new(TsconfigOutputMap::from_project(package_root));
+        self.output_maps
+            .insert(package_root.to_path_buf(), Arc::clone(&map));
+        map
     }
 }
 
@@ -512,6 +556,7 @@ impl<'a> CanonicalFallback<'a> {
     /// Look up a canonical path, lazily building the index on first call.
     pub fn get(&self, canonical: &Path) -> Option<FileId> {
         let map = self.map.get_or_init(|| {
+            super::work::note_canonicalize(self.files.len() as u64);
             tracing::debug!(
                 "intra-project symlinks detected, building canonical path index ({} files)",
                 self.files.len()
@@ -582,6 +627,89 @@ mod tests {
     }
 
     #[test]
+    fn tsconfig_cache_loads_once_and_shares_the_parsed_document() {
+        let cache = TsconfigCache::default();
+        let path = Path::new("/project/tsconfig.json");
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = |_: &Path| {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(serde_json::json!({ "compilerOptions": {} }))
+        };
+
+        let first = cache.json(path, load).unwrap();
+        let second = cache.json(path, load).unwrap();
+
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeat reads must share one allocation rather than deep-copy"
+        );
+    }
+
+    /// An unreadable tsconfig is cached as a miss so the read is not retried.
+    #[test]
+    fn tsconfig_cache_caches_a_failed_load() {
+        let cache = TsconfigCache::default();
+        let path = Path::new("/project/missing.json");
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = |_: &Path| {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+
+        assert!(cache.json(path, load).is_none());
+        assert!(cache.json(path, load).is_none());
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tsconfig_cache_round_trips_a_chain() {
+        let cache = TsconfigCache::default();
+        let from_file = Path::new("/project/src/index.ts");
+        assert!(cache.chain(from_file).is_none());
+
+        let chain: Arc<[PathBuf]> = vec![PathBuf::from("/project/tsconfig.json")].into();
+        cache.store_chain(from_file, Arc::clone(&chain));
+
+        assert!(Arc::ptr_eq(&cache.chain(from_file).unwrap(), &chain));
+    }
+
+    /// Both caches are read concurrently by rayon workers during resolution.
+    #[test]
+    fn tsconfig_cache_is_consistent_under_concurrent_access() {
+        const THREADS: usize = 8;
+        const PATHS: usize = 32;
+
+        let cache = TsconfigCache::default();
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for index in 0..PATHS {
+                        let path = PathBuf::from(format!("/project/{index}/tsconfig.json"));
+                        let json = cache
+                            .json(&path, |_| Some(serde_json::json!({ "index": index })))
+                            .unwrap();
+                        assert_eq!(json["index"], index);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn canonicalize_cache_returns_the_same_result_on_repeat_lookups() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let file = temp.path().join("file.ts");
+        std::fs::write(&file, "").unwrap();
+
+        let cache = CanonicalizeCache::default();
+        let expected = dunce::canonicalize(&file).ok();
+        assert_eq!(cache.get(&file), expected);
+        assert_eq!(cache.get(&file), expected);
+        assert!(cache.get(&temp.path().join("missing.ts")).is_none());
+    }
+
+    #[test]
     fn commonjs_provenance_wraps_internal_and_bare_package_targets() {
         assert!(matches!(
             ResolveResult::InternalModule(FileId(4)).into_commonjs_require(),
@@ -610,6 +738,16 @@ mod tests {
 /// prefixes with `src/` (the conventional source directory) to find the tracked
 /// source file.
 pub const OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "esm", "cjs"];
+
+/// Output directory names that map to `src/` only when the target is absent.
+///
+/// Many TypeScript libraries build `src/` into `lib/`, but older packages keep
+/// hand-written source in `lib/`. Thus `lib` maps to `src/` only when the
+/// `lib/` target is absent from the analyzed file set (for example in a fresh
+/// clone before the build, or a gitignored build), and only for package
+/// manifest targets. A `lib/` file in the file set always wins, and generic
+/// relative imports never use this list.
+pub const MISSING_ONLY_OUTPUT_DIRS: &[&str] = &["lib"];
 
 /// Source extensions to try when mapping a built output file back to source.
 pub const SOURCE_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];

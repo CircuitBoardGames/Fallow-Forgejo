@@ -6,7 +6,7 @@
 // by `.github/scripts/sign-binary.mjs` using the workflow's
 // ED25519_BINARY_SIGNING_PRIVATE_KEY secret. The matching public key (32 raw
 // bytes) is embedded below and is identical to the value already trusted by
-// the VS Code extension at editors/vscode/src/download.ts:19-22.
+// the VS Code extension at editors/vscode/src/download.ts.
 //
 // SHA-256 digest source (in order of preference, refs #465 and #597):
 //   1. `fallowDigests` field in the platform package's package.json, written
@@ -18,9 +18,12 @@
 //      pooled GHA runners) can exceed the 60 req/hr unauthenticated limit;
 //      that failure mode is what motivated #597.
 //
-// Triggered from scripts/postinstall.js and from the GitHub Action installer
-// at action/scripts/install.sh. The escape hatch FALLOW_SKIP_BINARY_VERIFY=1
-// is documented in SECURITY.md.
+// Reached from scripts/lazy-verify.js on every bin/fallow, bin/fallow-lsp and
+// bin/fallow-mcp invocation, and from the GitHub Action installer at
+// action/scripts/install.sh. There is no postinstall hook: npm RFC 868 made
+// lifecycle scripts unreliable, and a CI gate fails the build if
+// scripts/postinstall.js reappears in the packed tarball. The escape hatch
+// FALLOW_SKIP_BINARY_VERIFY=1 is documented in SECURITY.md.
 //
 // No external dependencies: uses node:crypto and node:fs only.
 
@@ -34,7 +37,7 @@ const GITHUB_REPO = "fallow-rs/fallow";
 const DIGEST_TIMEOUT_MS = 10000;
 
 // 32-byte Ed25519 public key, identical to BINARY_SIGNING_PUBLIC_KEY in
-// editors/vscode/src/download.ts:19-22 and to the ED25519_BINARY_SIGNING_PUBLIC_KEY
+// editors/vscode/src/download.ts and to the ED25519_BINARY_SIGNING_PUBLIC_KEY
 // repo variable on fallow-rs/fallow. Embedded rather than fetched so verification
 // works offline and cannot be silently downgraded by tampering with the network
 // path.
@@ -293,19 +296,20 @@ function binaryTargetsForPlatform(platformId) {
   // and tests can synthesize a Windows verify without running on Windows.
   const isWindows = typeof platformId === "string" && platformId.startsWith("win32");
   const ext = isWindows ? ".exe" : "";
-  // Platform packages ship ONE binary now: the multicall `fallow` (CLI + LSP +
-  // MCP in one engine). The bundled `fallow-lsp` / `fallow-mcp` launchers live
-  // in the wrapper and spawn `fallow lsp-server` / `fallow mcp-server`. The
-  // authoritative digest is the `fallowDigests.fallow` field the release
-  // pipeline embeds for every bundled package; the `asset` below is only the
-  // legacy GitHub-release fallback for pre-embedded-digest packages, which
-  // never shipped this bundled binary, so it is inert for bundled installs and
-  // fails closed (digest-mismatch) in the impossible case it is ever reached.
-  return [{ binary: `fallow${ext}`, asset: `fallow-${platformId}${ext}` }];
+  // The platform package ships the multicall CLI plus the local-only
+  // similar-code provider. Both are signed and digest-pinned. Verifying them
+  // together keeps the Rust sibling lookup free of project or PATH overrides.
+  return [
+    { binary: `fallow${ext}`, asset: `fallow-${platformId}${ext}` },
+    {
+      binary: `fallow-similar-code${ext}`,
+      asset: `fallow-similar-code-${platformId}${ext}`,
+    },
+  ];
 }
 
-function isSkipRequested() {
-  const v = process.env[SKIP_ENV];
+function isSkipRequested(env = process.env) {
+  const v = env[SKIP_ENV];
   return v === "1" || v === "true" || v === "yes";
 }
 
@@ -500,7 +504,7 @@ async function verifyOneBinary(target, dir, pkg, manifestPath, verifyFn, digestP
 }
 
 // Locate the platform package the wrapper would use at runtime and verify
-// each of its three binaries. Returns the same result shape as
+// every binary binaryTargetsForPlatform lists. Returns the same result shape as
 // verifyBinaryAt, with `binary` populated on failure so callers can produce
 // a useful error.
 //
@@ -660,4 +664,6 @@ module.exports = {
   EMBEDDED_PUBLIC_KEY,
   ED25519_SPKI_HEADER,
   SKIP_ENV,
+  binaryTargetsForPlatform,
+  isSkipRequested,
 };

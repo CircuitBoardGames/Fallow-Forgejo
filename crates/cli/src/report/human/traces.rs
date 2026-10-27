@@ -1,10 +1,15 @@
 use std::path::Path;
 
 use colored::Colorize;
-use fallow_types::semantic::{SemanticCompleteness, SemanticSymbolImpact, SemanticSymbolTrace};
+use fallow_types::semantic::{
+    SemanticCompleteness, SemanticNamespace, SemanticSymbolImpact, SemanticSymbolTrace,
+};
 use fallow_types::trace::{
     ClassMemberTrace, CloneTrace, DependencyTrace, ExportReference, ExportTrace, FileTrace,
-    ReExportChain, TracedCloneGroup,
+    ReExportChain, TraceSource, TracedCloneGroup,
+};
+use fallow_types::trace_usage::{
+    DependencyUsage, FileLevelUnresolved, SpecifierUnresolved, UsageSitePage, WrapperShape,
 };
 
 use crate::report::{human_status_line, semantic_status};
@@ -27,6 +32,18 @@ pub(in crate::report) fn print_dependency_trace_human(trace: &DependencyTrace) {
     print_lines(&build_dependency_trace_human_lines(trace));
 }
 
+/// Print `fallow trace --dependency` on stdout: the dependency block, then
+/// the usage block.
+pub(in crate::report) fn print_dependency_usage_trace_human(trace: &DependencyTrace, quiet: bool) {
+    let mut lines = build_dependency_trace_human_lines(trace);
+    if let Some(usage) = &trace.usage {
+        lines.extend(build_dependency_usage_human_lines(usage, quiet));
+    }
+    for line in lines {
+        crate::report::sink::outln!("{line}");
+    }
+}
+
 pub(in crate::report) fn print_clone_trace_human(trace: &CloneTrace, root: &Path) {
     print_lines(&build_clone_trace_human_lines(trace, root));
 }
@@ -40,7 +57,9 @@ fn print_lines(lines: &[String]) {
 fn build_export_trace_human_lines(trace: &ExportTrace) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(String::new());
-    let status_icon = if trace.is_used {
+    let status_icon = if trace.star_export_ambiguity.is_some() {
+        "AMBIGUOUS".yellow().bold()
+    } else if trace.is_used {
         "USED".green().bold()
     } else {
         "UNUSED".red().bold()
@@ -63,12 +82,33 @@ fn build_export_trace_human_lines(trace: &ExportTrace) -> Vec<String> {
         String::new()
     };
     lines.push(format!("  File: {reachable}{entry}"));
+    lines.push(format!("  Namespace: {}", namespace_name(trace.namespace)));
     lines.push(format!("  Reason: {}", trace.reason));
+    for credit in &trace.plugin_credits {
+        lines.push(format!(
+            "  Plugin credit: {} {}",
+            credit.plugin,
+            format!("({})", credit.pattern).dimmed()
+        ));
+    }
+
+    if let Some(ambiguity) = &trace.star_export_ambiguity {
+        lines.push(format!(
+            "  Collision sources: {}",
+            ambiguity
+                .sources
+                .iter()
+                .map(|source| source.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     push_export_trace_direct_references(&mut lines, trace);
+    push_export_trace_namespaced_references(&mut lines, trace);
     push_export_trace_re_export_chains(&mut lines, trace);
     if let Some(semantic) = &trace.semantic {
-        push_semantic_trace(&mut lines, semantic);
+        push_semantic_trace(&mut lines, semantic, trace.namespace);
     }
     lines.push(String::new());
     lines
@@ -76,6 +116,34 @@ fn build_export_trace_human_lines(trace: &ExportTrace) -> Vec<String> {
 
 fn push_export_trace_direct_references(lines: &mut Vec<String>, trace: &ExportTrace) {
     push_direct_references(lines, &trace.direct_references);
+}
+
+fn push_export_trace_namespaced_references(lines: &mut Vec<String>, trace: &ExportTrace) {
+    let other_lanes: Vec<_> = trace
+        .direct_references_by_namespace
+        .iter()
+        .filter(|lane| lane.namespace != trace.namespace && lane.reference_count > 0)
+        .collect();
+    if other_lanes.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    for lane in other_lanes {
+        lines.push(format!(
+            "  {} additional {}-namespace reference(s):",
+            lane.reference_count,
+            namespace_name(lane.namespace)
+        ));
+        for reference in &lane.references {
+            lines.push(format!(
+                "    {} {} ({}){}",
+                "->".dimmed(),
+                reference.from_file.display(),
+                reference.kind.dimmed(),
+                search_hint(reference.search_visibility, reference.search_as.as_deref())
+            ));
+        }
+    }
 }
 
 fn push_direct_references(lines: &mut Vec<String>, refs: &[ExportReference]) {
@@ -86,12 +154,50 @@ fn push_direct_references(lines: &mut Vec<String>, refs: &[ExportReference]) {
     lines.push(format!("  {} direct reference(s):", refs.len()));
     for r in refs {
         lines.push(format!(
-            "    {} {} ({})",
+            "    {} {} ({}){}",
             "->".dimmed(),
             r.from_file.display(),
-            r.kind.dimmed()
+            r.kind.dimmed(),
+            search_hint(r.search_visibility, r.search_as.as_deref())
         ));
     }
+}
+
+/// A short suffix that tells the reader a name search does not find the
+/// consumer, or finds it only under another name. Empty for `found`.
+pub(in crate::report) fn search_hint(
+    visibility: Option<fallow_types::trace::SearchVisibility>,
+    search_as: Option<&str>,
+) -> String {
+    symbol_search_hint(None, visibility, search_as)
+}
+
+/// The search hint of an impact-closure coordination gap. When the consumer
+/// uses more than one symbol, the hint names the symbol that the search
+/// fields describe.
+pub(in crate::report) fn gap_search_hint(gap: &fallow_types::trace::ImpactClosureGap) -> String {
+    let symbol = gap
+        .search_symbol
+        .as_deref()
+        .filter(|_| gap.consumed_symbols.len() > 1);
+    symbol_search_hint(symbol, gap.search_visibility, gap.search_as.as_deref())
+}
+
+fn symbol_search_hint(
+    symbol: Option<&str>,
+    visibility: Option<fallow_types::trace::SearchVisibility>,
+    search_as: Option<&str>,
+) -> String {
+    use fallow_types::trace::SearchVisibility;
+
+    let level = match visibility {
+        Some(SearchVisibility::Missed) => "name search misses it",
+        Some(SearchVisibility::Renamed) => "used under another name",
+        Some(SearchVisibility::Found) | None => return String::new(),
+    };
+    let subject = symbol.map_or_else(String::new, |name| format!("{name}: "));
+    let hint = search_as.map_or_else(String::new, |name| format!(", search {name}"));
+    format!(" [{subject}{level}{hint}]").dimmed().to_string()
 }
 
 fn build_class_member_trace_human_lines(trace: &ClassMemberTrace) -> Vec<String> {
@@ -126,25 +232,58 @@ fn build_class_member_trace_human_lines(trace: &ClassMemberTrace) -> Vec<String>
         "  Owner: {owner_status} {} ({reachable}{entry})",
         trace.owner_export.bold()
     ));
+    lines.push(format!(
+        "  Owner namespace: {}",
+        namespace_name(trace.owner_namespace)
+    ));
     lines.push(format!("  Reason: {}", trace.reason));
 
     push_direct_references(&mut lines, &trace.owner_direct_references);
     push_re_export_chains(&mut lines, &trace.owner_re_export_chains);
     if let Some(semantic) = &trace.semantic {
-        push_semantic_trace(&mut lines, semantic);
+        push_semantic_trace(&mut lines, semantic, trace.owner_namespace);
     }
     lines.push(String::new());
     lines
 }
 
-fn push_semantic_trace(lines: &mut Vec<String>, trace: &SemanticSymbolTrace) {
+const fn namespace_name(namespace: SemanticNamespace) -> &'static str {
+    match namespace {
+        SemanticNamespace::Value => "value",
+        SemanticNamespace::Type => "type",
+    }
+}
+
+/// Render the checker proof under a syntactic trace.
+///
+/// `listed_namespace` is the namespace whose references the surrounding trace
+/// lists: the export's own lane, or the owner's lane on a class-member trace.
+/// The proof always covers the lane the declaration itself occupies, so the
+/// two differ exactly when a value export is credited through a bound
+/// `import type` (issue #2371). The scope is only printed when the proof also
+/// found nothing, which is the case that would otherwise read as a denial of
+/// the references printed above it; a proof that lists its own references
+/// contradicts nothing and stays unqualified.
+fn push_semantic_trace(
+    lines: &mut Vec<String>,
+    trace: &SemanticSymbolTrace,
+    listed_namespace: SemanticNamespace,
+) {
+    let proved_lane = if listed_namespace != trace.target.namespace && trace.references.is_empty() {
+        format!(
+            ", {} namespace only",
+            namespace_name(trace.target.namespace)
+        )
+    } else {
+        String::new()
+    };
     lines.push(String::new());
     lines.push(format!(
         "  {}",
         human_status_line(
             semantic_status(trace.status),
             format!(
-                "Type-aware proof: {} ({})",
+                "Type-aware proof: {} ({}{proved_lane})",
                 trace.assertion,
                 completeness_name(trace.status)
             )
@@ -273,6 +412,7 @@ fn build_file_trace_human_lines(trace: &FileTrace) -> Vec<String> {
         "  {reachable} {}{entry}",
         trace.file.display().to_string().bold()
     ));
+    push_trace_sources(&mut lines, &trace.sources);
 
     push_file_trace_exports(&mut lines, trace);
     push_file_trace_import_lists(&mut lines, trace);
@@ -291,6 +431,10 @@ fn push_file_trace_exports(lines: &mut Vec<String>, trace: &FileTrace) {
     for export in &trace.exports {
         let used_indicator = if export.reference_count > 0 {
             format!("{} ref(s)", export.reference_count)
+                .green()
+                .to_string()
+        } else if let Some(credit) = export.plugin_credits.first().filter(|_| trace.is_reachable) {
+            format!("used by the {} plugin", credit.plugin)
                 .green()
                 .to_string()
         } else {
@@ -356,6 +500,165 @@ fn push_file_trace_re_exports(lines: &mut Vec<String>, trace: &FileTrace) {
     }
 }
 
+/// One line per config that names the traced file or dependency.
+fn push_trace_sources(lines: &mut Vec<String>, sources: &[TraceSource]) {
+    for source in sources {
+        let mechanism = match source.kind.as_str() {
+            "module-federation" => "Module Federation",
+            other => other,
+        };
+        lines.push(format!(
+            "  Source: {mechanism} `{}` in {}",
+            source.key,
+            source.config.display()
+        ));
+    }
+}
+
+/// The non-zero reasons of a specifier, as `reason N` pairs.
+fn specifier_unresolved_parts(unresolved: &SpecifierUnresolved) -> Vec<String> {
+    [
+        ("value_alias", unresolved.value_alias),
+        ("non_call_reference", unresolved.non_call_reference),
+        ("jsx_element", unresolved.jsx_element),
+        ("re_export", unresolved.re_export),
+        ("nested_wrapper", unresolved.nested_wrapper),
+        ("binding_without_site", unresolved.binding_without_site),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(reason, count)| format!("{reason} {count}"))
+    .collect()
+}
+
+fn file_level_unresolved_parts(unresolved: &FileLevelUnresolved) -> Vec<String> {
+    [
+        ("dynamic_import", unresolved.dynamic_import),
+        ("require", unresolved.require),
+        ("side_effect_import", unresolved.side_effect_import),
+        ("star_re_export", unresolved.star_re_export),
+        ("unattributed_file", unresolved.unattributed_file),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(reason, count)| format!("{reason} {count}"))
+    .collect()
+}
+
+fn build_dependency_usage_human_lines(usage: &DependencyUsage, quiet: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("  Usage by imported name (syntactic):".to_string());
+    if usage.specifiers.is_empty() {
+        lines.push(format!("    {}", "No imported name.".dimmed()));
+    }
+    let width = usage
+        .specifiers
+        .iter()
+        .map(|entry| entry.name.len())
+        .max()
+        .unwrap_or(0)
+        .max("NAME".len());
+    if !usage.specifiers.is_empty() {
+        lines.push(format!(
+            "    {:<width$}  {:>5}  {:>9}  {:>5}  UNRESOLVED",
+            "NAME", "FILES", "TYPE-ONLY", "CALLS"
+        ));
+    }
+    for entry in &usage.specifiers {
+        let unresolved = specifier_unresolved_parts(&entry.unresolved);
+        let unresolved = if unresolved.is_empty() {
+            "-".to_string()
+        } else {
+            unresolved.join(", ")
+        };
+        lines.push(format!(
+            "    {:<width$}  {:>5}  {:>9}  {:>5}  {unresolved}",
+            entry.name, entry.file_count, entry.type_only_file_count, entry.call_site_count
+        ));
+        for wrapper in &entry.wrappers {
+            let shape = match wrapper.shape {
+                WrapperShape::Call => "call",
+                WrapperShape::Alias => "alias",
+            };
+            lines.push(format!(
+                "      {} {} via {}:{} ({shape}): {} call(s) in {} file(s)",
+                "wrapper".dimmed(),
+                wrapper.export.bold(),
+                wrapper.file,
+                wrapper.line,
+                wrapper.call_site_count,
+                wrapper.consumer_file_count
+            ));
+        }
+    }
+    let file_level = file_level_unresolved_parts(&usage.unresolved);
+    if !file_level.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("  File-level uses: {}", file_level.join(", ")));
+    }
+    if let Some(page) = &usage.sites {
+        push_usage_site_lines(&mut lines, page);
+    }
+    if let Some(closure) = &usage.closure {
+        lines.push(String::new());
+        lines.push(format!(
+            "  Files that import the users (depth {}, {} file(s)):",
+            closure.depth, closure.file_count
+        ));
+        for file in &closure.files {
+            lines.push(format!("    [{}] {}", file.depth, file.file));
+        }
+        if closure.truncated {
+            lines.push(format!(
+                "    {}",
+                "More importers exist past this depth. Raise --depth to see them.".dimmed()
+            ));
+        }
+    }
+    if !quiet {
+        lines.push(String::new());
+        lines.push(format!(
+            "  {}",
+            "Counts come from import bindings and call sites, without types. An unresolved use is counted, not followed."
+                .dimmed()
+        ));
+    }
+    lines.push(String::new());
+    lines
+}
+
+fn push_usage_site_lines(lines: &mut Vec<String>, page: &UsageSitePage) {
+    lines.push(String::new());
+    lines.push(format!(
+        "  Sites ({} on this page, {} in total):",
+        page.items.len(),
+        page.total
+    ));
+    for site in &page.items {
+        let mut detail = String::new();
+        if let Some(specifier) = &site.specifier {
+            detail.push_str(specifier);
+            detail.push(' ');
+        }
+        detail.push_str(site.kind.as_str());
+        if let Some(member) = &site.member {
+            detail.push_str(" .");
+            detail.push_str(member);
+        }
+        if let Some(via) = &site.via {
+            detail.push_str(" via ");
+            detail.push_str(via);
+        }
+        lines.push(format!(
+            "    {}:{}:{}  {detail}",
+            site.file, site.line, site.col
+        ));
+    }
+    if let Some(cursor) = &page.next_cursor {
+        lines.push(format!("  Next page: --cursor {cursor}"));
+    }
+}
+
 fn build_dependency_trace_human_lines(trace: &DependencyTrace) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(String::new());
@@ -369,6 +672,13 @@ fn build_dependency_trace_human_lines(trace: &DependencyTrace) -> Vec<String> {
         trace.package_name.bold(),
         trace.import_count
     ));
+    if !trace.sources.is_empty() {
+        push_trace_sources(&mut lines, &trace.sources);
+        lines.push(format!(
+            "  {}",
+            "A remote container provides this name at runtime, not an npm package.".dimmed()
+        ));
+    }
 
     if !trace.imported_by.is_empty() {
         lines.push(String::new());
@@ -387,11 +697,72 @@ fn build_dependency_trace_human_lines(trace: &DependencyTrace) -> Vec<String> {
         lines.push(String::new());
         lines.push(format!(
             "  {}",
-            "Referenced from package.json scripts or CI configs.".dimmed()
+            "Referenced from package.json scripts, CI configs or git hooks.".dimmed()
+        ));
+    }
+    if !trace.peer_of.is_empty() {
+        lines.push(String::new());
+        lines.push("  Peer dependency of:".to_string());
+        for host in &trace.peer_of {
+            lines.push(format!("    {} {host}", "->".dimmed()));
+        }
+        lines.push(format!(
+            "  {}",
+            "A used package lists this name as a peer and loads it at runtime.".dimmed()
+        ));
+    }
+    if let Some(credit) = &trace.tooling_credit {
+        lines.push(String::new());
+        lines.push(format!("  {}", describe_tooling_credit(credit).dimmed()));
+    }
+    if !trace.unused_in.is_empty() {
+        lines.push(String::new());
+        lines.push("  Reported unused in:".to_string());
+        for path in &trace.unused_in {
+            lines.push(format!("    {} {}", "->".dimmed(), path.display()));
+        }
+        lines.push(format!(
+            "  {}",
+            "Each manifest is checked on its own. An import credits the nearest manifest that installs the package."
+                .dimmed()
         ));
     }
     lines.push(String::new());
     lines
+}
+
+fn describe_tooling_credit(credit: &fallow_types::trace::ToolingCredit) -> String {
+    let plugin = credit.plugin.as_deref().unwrap_or("unknown");
+    match (credit.reason.as_str(), &credit.config, &credit.reference) {
+        ("plugin-config", Some(config), _) => format!(
+            "Credited as tooling of the {plugin} plugin, which found its config in {}.",
+            config.display()
+        ),
+        ("plugin-reference", _, Some(reference)) => format!(
+            "Credited as tooling of the {plugin} plugin: a package.json script, CI config or git hook runs {reference}."
+        ),
+        ("ambient-types", _, _) => "Credited as a type package that declares globals.".to_string(),
+        ("types-target", _, Some(target)) => {
+            format!(
+                "Credited as the type package of {target}, which the project declares or imports."
+            )
+        }
+        ("types-config", _, _) => {
+            "Credited because a config file, such as a tsconfig types entry, names it.".to_string()
+        }
+        ("known-tooling", _, _) => {
+            "Credited as a known tooling package from the tooling catalogue.".to_string()
+        }
+        ("known-tooling-config", Some(config), _) => format!(
+            "Credited as a known command-line tool with its own config in {}.",
+            config.display()
+        ),
+        ("own-peer", Some(manifest), _) => format!(
+            "Credited as an own peer: {} lists it in peerDependencies and devDependencies.",
+            manifest.display()
+        ),
+        (reason, _, _) => format!("Credited as tooling ({reason})."),
+    }
 }
 
 fn build_clone_trace_human_lines(trace: &CloneTrace, root: &Path) -> Vec<String> {
@@ -504,6 +875,7 @@ mod tests {
         ReExportChain, TracedCloneGroup, TracedExport, TracedReExport,
     };
     use fallow_types::duplicates::{CloneInstance, RefactoringKind, RefactoringSuggestion};
+    use fallow_types::trace::NamespacedExportReferences;
 
     use super::*;
 
@@ -515,23 +887,204 @@ mod tests {
             .join("\n")
     }
 
+    fn semantic_trace_for(
+        target_namespace: fallow_types::semantic::SemanticNamespace,
+    ) -> SemanticSymbolTrace {
+        SemanticSymbolTrace {
+            target: fallow_types::semantic::SemanticSymbol {
+                path: PathBuf::from("src/impl.ts"),
+                namespace: target_namespace,
+                declaration_kind: "export".to_string(),
+                exported_name: "helper".to_string(),
+                local_name: "helper".to_string(),
+                owner: None,
+                line: 1,
+                col: 13,
+            },
+            identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
+            selected_project: "tsconfig.json".to_string(),
+            assertion: "no-references-found".to_string(),
+            status: SemanticCompleteness::Complete,
+            references: Vec::new(),
+            total_reference_count: 0,
+            checker_evidence_count: 0,
+            graph_evidence_count: 0,
+            truncated: false,
+            omissions: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    fn type_lane_credited_trace(
+        semantic: Option<SemanticSymbolTrace>,
+    ) -> fallow_types::trace::ExportTrace {
+        ExportTrace {
+            file: PathBuf::from("src/impl.ts"),
+            export_name: "helper".to_string(),
+            namespace: fallow_types::semantic::SemanticNamespace::Type,
+            file_reachable: true,
+            is_entry_point: false,
+            is_used: true,
+            direct_references: vec![ExportReference::new(
+                PathBuf::from("src/index.ts"),
+                "named import".to_string(),
+            )],
+            direct_references_by_namespace: Vec::new(),
+            star_export_ambiguity: None,
+            re_export_chains: Vec::new(),
+            plugin_credits: Vec::new(),
+            reason: "Used by 1 file(s)".to_string(),
+            semantic,
+        }
+    }
+
+    #[test]
+    fn export_trace_scopes_a_proof_that_covers_the_other_lane() {
+        // Issue #2371: the trace lists the type lane that credits the value
+        // declaration while the checker proof covers the value lane, so the
+        // proof line must name its lane instead of reading as a denial of the
+        // reference printed above it.
+        let trace = type_lane_credited_trace(Some(semantic_trace_for(
+            fallow_types::semantic::SemanticNamespace::Value,
+        )));
+
+        let rendered = plain(&build_export_trace_human_lines(&trace));
+
+        assert!(rendered.contains("Namespace: type"));
+        assert!(rendered.contains("-> src/index.ts (named import)"));
+        assert!(
+            rendered
+                .contains("Type-aware proof: no-references-found (complete, value namespace only)"),
+            "the proof line names the lane it covers: {rendered}"
+        );
+    }
+
+    #[test]
+    fn export_trace_leaves_a_same_lane_proof_unscoped() {
+        // Deliberate negative control: when the proof covers the same lane the
+        // trace lists there is nothing to disambiguate, so the line stays as
+        // it was before issue #2371.
+        let trace = type_lane_credited_trace(Some(semantic_trace_for(
+            fallow_types::semantic::SemanticNamespace::Type,
+        )));
+
+        let rendered = plain(&build_export_trace_human_lines(&trace));
+
+        assert!(rendered.contains("Type-aware proof: no-references-found (complete)"));
+        assert!(!rendered.contains("namespace only"));
+    }
+
+    #[test]
+    fn export_trace_leaves_a_cross_lane_proof_that_found_references_unscoped() {
+        // Deliberate negative control: the lanes differ, but a proof that
+        // lists its own references denies nothing the trace printed, so the
+        // qualifier must not appear above that evidence.
+        let mut semantic = semantic_trace_for(fallow_types::semantic::SemanticNamespace::Value);
+        semantic.assertion = "references-found".to_string();
+        semantic.references = vec![fallow_types::semantic::SemanticReference {
+            path: PathBuf::from("src/index.ts"),
+            line: 1,
+            col: 14,
+            role: "type-reference".to_string(),
+            namespace: fallow_types::semantic::SemanticNamespace::Type,
+            via: Vec::new(),
+        }];
+        semantic.total_reference_count = 1;
+        semantic.checker_evidence_count = 1;
+        let trace = type_lane_credited_trace(Some(semantic));
+
+        let rendered = plain(&build_export_trace_human_lines(&trace));
+
+        assert!(
+            rendered.contains("Type-aware proof: references-found (complete)"),
+            "a proof with its own evidence stays unqualified: {rendered}"
+        );
+        assert!(!rendered.contains("namespace only"));
+    }
+
+    fn type_lane_credited_member_trace(semantic: Option<SemanticSymbolTrace>) -> ClassMemberTrace {
+        ClassMemberTrace {
+            file: PathBuf::from("src/impl.ts"),
+            member_name: "run".to_string(),
+            member_kind: "class-method".to_string(),
+            owner_export: "Helper".to_string(),
+            owner_namespace: fallow_types::semantic::SemanticNamespace::Type,
+            owner_is_used: true,
+            owner_file_reachable: true,
+            owner_is_entry_point: false,
+            owner_direct_references: vec![ExportReference::new(
+                PathBuf::from("src/index.ts"),
+                "named import".to_string(),
+            )],
+            owner_re_export_chains: Vec::new(),
+            reason: "'Helper' is used by 1 file(s)".to_string(),
+            semantic,
+        }
+    }
+
+    #[test]
+    fn class_member_trace_scopes_a_proof_that_covers_the_other_lane() {
+        // Issue #2371: the member trace inherits the owner's crediting lane,
+        // so the proof beside it must name the narrower lane it covers rather
+        // than reading as a denial of the owner reference printed above.
+        let trace = type_lane_credited_member_trace(Some(semantic_trace_for(
+            fallow_types::semantic::SemanticNamespace::Value,
+        )));
+
+        let rendered = plain(&build_class_member_trace_human_lines(&trace));
+
+        assert!(rendered.contains("Owner: USED Helper (reachable)"));
+        assert!(rendered.contains("Owner namespace: type"));
+        assert!(
+            rendered
+                .contains("Type-aware proof: no-references-found (complete, value namespace only)"),
+            "the member proof line names the lane it covers: {rendered}"
+        );
+    }
+
+    #[test]
+    fn class_member_trace_leaves_a_same_lane_proof_unscoped() {
+        // Deliberate negative control: an owner credited through its own lane
+        // leaves nothing to disambiguate, so the member proof line keeps the
+        // pre-#2371 shape.
+        let trace = type_lane_credited_member_trace(Some(semantic_trace_for(
+            fallow_types::semantic::SemanticNamespace::Type,
+        )));
+
+        let rendered = plain(&build_class_member_trace_human_lines(&trace));
+
+        assert!(rendered.contains("Type-aware proof: no-references-found (complete)"));
+        assert!(!rendered.contains("namespace only"));
+    }
+
     #[test]
     fn export_trace_renders_reachability_references_and_barrels() {
-        let trace = ExportTrace {
+        let mut trace = ExportTrace {
             file: PathBuf::from("src/lib.ts"),
             export_name: "formatUser".to_string(),
+            namespace: fallow_types::semantic::SemanticNamespace::Value,
             file_reachable: true,
             is_entry_point: true,
             is_used: true,
-            direct_references: vec![ExportReference {
-                from_file: PathBuf::from("src/app.ts"),
-                kind: "value".to_string(),
+            direct_references: vec![ExportReference::new(
+                PathBuf::from("src/app.ts"),
+                "value".to_string(),
+            )],
+            direct_references_by_namespace: vec![NamespacedExportReferences {
+                namespace: fallow_types::semantic::SemanticNamespace::Type,
+                reference_count: 1,
+                references: vec![ExportReference::new(
+                    PathBuf::from("src/types.ts"),
+                    "type import".to_string(),
+                )],
             }],
+            star_export_ambiguity: None,
             re_export_chains: vec![ReExportChain {
                 barrel_file: PathBuf::from("src/index.ts"),
                 exported_as: "formatUser".to_string(),
                 reference_count: 2,
             }],
+            plugin_credits: Vec::new(),
             reason: "referenced from reachable code".to_string(),
             semantic: None,
         };
@@ -540,11 +1093,82 @@ mod tests {
 
         assert!(rendered.contains("USED formatUser in src/lib.ts"));
         assert!(rendered.contains("File: reachable (entry point)"));
+        assert!(rendered.contains("Namespace: value"));
         assert!(rendered.contains("Reason: referenced from reachable code"));
         assert!(rendered.contains("1 direct reference(s):"));
         assert!(rendered.contains("-> src/app.ts (value)"));
+        assert!(rendered.contains("1 additional type-namespace reference(s):"));
+        assert!(rendered.contains("-> src/types.ts (type import)"));
         assert!(rendered.contains("Re-exported through:"));
         assert!(rendered.contains("-> src/index.ts as 'formatUser' (2 ref(s))"));
+
+        trace.star_export_ambiguity = Some(fallow_types::trace_chain::StarExportAmbiguity {
+            sources: vec![PathBuf::from("src/a.ts"), PathBuf::from("src/b.ts")],
+            namespaces: vec![fallow_types::semantic::SemanticNamespace::Value],
+        });
+        let ambiguous = plain(&build_export_trace_human_lines(&trace));
+        assert!(ambiguous.contains("AMBIGUOUS formatUser"));
+        assert!(ambiguous.contains("Collision sources: src/a.ts, src/b.ts"));
+    }
+
+    #[test]
+    fn export_trace_namespace_lane_references_carry_the_search_hint() {
+        let mut lane_reference =
+            ExportReference::new(PathBuf::from("src/types.ts"), "type import".to_string());
+        lane_reference.search_visibility = Some(fallow_types::trace::SearchVisibility::Renamed);
+        lane_reference.search_as = Some("UserFormat".to_string());
+        let trace = ExportTrace {
+            file: PathBuf::from("src/lib.ts"),
+            export_name: "formatUser".to_string(),
+            namespace: fallow_types::semantic::SemanticNamespace::Value,
+            file_reachable: true,
+            is_entry_point: true,
+            is_used: true,
+            direct_references: vec![ExportReference::new(
+                PathBuf::from("src/app.ts"),
+                "value".to_string(),
+            )],
+            direct_references_by_namespace: vec![NamespacedExportReferences {
+                namespace: fallow_types::semantic::SemanticNamespace::Type,
+                reference_count: 1,
+                references: vec![lane_reference],
+            }],
+            star_export_ambiguity: None,
+            re_export_chains: Vec::new(),
+            plugin_credits: Vec::new(),
+            reason: "referenced from reachable code".to_string(),
+            semantic: None,
+        };
+
+        let rendered = plain(&build_export_trace_human_lines(&trace));
+
+        assert!(
+            rendered.contains(
+                "-> src/types.ts (type import) [used under another name, search UserFormat]"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn gap_search_hint_names_the_symbol_only_for_several_symbols() {
+        let mut gap = fallow_types::trace::ImpactClosureGap {
+            consumer_file: "src/multi.ts".to_string(),
+            consumed_symbols: vec!["default".to_string(), "formatDate".to_string()],
+            note: String::new(),
+            search_visibility: Some(fallow_types::trace::SearchVisibility::Missed),
+            reason: Some(fallow_types::trace::SearchGapReason::DefaultImport),
+            search_as: Some("Thing".to_string()),
+            search_symbol: Some("default".to_string()),
+        };
+        let hint = |gap: &fallow_types::trace::ImpactClosureGap| plain(&[gap_search_hint(gap)]);
+
+        assert_eq!(
+            hint(&gap),
+            " [default: name search misses it, search Thing]"
+        );
+        gap.consumed_symbols.truncate(1);
+        assert_eq!(hint(&gap), " [name search misses it, search Thing]");
     }
 
     #[test]
@@ -554,13 +1178,14 @@ mod tests {
             member_name: "createEstimate".to_string(),
             member_kind: "class-method".to_string(),
             owner_export: "Ctrl".to_string(),
+            owner_namespace: fallow_types::semantic::SemanticNamespace::Value,
             owner_is_used: true,
             owner_file_reachable: true,
             owner_is_entry_point: false,
-            owner_direct_references: vec![ExportReference {
-                from_file: PathBuf::from("src/consumer.ts"),
-                kind: "named import".to_string(),
-            }],
+            owner_direct_references: vec![ExportReference::new(
+                PathBuf::from("src/consumer.ts"),
+                "named import".to_string(),
+            )],
             owner_re_export_chains: vec![ReExportChain {
                 barrel_file: PathBuf::from("src/index.ts"),
                 exported_as: "Ctrl".to_string(),
@@ -576,11 +1201,39 @@ mod tests {
             rendered.contains("MEMBER createEstimate (class-method) of Ctrl in src/controller.ts")
         );
         assert!(rendered.contains("Owner: USED Ctrl (reachable)"));
+        assert!(rendered.contains("Owner namespace: value"));
         assert!(rendered.contains("Reason: member reason text"));
         assert!(rendered.contains("1 direct reference(s):"));
         assert!(rendered.contains("-> src/consumer.ts (named import)"));
         assert!(rendered.contains("Re-exported through:"));
         assert!(rendered.contains("-> src/index.ts as 'Ctrl' (1 ref(s))"));
+    }
+
+    #[test]
+    fn file_trace_names_the_plugin_that_credits_an_export() {
+        let trace = FileTrace {
+            file: PathBuf::from("app/page.tsx"),
+            is_reachable: true,
+            is_entry_point: true,
+            exports: vec![TracedExport {
+                name: "default".to_string(),
+                is_type_only: false,
+                reference_count: 0,
+                referenced_by: Vec::new(),
+                plugin_credits: vec![fallow_types::trace::PluginExportCredit {
+                    plugin: "nextjs".to_string(),
+                    pattern: "app/**/page.{ts,tsx}".to_string(),
+                }],
+            }],
+            imports_from: Vec::new(),
+            imported_by: Vec::new(),
+            re_exports: Vec::new(),
+            sources: Vec::new(),
+        };
+
+        let rendered = plain(&build_file_trace_human_lines(&trace));
+
+        assert!(rendered.contains("export default [used by the nextjs plugin]"));
     }
 
     #[test]
@@ -594,6 +1247,7 @@ mod tests {
                 is_type_only: true,
                 reference_count: 0,
                 referenced_by: Vec::new(),
+                plugin_credits: Vec::new(),
             }],
             imports_from: vec![PathBuf::from("src/db.ts")],
             imported_by: vec![PathBuf::from("src/app.ts")],
@@ -602,6 +1256,7 @@ mod tests {
                 imported_name: "Account".to_string(),
                 exported_name: "Account".to_string(),
             }],
+            sources: Vec::new(),
         };
 
         let rendered = plain(&build_file_trace_human_lines(&trace));
@@ -626,6 +1281,11 @@ mod tests {
             used_in_scripts: true,
             is_used: true,
             import_count: 1,
+            peer_of: Vec::new(),
+            sources: Vec::new(),
+            tooling_credit: None,
+            unused_in: Vec::new(),
+            usage: None,
         };
 
         let rendered = plain(&build_dependency_trace_human_lines(&trace));
@@ -633,7 +1293,162 @@ mod tests {
         assert!(rendered.contains("USED zod (1 import(s))"));
         assert!(rendered.contains("Imported by:"));
         assert!(rendered.contains("-> src/schema.ts (type-only)"));
-        assert!(rendered.contains("Referenced from package.json scripts or CI configs."));
+        assert!(
+            rendered.contains("Referenced from package.json scripts, CI configs or git hooks.")
+        );
+        assert!(!rendered.contains("Source:"));
+    }
+
+    #[test]
+    fn a_peer_credited_trace_names_the_packages_that_list_it() {
+        let trace = DependencyTrace {
+            package_name: "opt-peer".to_string(),
+            imported_by: Vec::new(),
+            type_only_imported_by: Vec::new(),
+            used_in_scripts: false,
+            is_used: true,
+            import_count: 0,
+            peer_of: vec!["host".to_string()],
+            sources: Vec::new(),
+            tooling_credit: None,
+            unused_in: Vec::new(),
+            usage: None,
+        };
+
+        let rendered = plain(&build_dependency_trace_human_lines(&trace));
+
+        assert!(rendered.contains("USED opt-peer (0 import(s))"));
+        assert!(rendered.contains("Peer dependency of:"));
+        assert!(rendered.contains("-> host"));
+        assert!(!rendered.contains("Imported by:"));
+    }
+
+    #[test]
+    fn dependency_trace_explains_a_tooling_credit() {
+        let mut trace = DependencyTrace {
+            package_name: "tool-addon".to_string(),
+            imported_by: Vec::new(),
+            type_only_imported_by: Vec::new(),
+            used_in_scripts: false,
+            is_used: false,
+            import_count: 0,
+            peer_of: Vec::new(),
+            sources: Vec::new(),
+            tooling_credit: None,
+            unused_in: Vec::new(),
+            usage: None,
+        };
+        trace.apply_tooling_credit(Some(fallow_types::trace::ToolingCredit {
+            reason: "plugin-reference".to_string(),
+            plugin: Some("tool".to_string()),
+            config: None,
+            reference: Some("tool".to_string()),
+        }));
+
+        let rendered = plain(&build_dependency_trace_human_lines(&trace));
+
+        assert!(rendered.contains("USED tool-addon (0 import(s))"));
+        assert!(rendered.contains(
+            "Credited as tooling of the tool plugin: a package.json script, CI config or git hook runs tool."
+        ));
+
+        let mut config_trace = DependencyTrace {
+            package_name: "tool".to_string(),
+            imported_by: Vec::new(),
+            type_only_imported_by: Vec::new(),
+            used_in_scripts: false,
+            is_used: false,
+            import_count: 0,
+            peer_of: Vec::new(),
+            sources: Vec::new(),
+            tooling_credit: None,
+            unused_in: Vec::new(),
+            usage: None,
+        };
+        config_trace.apply_tooling_credit(Some(fallow_types::trace::ToolingCredit {
+            reason: "plugin-config".to_string(),
+            plugin: Some("tool".to_string()),
+            config: Some(PathBuf::from(".toolrc.json")),
+            reference: None,
+        }));
+        let rendered = plain(&build_dependency_trace_human_lines(&config_trace));
+        assert!(rendered.contains("found its config in .toolrc.json."));
+
+        let mut types_trace = DependencyTrace {
+            package_name: "@types/lib".to_string(),
+            imported_by: Vec::new(),
+            type_only_imported_by: Vec::new(),
+            used_in_scripts: false,
+            is_used: false,
+            import_count: 0,
+            peer_of: Vec::new(),
+            sources: Vec::new(),
+            tooling_credit: None,
+            unused_in: Vec::new(),
+            usage: None,
+        };
+        types_trace.apply_tooling_credit(Some(fallow_types::trace::ToolingCredit {
+            reason: "types-target".to_string(),
+            plugin: None,
+            config: None,
+            reference: Some("lib".to_string()),
+        }));
+        let rendered = plain(&build_dependency_trace_human_lines(&types_trace));
+        assert!(rendered.contains(
+            "Credited as the type package of lib, which the project declares or imports."
+        ));
+
+        let mut cli_trace = DependencyTrace {
+            package_name: "tool-cli".to_string(),
+            imported_by: Vec::new(),
+            type_only_imported_by: Vec::new(),
+            used_in_scripts: false,
+            is_used: false,
+            import_count: 0,
+            peer_of: Vec::new(),
+            sources: Vec::new(),
+            tooling_credit: None,
+            unused_in: Vec::new(),
+            usage: None,
+        };
+        cli_trace.apply_tooling_credit(Some(fallow_types::trace::ToolingCredit {
+            reason: "known-tooling-config".to_string(),
+            plugin: None,
+            config: Some(PathBuf::from(".toolrc")),
+            reference: None,
+        }));
+        let rendered = plain(&build_dependency_trace_human_lines(&cli_trace));
+        assert!(
+            rendered
+                .contains("Credited as a known command-line tool with its own config in .toolrc.")
+        );
+    }
+
+    #[test]
+    fn a_federation_remote_trace_names_its_config() {
+        let trace = DependencyTrace {
+            package_name: "checkout".to_string(),
+            imported_by: vec![PathBuf::from("src/index.ts")],
+            type_only_imported_by: Vec::new(),
+            used_in_scripts: false,
+            is_used: true,
+            import_count: 1,
+            peer_of: Vec::new(),
+            sources: vec![TraceSource {
+                kind: "module-federation".to_string(),
+                plugin: "webpack".to_string(),
+                config: PathBuf::from("webpack.config.js"),
+                key: "remotes".to_string(),
+            }],
+            tooling_credit: None,
+            unused_in: Vec::new(),
+            usage: None,
+        };
+
+        let rendered = plain(&build_dependency_trace_human_lines(&trace));
+
+        assert!(rendered.contains("Source: Module Federation `remotes` in webpack.config.js"));
+        assert!(rendered.contains("A remote container provides this name at runtime"));
     }
 
     #[test]
@@ -685,6 +1500,7 @@ mod tests {
         fragment: &str,
     ) -> CloneInstance {
         CloneInstance {
+            is_symlink: false,
             file: PathBuf::from(file),
             start_line,
             end_line,

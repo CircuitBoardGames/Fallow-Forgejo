@@ -1,7 +1,7 @@
 //! Coverage command output envelopes.
 
 use crate::RuntimeCoverageReport;
-use crate::root_envelopes::{RootEnvelopeMode, attach_telemetry_meta, serialize_named_json_output};
+use crate::root_envelopes::{attach_telemetry_meta, serialize_named_json_output};
 use fallow_types::envelope::{ElapsedMs, Meta, ToolVersion};
 use serde::Serialize;
 use std::time::Duration;
@@ -157,6 +157,9 @@ pub enum CoverageAnalyzeSchemaVersion {
     /// First release of the coverage analyze format.
     #[serde(rename = "1")]
     V1,
+    /// Expands the required semantic omission reason-code enum.
+    #[serde(rename = "2")]
+    V2,
 }
 
 /// Envelope emitted by `fallow coverage analyze --format json`.
@@ -167,7 +170,7 @@ pub enum CoverageAnalyzeSchemaVersion {
     schemars(title = "fallow coverage analyze --format json")
 )]
 pub struct CoverageAnalyzeOutput {
-    /// Analyze output schema version; serialized as the string `"1"`.
+    /// Analyze output schema version; currently serialized as the string `"2"`.
     pub schema_version: CoverageAnalyzeSchemaVersion,
     /// Fallow CLI version that produced this output.
     pub version: ToolVersion,
@@ -188,10 +191,9 @@ pub struct CoverageAnalyzeOutput {
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_coverage_setup_json_output(
     output: CoverageSetupOutput,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let mut value = serialize_named_json_output(output, "coverage-setup", mode)?;
+    let mut value = serialize_named_json_output(output, "coverage-setup")?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -204,7 +206,7 @@ pub fn build_coverage_analyze_output(
     version: impl Into<String>,
 ) -> CoverageAnalyzeOutput {
     CoverageAnalyzeOutput {
-        schema_version: CoverageAnalyzeSchemaVersion::V1,
+        schema_version: CoverageAnalyzeSchemaVersion::V2,
         version: ToolVersion(version.into()),
         elapsed_ms: ElapsedMs(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
         runtime_coverage: report.clone(),
@@ -222,11 +224,10 @@ pub fn build_coverage_analyze_output(
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_coverage_analyze_json_output(
     output: CoverageAnalyzeOutput,
-    mode: RootEnvelopeMode,
     explain_meta: Option<serde_json::Value>,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let mut value = serialize_named_json_output(output, "coverage-analyze", mode)?;
+    let mut value = serialize_named_json_output(output, "coverage-analyze")?;
     if let Some(meta) = explain_meta
         && let Some(map) = value.as_object_mut()
     {
@@ -259,9 +260,8 @@ mod tests {
             meta: None,
         };
 
-        let value =
-            serialize_coverage_setup_json_output(output, RootEnvelopeMode::Tagged, Some("run-1"))
-                .expect("coverage setup should serialize");
+        let value = serialize_coverage_setup_json_output(output, Some("run-1"))
+            .expect("coverage setup should serialize");
 
         assert_eq!(value["kind"], "coverage-setup");
         assert_eq!(value["schema_version"], "1");
@@ -275,14 +275,13 @@ mod tests {
 
         let value = serialize_coverage_analyze_json_output(
             output,
-            RootEnvelopeMode::Tagged,
             Some(json!({"docs": "coverage"})),
             Some("run-2"),
         )
         .expect("coverage analyze should serialize");
 
         assert_eq!(value["kind"], "coverage-analyze");
-        assert_eq!(value["schema_version"], "1");
+        assert_eq!(value["schema_version"], "2");
         assert_eq!(value["elapsed_ms"], 7);
         assert_eq!(value["_meta"]["docs"], "coverage");
         assert_eq!(value["_meta"]["telemetry"]["analysis_run_id"], "run-2");

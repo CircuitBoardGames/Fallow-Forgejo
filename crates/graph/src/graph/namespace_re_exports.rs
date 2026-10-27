@@ -23,25 +23,30 @@
 //! Whole-object uses (`Object.values(Foo)`, spread, destructure-with-rest)
 //! credit every target export. Barrels that expose the namespace through an
 //! entry point also credit every target export, mirroring the entry-point
-//! semantics of `propagate_entry_point_star`.
+//! semantics of `propagate_entry_point_star`, as does every member of the
+//! exposed namespace closure (`ModuleGraph::collect_exposed_namespace_targets`,
+//! issues #2357, #2372, #2373): a barrel whose whole namespace object reaches
+//! consumers the graph cannot enumerate, through an ambient-module star, a
+//! dynamic-import pattern, a whole-object namespace use, or an `export * as`
+//! chain on the entry-point surface.
 //!
 //! Runs after Phase 2b (cross-package alias propagation) and before Phase 3
 //! (reachability) so credits attached here participate in reachability and
 //! Phase 4 chain propagation downstream. See issue #324.
 
 use rustc_hash::FxHashMap;
-#[cfg(test)]
-use rustc_hash::FxHashSet;
 
-use super::ModuleGraph;
 use super::namespace_indexes::{
     NamespacePropagationIndexes, NamespaceReferenceRoutes, ReachableNamespaceExports,
 };
 use super::narrowing::{
-    ReferenceDedup, ReferenceSite, create_synthetic_exports_for_star_re_exports_at_site,
-    mark_all_exports_referenced_at_site, mark_member_exports_referenced_at_site,
+    NamespaceMarkContext, ReferenceDedup, ReferenceSite,
+    create_synthetic_exports_for_star_re_exports_at_site, mark_all_exports_referenced_at_site,
+    mark_member_exports_referenced_at_site,
 };
+use super::re_exports::ExposedNamespaceTargets;
 use super::types::{ReferenceKind, ReferencePathId, ReferencePathInterner};
+use super::{ExportNamespace, ModuleGraph};
 use fallow_types::discover::FileId;
 use fallow_types::extract::ModuleLoadMechanism;
 
@@ -56,6 +61,7 @@ enum CreditKind {
 struct PendingCredit {
     /// Index into `ModuleGraph::modules` of the namespace target file.
     target_module_idx: usize,
+    namespace: ExportNamespace,
     /// What to credit on the target.
     kind: CreditKind,
     /// File whose code produced the access (used as `from_file` on the
@@ -69,19 +75,29 @@ struct PendingCredit {
 }
 
 /// Phase 2c: credit `export * as Foo from './bar'` member accesses onto `./bar`.
+///
+/// `exposed_namespace_targets` is the exposed namespace closure
+/// (`ModuleGraph::collect_exposed_namespace_targets`), computed once per build
+/// and shared with Phase 4.
 pub(super) fn propagate_namespace_re_exports(
     graph: &mut ModuleGraph,
     indexes: &NamespacePropagationIndexes<'_>,
+    exposed_namespace_targets: &ExposedNamespaceTargets,
     reference_paths: &mut ReferencePathInterner,
 ) {
-    let ns_edges: Vec<(FileId, FileId, String)> = graph
+    let ns_edges: Vec<(FileId, FileId, String, bool)> = graph
         .modules
         .iter()
         .flat_map(|m| {
             let barrel_file = m.file_id;
             m.re_exports.iter().filter_map(move |re| {
                 if re.imported_name == "*" && re.exported_name != "*" {
-                    Some((barrel_file, re.source_file, re.exported_name.clone()))
+                    Some((
+                        barrel_file,
+                        re.source_file,
+                        re.exported_name.clone(),
+                        re.is_type_only,
+                    ))
                 } else {
                     None
                 }
@@ -94,44 +110,91 @@ pub(super) fn propagate_namespace_re_exports(
     }
 
     let mut pending: Vec<PendingCredit> = Vec::new();
+    let credits_unseen_consumers = !exposed_namespace_targets.is_empty()
+        || graph
+            .modules
+            .iter()
+            .any(super::types::ModuleNode::is_entry_point);
 
-    for (barrel_file_id, source_file_id, exported_name) in &ns_edges {
+    for (barrel_file_id, source_file_id, exported_name, is_type_only) in &ns_edges {
         let Some(target_module_idx) = module_index_for_file(graph, *source_file_id) else {
             continue;
         };
 
-        let reachable = indexes.enumerate_reachable_barrels(*barrel_file_id, exported_name);
-        let routes = reachable.intern_routes(
-            *source_file_id,
-            ModuleLoadMechanism::EsModule,
-            reference_paths,
-        );
-
-        for export in reachable.iter().filter(|export| {
-            graph
-                .modules
-                .get(export.file_id.0 as usize)
-                .is_some_and(super::types::ModuleNode::is_entry_point)
-        }) {
-            let path = routes.entry_path(export, reference_paths);
-            pending.push(PendingCredit {
-                target_module_idx,
-                kind: CreditKind::AllExports,
-                consumer_file_id: export.file_id,
-                import_span: oxc_span::Span::default(),
-                path,
-            });
-        }
-
-        let context = ConsumerCreditContext {
-            indexes,
-            seed_barrel_file: *barrel_file_id,
-            target_module_idx,
+        let namespaces: &[ExportNamespace] = if *is_type_only {
+            &[ExportNamespace::Type]
+        } else {
+            &[ExportNamespace::Type, ExportNamespace::Value]
         };
-        collect_consumer_credits(&context, &reachable, &routes, &mut pending, reference_paths);
+        for &namespace in namespaces {
+            if !credits_unseen_consumers && !indexes.has_consumers_in(namespace) {
+                continue;
+            }
+            let reachable = indexes.enumerate_reachable_barrels(
+                graph,
+                *barrel_file_id,
+                exported_name,
+                namespace,
+            );
+            let routes = reachable.intern_routes(
+                *source_file_id,
+                ModuleLoadMechanism::EsModule,
+                reference_paths,
+            );
+
+            for export in reachable.iter().filter(|export| {
+                exposes_namespace_object(
+                    graph,
+                    exposed_namespace_targets,
+                    export.file_id,
+                    &export.exported_name,
+                )
+            }) {
+                let path = routes.entry_path(export, reference_paths);
+                pending.push(PendingCredit {
+                    target_module_idx,
+                    namespace,
+                    kind: CreditKind::AllExports,
+                    consumer_file_id: export.file_id,
+                    import_span: oxc_span::Span::default(),
+                    path,
+                });
+            }
+
+            let context = ConsumerCreditContext {
+                indexes,
+                seed_barrel_file: *barrel_file_id,
+                target_module_idx,
+                namespace,
+            };
+            collect_consumer_credits(&context, &reachable, &routes, &mut pending, reference_paths);
+        }
     }
 
     apply_pending_credits(graph, &pending);
+}
+
+/// Whether a barrel hands the namespace re-export it exports under
+/// `exported_name` to consumers the graph cannot enumerate: an entry point, or
+/// a member of the exposed namespace closure (issues #2357, #2372, #2373)
+/// whose whole namespace object some consumer observes. Both credit every
+/// export of the namespace target, `default` included, because the namespace
+/// object exposes it.
+///
+/// The name matters for a closure member reached through a plain `export *`:
+/// that star never forwarded the member's `default`, so an
+/// `export * as default` on it reaches nobody.
+fn exposes_namespace_object(
+    graph: &ModuleGraph,
+    exposed_namespace_targets: &ExposedNamespaceTargets,
+    file_id: FileId,
+    exported_name: &str,
+) -> bool {
+    exposed_namespace_targets.exposes_name(file_id, exported_name)
+        || graph
+            .modules
+            .get(file_id.0 as usize)
+            .is_some_and(super::types::ModuleNode::is_entry_point)
 }
 
 /// Map a `FileId` to its index in `graph.modules`. Returns `None` if the id
@@ -149,6 +212,7 @@ struct ConsumerCreditContext<'indexes, 'modules> {
     indexes: &'indexes NamespacePropagationIndexes<'modules>,
     seed_barrel_file: FileId,
     target_module_idx: usize,
+    namespace: ExportNamespace,
 }
 
 fn collect_consumer_credits(
@@ -168,16 +232,11 @@ fn collect_consumer_credits(
             if consumer.file_id == context.seed_barrel_file {
                 continue;
             }
+            if !indexed.namespaces.contains(context.namespace) {
+                continue;
+            }
             let path = routes.consumer_path(export, indexed, reference_paths);
-
             let consumer_local = import.info.local_name.as_str();
-            if consumer_local.is_empty() {
-                continue;
-            }
-
-            if consumer.unused_import_bindings.contains(consumer_local) {
-                continue;
-            }
 
             let whole_object = consumer
                 .whole_object_uses
@@ -186,6 +245,7 @@ fn collect_consumer_credits(
             if whole_object {
                 pending.push(PendingCredit {
                     target_module_idx: context.target_module_idx,
+                    namespace: context.namespace,
                     kind: CreditKind::AllExports,
                     consumer_file_id: consumer.file_id,
                     import_span: import.info.span,
@@ -200,6 +260,7 @@ fn collect_consumer_credits(
                 }
                 pending.push(PendingCredit {
                     target_module_idx: context.target_module_idx,
+                    namespace: context.namespace,
                     kind: CreditKind::Member(access.member.clone()),
                     consumer_file_id: consumer.file_id,
                     import_span: import.info.span,
@@ -217,7 +278,13 @@ fn collect_consumer_credits(
 /// imports. `AllExports` credits short-circuit to `mark_all_exports_referenced`
 /// for the whole-object and entry-point cases.
 fn apply_pending_credits(graph: &mut ModuleGraph, pending: &[PendingCredit]) {
-    type GroupKey = (usize, FileId, oxc_span::Span, Option<ReferencePathId>);
+    type GroupKey = (
+        usize,
+        FileId,
+        oxc_span::Span,
+        Option<ReferencePathId>,
+        ExportNamespace,
+    );
 
     let mut groups: FxHashMap<GroupKey, GroupState> = FxHashMap::default();
     for credit in pending {
@@ -226,6 +293,7 @@ fn apply_pending_credits(graph: &mut ModuleGraph, pending: &[PendingCredit]) {
             credit.consumer_file_id,
             credit.import_span,
             credit.path,
+            credit.namespace,
         );
         let entry = groups.entry(key).or_default();
         match &credit.kind {
@@ -242,25 +310,26 @@ fn apply_pending_credits(graph: &mut ModuleGraph, pending: &[PendingCredit]) {
     }
 
     let mut dedup = ReferenceDedup::default();
-    for ((target_module_idx, consumer_file_id, import_span, path), state) in groups {
-        let module = &mut graph.modules[target_module_idx];
+    let effective_exports = &graph.effective_exports;
+    let modules = &mut graph.modules;
+    for ((target_module_idx, consumer_file_id, import_span, path, namespace), state) in groups {
+        let module = &mut modules[target_module_idx];
         let site = ReferenceSite::exact(consumer_file_id, import_span, path);
+        let mut mark = NamespaceMarkContext {
+            module_id: module.file_id,
+            site,
+            kind: ReferenceKind::NamespaceImport,
+            namespace,
+            effective_exports,
+            dedup: &mut dedup,
+        };
         if state.whole_object {
-            mark_all_exports_referenced_at_site(
-                &mut module.exports,
-                module.file_id,
-                site,
-                ReferenceKind::NamespaceImport,
-                &mut dedup,
-            );
+            mark_all_exports_referenced_at_site(&mut module.exports, &mut mark);
         } else {
             let found = mark_member_exports_referenced_at_site(
                 &mut module.exports,
-                module.file_id,
-                site,
                 &state.members,
-                ReferenceKind::NamespaceImport,
-                &mut dedup,
+                &mut mark,
             );
             create_synthetic_exports_for_star_re_exports_at_site(
                 &mut module.exports,
@@ -268,6 +337,7 @@ fn apply_pending_credits(graph: &mut ModuleGraph, pending: &[PendingCredit]) {
                 site,
                 &state.members,
                 &found,
+                namespace,
             );
         }
     }
@@ -281,6 +351,8 @@ struct GroupState {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashSet;
+
     use super::*;
     use crate::graph::ModuleGraph;
     use crate::resolve::{
@@ -312,6 +384,8 @@ mod tests {
             members: vec![],
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         }
     }
 
@@ -331,6 +405,7 @@ mod tests {
                 imported_name: ImportedName::Named(name.to_string()),
                 local_name: name.to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 10),
                 source_span: oxc_span::Span::default(),
@@ -350,6 +425,7 @@ mod tests {
                 imported_name: ImportedName::SideEffect,
                 local_name: String::new(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span,
                 source_span: oxc_span::Span::default(),
@@ -624,6 +700,230 @@ mod tests {
         assert!(!graph.is_test_reference_covered(export, 0));
     }
 
+    /// The diamond with a star re-export cycle between `outer` and `left`.
+    fn namespace_cycle_graph() -> ModuleGraph {
+        let files: Vec<_> = (0..7)
+            .map(|id| discovered_file(id, &format!("/project/file-{id}.ts"), 50))
+            .collect();
+        let modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: files[0].path.clone(),
+                resolved_imports: vec![
+                    named_import_from("./outer", "Ns", FileId(1)),
+                    side_effect_import("./alternate", FileId(6), oxc_span::Span::new(20, 30)),
+                ],
+                member_accesses: vec![MemberAccess {
+                    object: "Ns".to_string(),
+                    member: "used".to_string(),
+                }]
+                .into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: files[1].path.clone(),
+                re_exports: vec![
+                    star_re_export("./left", FileId(2)),
+                    star_re_export("./right", FileId(3)),
+                ],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: files[2].path.clone(),
+                re_exports: vec![
+                    star_re_export("./namespace", FileId(4)),
+                    star_re_export("./outer", FileId(1)),
+                ],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(3),
+                path: files[3].path.clone(),
+                re_exports: vec![star_re_export("./namespace", FileId(4))],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(4),
+                path: files[4].path.clone(),
+                re_exports: vec![ns_re_export("./source", "Ns", FileId(5))],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(5),
+                path: files[5].path.clone(),
+                exports: vec![named_export("used")].into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(6),
+                path: files[6].path.clone(),
+                resolved_imports: vec![side_effect_import(
+                    "./source",
+                    FileId(5),
+                    oxc_span::Span::new(0, 10),
+                )],
+                ..Default::default()
+            },
+        ];
+        let test_entries = vec![EntryPoint {
+            path: files[0].path.clone(),
+            source: EntryPointSource::TestFile,
+        }];
+        let replacements = [2, 3].map(|target| ResolvedReplacedModuleTarget {
+            source_file: FileId(0),
+            target_file: FileId(target),
+        });
+
+        ModuleGraph::build_with_reachability_roots_and_replacements(
+            &modules,
+            &replacements,
+            &test_entries,
+            &[],
+            &test_entries,
+            &files,
+        )
+    }
+
+    fn reach_of(graph: &ModuleGraph, file: u32) -> crate::graph::ExportTestReachResult {
+        let module = &graph.modules[file as usize];
+        graph.export_test_reach(module.file_id, &module.exports[0], &|id| id == FileId(0))
+    }
+
+    #[test]
+    fn test_reach_names_both_masked_namespace_routes() {
+        let graph = namespace_diamond_graph(true);
+        let reach = reach_of(&graph, 5);
+
+        assert!(!graph.reference_routes.graphs.is_empty());
+        assert_eq!(reach.reach, crate::graph::ExportTestReach::MockedOnly);
+        assert_eq!(reach.tests, vec![FileId(0)]);
+        assert_eq!(reach.mocked_targets, vec![FileId(2), FileId(3)]);
+    }
+
+    #[test]
+    fn test_reach_with_one_open_namespace_route_is_direct() {
+        let graph = namespace_diamond_graph(false);
+
+        assert_eq!(
+            reach_of(&graph, 5).reach,
+            crate::graph::ExportTestReach::Direct
+        );
+    }
+
+    #[test]
+    fn test_reach_through_a_namespace_route_cycle_terminates() {
+        let graph = namespace_cycle_graph();
+        let export = &graph.modules[5].exports[0];
+        let reach = reach_of(&graph, 5);
+
+        assert!(!graph.reference_routes.graphs.is_empty());
+        assert!(!graph.is_any_test_reference_covered(export));
+        assert_eq!(reach.reach, crate::graph::ExportTestReach::MockedOnly);
+        assert_eq!(reach.mocked_targets, vec![FileId(2), FileId(3)]);
+    }
+
+    /// An entry barrel exposes `Ns`, so its own route starts without a load
+    /// mechanism. The test reaches the barrel through `require()`, which
+    /// ignores the mock, and the test mocks both the barrel and the source.
+    fn namespace_entry_route_graph() -> ModuleGraph {
+        let files = vec![
+            discovered_file(0, "/project/consumer.test.ts", 100),
+            discovered_file(1, "/project/barrel.ts", 50),
+            discovered_file(2, "/project/source.ts", 50),
+        ];
+        let modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: files[0].path.clone(),
+                resolved_imports: vec![named_import_with_mechanism(
+                    "./barrel",
+                    "unrelated",
+                    FileId(1),
+                    true,
+                )],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: files[1].path.clone(),
+                re_exports: vec![ns_re_export("./source", "Ns", FileId(2))],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: files[2].path.clone(),
+                exports: vec![named_export("used")].into(),
+                ..Default::default()
+            },
+        ];
+        let test_entries = vec![EntryPoint {
+            path: files[0].path.clone(),
+            source: EntryPointSource::TestFile,
+        }];
+        let entry_points = vec![
+            test_entries[0].clone(),
+            EntryPoint {
+                path: files[1].path.clone(),
+                source: EntryPointSource::PackageJsonMain,
+            },
+        ];
+        let replacements = [1, 2].map(|target| ResolvedReplacedModuleTarget {
+            source_file: FileId(0),
+            target_file: FileId(target),
+        });
+
+        ModuleGraph::build_with_reachability_roots_and_replacements(
+            &modules,
+            &replacements,
+            &entry_points,
+            &[],
+            &test_entries,
+            &files,
+        )
+    }
+
+    #[test]
+    fn test_reach_does_not_mask_the_start_of_an_entry_route() {
+        let graph = namespace_entry_route_graph();
+        let export = &graph.modules[2].exports[0];
+        let barrel_reference = export
+            .references
+            .iter()
+            .position(|reference| reference.from_file == FileId(1))
+            .expect("the entry barrel credits the namespace member");
+        let path = export
+            .reference_path(barrel_reference)
+            .expect("the barrel credit records its route");
+        assert!(matches!(
+            graph.reference_paths[path.index()],
+            crate::graph::types::ReferencePathNode::Route {
+                start_mechanism: None,
+                ..
+            }
+        ));
+
+        let reach = reach_of(&graph, 2);
+
+        assert_eq!(reach.reach, crate::graph::ExportTestReach::MockedOnly);
+        assert_eq!(reach.mocked_targets, vec![FileId(2)]);
+    }
+
+    #[test]
+    fn test_reach_with_a_commonjs_namespace_consumer_is_direct() {
+        let graph = namespace_coverage_graph(true);
+
+        assert_eq!(
+            reach_of(&graph, 2).reach,
+            crate::graph::ExportTestReach::Direct
+        );
+        let esm = namespace_coverage_graph(false);
+        let reach = reach_of(&esm, 2);
+        assert_eq!(reach.reach, crate::graph::ExportTestReach::MockedOnly);
+        assert_eq!(reach.mocked_targets, vec![FileId(1)]);
+    }
+
     #[test]
     fn issue_324_simple_namespace_re_export_credits_target_members() {
         let files = vec![
@@ -686,6 +986,173 @@ mod tests {
             unused.references.is_empty(),
             "anotherSymbol stays unreferenced when only someExportedSymbol is accessed"
         );
+    }
+
+    #[test]
+    fn explicit_export_shadows_namespace_object_forwarded_by_star() {
+        let files: Vec<_> = ["main", "namespace", "source", "explicit", "outer"]
+            .iter()
+            .enumerate()
+            .map(|(id, name)| discovered_file(id as u32, &format!("/project/{name}.ts"), 50))
+            .collect();
+        let entry_points = vec![EntryPoint {
+            path: files[0].path.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: files[0].path.clone(),
+                resolved_imports: vec![named_import_from("./outer", "N", FileId(4))],
+                member_accesses: vec![MemberAccess {
+                    object: "N".to_string(),
+                    member: "used".to_string(),
+                }]
+                .into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: files[1].path.clone(),
+                re_exports: vec![ns_re_export("./source", "N", FileId(2))],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: files[2].path.clone(),
+                exports: vec![named_export("used")].into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(3),
+                path: files[3].path.clone(),
+                exports: vec![named_export("N")].into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(4),
+                path: files[4].path.clone(),
+                re_exports: vec![
+                    star_re_export("./namespace", FileId(1)),
+                    named_re_export("./explicit", "N", FileId(3)),
+                ],
+                ..Default::default()
+            },
+        ];
+
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+        let target = graph.modules[2]
+            .exports
+            .iter()
+            .find(|export| export.name.to_string() == "used")
+            .expect("namespace target export");
+
+        assert!(
+            target.references.is_empty(),
+            "shadowed namespace object must not receive consumer member credit"
+        );
+    }
+
+    #[test]
+    fn type_only_consumer_credits_namespace_member_in_type_space() {
+        let files = vec![
+            discovered_file(0, "/project/main.ts", 100),
+            discovered_file(1, "/project/barrel.ts", 50),
+            discovered_file(2, "/project/source.ts", 50),
+        ];
+        let entry_points = vec![EntryPoint {
+            path: files[0].path.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+        let mut import = named_import_from("./barrel", "N", FileId(1));
+        import.info.is_type_only = true;
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: files[0].path.clone(),
+                resolved_imports: vec![import],
+                member_accesses: vec![MemberAccess {
+                    object: "N".to_string(),
+                    member: "used".to_string(),
+                }]
+                .into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: files[1].path.clone(),
+                re_exports: vec![ns_re_export("./source", "N", FileId(2))],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: files[2].path.clone(),
+                exports: vec![named_export("used")].into(),
+                ..Default::default()
+            },
+        ];
+
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+        let references = &graph.modules[2].exports[0].references;
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].namespace, ExportNamespace::Type);
+    }
+
+    #[test]
+    fn type_only_namespace_consumer_credits_type_and_value_backed_members() {
+        let files = vec![
+            discovered_file(0, "/project/main.ts", 100),
+            discovered_file(1, "/project/barrel.ts", 50),
+            discovered_file(2, "/project/source.ts", 50),
+        ];
+        let mut import = named_import_from("./barrel", "N", FileId(1));
+        import.info.is_type_only = true;
+        let mut interface = named_export("Foo");
+        interface.is_type_only = true;
+        let graph = ModuleGraph::build(
+            &[
+                ResolvedModule {
+                    file_id: FileId(0),
+                    path: files[0].path.clone(),
+                    resolved_imports: vec![import],
+                    member_accesses: vec![
+                        MemberAccess {
+                            object: "N".to_string(),
+                            member: "Foo".to_string(),
+                        },
+                        MemberAccess {
+                            object: "N".to_string(),
+                            member: "bar".to_string(),
+                        },
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+                ResolvedModule {
+                    file_id: FileId(1),
+                    path: files[1].path.clone(),
+                    re_exports: vec![ns_re_export("./source", "N", FileId(2))],
+                    ..Default::default()
+                },
+                ResolvedModule {
+                    file_id: FileId(2),
+                    path: files[2].path.clone(),
+                    exports: vec![interface, named_export("bar")].into(),
+                    ..Default::default()
+                },
+            ],
+            &[EntryPoint {
+                path: files[0].path.clone(),
+                source: EntryPointSource::PackageJsonMain,
+            }],
+            &files,
+        );
+
+        for export in &graph.modules[2].exports {
+            assert_eq!(export.references.len(), 1);
+            assert_eq!(export.references[0].namespace, ExportNamespace::Type);
+        }
     }
 
     #[test]
@@ -972,6 +1439,7 @@ mod tests {
                 imported_name: ImportedName::Named("Foo".to_string()),
                 local_name: "MyFoo".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 10),
                 source_span: oxc_span::Span::default(),
@@ -1086,6 +1554,124 @@ mod tests {
         assert!(
             untouched.references.is_empty(),
             "Phase 2c does not over-credit unrelated exports under plain export-star"
+        );
+    }
+
+    /// shim.ts (reachable, not an entry point) carries
+    /// `declare module 'pkg' { export * from './barrel' }`; barrel.ts has
+    /// `export * as sub from './sub'`; sub.ts has `export * from './deep'`.
+    fn ambient_star_namespace_chain_graph() -> ModuleGraph {
+        let paths = [
+            "/project/main.ts",
+            "/project/shim.ts",
+            "/project/barrel.ts",
+            "/project/sub.ts",
+            "/project/deep.ts",
+        ];
+        let files: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| discovered_file(id as u32, path, 50))
+            .collect();
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from(paths[0]),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+        let default_export = || ExportInfo {
+            name: ExportName::Default,
+            ..named_export("default")
+        };
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from(paths[0]),
+                resolved_imports: vec![side_effect_import(
+                    "./shim",
+                    FileId(1),
+                    oxc_span::Span::new(0, 10),
+                )],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: PathBuf::from(paths[1]),
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "./barrel".to_string(),
+                        imported_name: ImportedName::Namespace,
+                        local_name: String::new(),
+                        is_type_only: true,
+                        is_type_only_star: false,
+                        from_style: false,
+                        span: oxc_span::Span::new(0, 10),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(2)),
+                }],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: PathBuf::from(paths[2]),
+                re_exports: vec![ns_re_export("./sub", "sub", FileId(3))],
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(3),
+                path: PathBuf::from(paths[3]),
+                re_exports: vec![star_re_export("./deep", FileId(4))],
+                exports: vec![named_export("subOne"), default_export()].into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(4),
+                path: PathBuf::from(paths[4]),
+                exports: vec![named_export("deepOne"), default_export()].into(),
+                ..Default::default()
+            },
+        ];
+
+        ModuleGraph::build(&resolved_modules, &entry_points, &files)
+    }
+
+    #[test]
+    fn issue_2357_ambient_star_target_exposes_its_namespace_re_exports() {
+        // The ambient star reaches the namespace object, so every export of
+        // sub.ts (`default` included) is credited, and the star chain below
+        // it credits deep.ts's named exports but never its default.
+        let graph = ambient_star_namespace_chain_graph();
+        let export = |module: usize, name: &str| {
+            graph.modules[module]
+                .exports
+                .iter()
+                .find(|e| e.name.to_string() == name)
+                .unwrap_or_else(|| panic!("module {module} must export `{name}`"))
+        };
+        for name in ["subOne", "default"] {
+            let shapes: Vec<_> = export(3, name)
+                .references
+                .iter()
+                .map(|r| (r.kind, r.namespace, r.from_file))
+                .collect();
+            assert!(
+                shapes.contains(&(
+                    ReferenceKind::NamespaceImport,
+                    ExportNamespace::Value,
+                    FileId(2)
+                )),
+                "sub.ts:{name} is exposed through barrel.ts's namespace object, found {shapes:?}"
+            );
+        }
+        assert!(
+            export(4, "deepOne")
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::ReExport && r.from_file == FileId(3)),
+            "deep.ts:deepOne is credited through sub.ts's `export *` chain"
+        );
+        assert!(
+            export(4, "default").references.is_empty(),
+            "sub.ts's plain `export *` never forwards deep.ts's default"
         );
     }
 }

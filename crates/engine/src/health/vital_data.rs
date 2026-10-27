@@ -19,8 +19,14 @@ use super::{
 
 pub struct HealthVitalData {
     pub(crate) vital_signs: fallow_output::VitalSigns,
+    /// Raw counts behind `vital_signs`, kept for the snapshot that the output
+    /// stage saves after grouping.
+    pub(crate) counts: fallow_output::VitalSignsCounts,
     pub(crate) health_score: Option<HealthScore>,
     pub(crate) health_trend: Option<fallow_output::HealthTrend>,
+    /// The snapshot the project trend compared against. The group trend
+    /// compares against the same snapshot.
+    pub(crate) trend_baseline: Option<vital_signs::TrendBaseline>,
     pub(crate) large_functions: Vec<fallow_output::LargeFunctionEntry>,
 }
 
@@ -40,9 +46,11 @@ pub struct HealthVitalDataInput<'a> {
     pub(crate) changed_files: Option<&'a rustc_hash::FxHashSet<std::path::PathBuf>>,
     pub(crate) ws_roots: Option<&'a [std::path::PathBuf]>,
     pub(crate) diff_index: Option<&'a fallow_output::DiffIndex>,
-    pub(crate) hotspot_summary: Option<&'a HotspotSummary>,
-    pub(crate) has_istanbul_coverage: bool,
     pub(crate) needs_file_scores: bool,
+    /// Run-wide override resolver from `prepare_health_core_sections`, reused
+    /// for the large-function list so it shares the same ceilings as findings
+    /// and file scoring instead of re-deriving them from raw config values.
+    pub(crate) threshold_resolver: &'a super::threshold_overrides::ThresholdOverrideResolver,
 }
 
 /// Assign the prop-drilling chain count / max depth onto the vital signs. Prop
@@ -149,24 +157,42 @@ fn compute_scoped_vital_signs(
 }
 
 /// Persist the health snapshot when `--save-snapshot` was requested.
-fn maybe_save_health_snapshot(
-    input: &HealthVitalDataInput<'_>,
-    vital_signs: &fallow_output::VitalSigns,
-    counts: &fallow_output::VitalSignsCounts,
-    health_score: Option<&HealthScore>,
+///
+/// Runs in the output stage after grouping, so a grouped run stores its group
+/// data in the same file. The trend baseline was loaded before this save, so
+/// a trend never compares a run against its own snapshot.
+pub(super) fn maybe_save_health_snapshot(
+    input: &HealthSnapshotSaveInput<'_>,
 ) -> Result<(), HealthError> {
     if let Some(ref snapshot_path) = input.opts.save_snapshot {
         save_snapshot(SnapshotInput {
             opts: input.opts,
             snapshot_path,
-            vital_signs,
-            counts,
+            vital_signs: input.vital_signs,
+            counts: input.counts,
             hotspot_summary: input.hotspot_summary,
-            health_score,
+            health_score: input.health_score,
             coverage_model: Some(active_health_coverage_model(input.has_istanbul_coverage)),
+            groups: input.groups.clone(),
         })?;
     }
     Ok(())
+}
+
+/// Inputs for [`maybe_save_health_snapshot`].
+pub(super) struct HealthSnapshotSaveInput<'a> {
+    pub(super) opts: &'a HealthExecutionOptions<'a>,
+    pub(super) vital_signs: &'a fallow_output::VitalSigns,
+    pub(super) counts: &'a fallow_output::VitalSignsCounts,
+    pub(super) health_score: Option<&'a HealthScore>,
+    pub(super) hotspot_summary: Option<&'a HotspotSummary>,
+    pub(super) has_istanbul_coverage: bool,
+    pub(super) groups: Option<fallow_output::SnapshotGrouping>,
+}
+
+/// Whether the run asked for a trend, through `--trend` or `--trend-from`.
+pub(super) const fn trend_requested(opts: &HealthExecutionOptions<'_>) -> bool {
+    opts.trend || opts.trend_from.is_some()
 }
 
 pub fn prepare_health_vital_data(
@@ -197,15 +223,25 @@ pub fn prepare_health_vital_data(
         changed_files: input.changed_files,
         ws_roots: input.ws_roots,
         diff_index: input.diff_index,
+        threshold_resolver: input.threshold_resolver,
     });
-    maybe_save_health_snapshot(input, &vital_signs, &counts, health_score.as_ref())?;
-    let health_trend =
-        compute_health_trend(input.opts, &vital_signs, &counts, health_score.as_ref())?;
+    let trend_baseline = load_health_trend_baseline(input.opts)?;
+    let health_trend = trend_baseline.as_ref().map(|baseline| {
+        vital_signs::compute_trend_against(
+            &baseline.snapshot,
+            baseline.snapshots_loaded,
+            &vital_signs,
+            &counts,
+            health_score.as_ref(),
+        )
+    });
 
     Ok(HealthVitalData {
         vital_signs,
+        counts,
         health_score,
         health_trend,
+        trend_baseline,
         large_functions,
     })
 }
@@ -236,20 +272,12 @@ struct FilteredLargeFunctionInput<'a> {
     changed_files: Option<&'a rustc_hash::FxHashSet<std::path::PathBuf>>,
     ws_roots: Option<&'a [std::path::PathBuf]>,
     diff_index: Option<&'a fallow_output::DiffIndex>,
+    threshold_resolver: &'a super::threshold_overrides::ThresholdOverrideResolver,
 }
 
 fn collect_filtered_large_functions(
     input: FilteredLargeFunctionInput<'_>,
 ) -> Vec<fallow_output::LargeFunctionEntry> {
-    let threshold_resolver = super::threshold_overrides::ThresholdOverrideResolver::new(
-        &input.config.health.threshold_overrides,
-        super::threshold_overrides::GlobalHealthThresholds {
-            cyclomatic: input.config.health.max_cyclomatic,
-            cognitive: input.config.health.max_cognitive,
-            crap: input.config.health.max_crap,
-            unit_size: input.config.health.max_unit_size,
-        },
-    );
     let large_input = LargeFunctionInput {
         vital_signs: input.vital_signs,
         modules: input.modules,
@@ -258,7 +286,7 @@ fn collect_filtered_large_functions(
         ignore_set: input.ignore_set,
         changed_files: input.changed_files,
         ws_roots: input.ws_roots,
-        thresholds: &threshold_resolver,
+        thresholds: input.threshold_resolver,
     };
     let mut large_functions = collect_large_functions(&large_input);
     if let Some(diff_index) = input.diff_index {
@@ -276,11 +304,12 @@ struct SnapshotInput<'a> {
     hotspot_summary: Option<&'a fallow_output::HotspotSummary>,
     health_score: Option<&'a fallow_output::HealthScore>,
     coverage_model: Option<fallow_output::CoverageModel>,
+    groups: Option<fallow_output::SnapshotGrouping>,
 }
 
 fn save_snapshot(input: SnapshotInput<'_>) -> Result<(), HealthError> {
     let shallow = input.hotspot_summary.is_some_and(|s| s.shallow_clone);
-    let snapshot = vital_signs::build_snapshot(
+    let mut snapshot = vital_signs::build_snapshot(
         input.vital_signs.clone(),
         input.counts.clone(),
         input.opts.root,
@@ -289,6 +318,7 @@ fn save_snapshot(input: SnapshotInput<'_>) -> Result<(), HealthError> {
         input.coverage_model,
         input.opts.analysis_identity.clone(),
     );
+    snapshot.groups = input.groups;
     let explicit = if input.snapshot_path.as_os_str().is_empty() {
         None
     } else {
@@ -305,14 +335,13 @@ fn save_snapshot(input: SnapshotInput<'_>) -> Result<(), HealthError> {
     }
 }
 
-/// Compute health trend from historical snapshots if requested.
-fn compute_health_trend(
+/// Load the trend baseline when a trend was requested.
+///
+/// The project trend and the group trend both compare against the result.
+fn load_health_trend_baseline(
     opts: &HealthExecutionOptions<'_>,
-    vital_signs: &fallow_output::VitalSigns,
-    counts: &fallow_output::VitalSignsCounts,
-    health_score: Option<&fallow_output::HealthScore>,
-) -> Result<Option<fallow_output::HealthTrend>, HealthError> {
-    if !opts.trend {
+) -> Result<Option<vital_signs::TrendBaseline>, HealthError> {
+    if !trend_requested(opts) {
         return Ok(None);
     }
     if opts.changed_since.is_some() && !opts.quiet {
@@ -321,31 +350,29 @@ fn compute_health_trend(
              snapshots are typically from full-project runs"
         );
     }
-    let snapshots = vital_signs::load_snapshots(opts.root);
-    if snapshots.is_empty() && !opts.quiet {
-        eprintln!(
-            "No snapshots found. Run `fallow health --save-snapshot` to save a \
-             baseline, then use --trend on subsequent runs to track progress."
-        );
-    }
-    if let Some(previous) = snapshots.last() {
-        let incompatible = previous
-            .analysis_identity
-            .incompatible_fields(&opts.analysis_identity);
-        if !incompatible.is_empty() {
-            return Err(HealthError::message(
-                format!(
-                    "health trend snapshot has an incompatible analysis identity ({}); regenerate it with `fallow health --save-snapshot --type-aware` using the same semantic options",
-                    incompatible.join(", ")
-                ),
-                2,
-            ));
+    let baseline = vital_signs::load_trend_baseline(opts.root, opts.trend_from)
+        .map_err(|message| HealthError::message(message, 2))?;
+    let Some(baseline) = baseline else {
+        if !opts.quiet {
+            eprintln!(
+                "No snapshots found. Run `fallow health --save-snapshot` to save a \
+                 baseline, then use --trend on subsequent runs to track progress."
+            );
         }
+        return Ok(None);
+    };
+    let incompatible = baseline
+        .snapshot
+        .analysis_identity
+        .incompatible_fields(&opts.analysis_identity);
+    if !incompatible.is_empty() {
+        return Err(HealthError::message(
+            format!(
+                "health trend snapshot has an incompatible analysis identity ({}); regenerate it with `fallow health --save-snapshot --type-aware` using the same semantic options",
+                incompatible.join(", ")
+            ),
+            2,
+        ));
     }
-    Ok(vital_signs::compute_trend(
-        vital_signs,
-        counts,
-        health_score.map(|s| s.score),
-        &snapshots,
-    ))
+    Ok(Some(baseline))
 }

@@ -6,22 +6,25 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::discover::FileId;
-use crate::extract::{ExportName, MemberInfo, MemberKind, ModuleInfo};
-use crate::graph::{ModuleGraph, ReferenceKind};
+use crate::extract::{MemberInfo, MemberKind, ModuleInfo};
+use crate::graph::{AmbiguityParticipants, ModuleGraph};
 use crate::resolve::ResolvedModule;
 use crate::results::UnusedMember;
 use crate::suppress::{IssueKind, SuppressionContext};
 use fallow_types::extract::{
     FactoryCallMemberAccessFact, FactoryFnMemberAccessFact, FactoryFnWholeObjectFact,
     FactoryReturnObjectPropertyAccessFact, FluentChainMemberAccessFact,
-    FluentChainNewMemberAccessFact, InstanceExportBindingFact, PlaywrightFixtureAliasFact,
+    FluentChainNewMemberAccessFact, InstanceExportBindingFact,
+    PlaywrightConditionalFixtureDefinitionFact, PlaywrightFixtureAliasFact,
     PlaywrightFixtureDefinitionFact, PlaywrightFixtureTypeFact, PlaywrightFixtureUseFact,
-    SemanticFactView, TypedPropertyMemberAccessFact, ordinary_whole_object_uses,
+    PlaywrightTestBindingFact, SemanticFactView, TypedPropertyMemberAccessFact,
+    ordinary_whole_object_uses,
 };
 
 use super::predicates::{is_angular_lifecycle_method, is_react_lifecycle_method};
 use super::{LineOffsetsMap, byte_offset_to_line_col};
 
+mod external_override;
 mod factory;
 mod fluent_chain;
 mod heritage;
@@ -29,6 +32,7 @@ mod instance;
 mod playwright;
 mod typed_property;
 
+use external_override::credit_external_override_members;
 use factory::*;
 use fluent_chain::*;
 use heritage::*;
@@ -68,9 +72,11 @@ const NATIVE_ERROR_BASE_NAMES: &[&str] = &[
     "AggregateError",
 ];
 
-/// Runtime-used members on error subclasses. Kept narrow so unrelated members
-/// on error classes still report.
-const ERROR_SUBCLASS_RUNTIME_MEMBERS: &[&str] = &["name"];
+/// Runtime-used members on error subclasses: the `Error` instance protocol
+/// that runtimes read to print and to inspect an error, and `toString`, which
+/// string conversion calls. Kept narrow so unrelated members on error classes
+/// still report.
+const ERROR_SUBCLASS_RUNTIME_MEMBERS: &[&str] = &["name", "message", "stack", "cause", "toString"];
 
 fn is_native_error_base_name(name: &str) -> bool {
     NATIVE_ERROR_BASE_NAMES.contains(&name)
@@ -457,55 +463,28 @@ pub(super) fn build_local_to_export_keys(
     local_to_export_keys
 }
 
-/// Walk re-export chains to the defining-site `ExportKey`s.
+/// Resolve an exported name to its unique defining-site `ExportKey`.
 ///
-/// Prefers real re-export edges over barrel stubs and handles renamed or
-/// star re-exports.
+/// Runtime bindings take precedence. Type resolution is used only when no
+/// value binding exists, preserving interface/type member analysis without
+/// allowing an ambiguous runtime binding to credit arbitrary declarations.
 fn walk_re_export_origins(
     graph: &ModuleGraph,
     start_file: FileId,
     start_name: &str,
 ) -> Vec<ExportKey> {
-    let mut origins: Vec<ExportKey> = Vec::new();
-    let mut visited: FxHashSet<(FileId, String)> = FxHashSet::default();
-    let mut stack: Vec<(FileId, String)> = vec![(start_file, start_name.to_string())];
+    use crate::graph::{EffectiveExportResolution, ExportNamespace};
 
-    while let Some((file_id, name)) = stack.pop() {
-        if !visited.insert((file_id, name.clone())) {
-            continue;
-        }
-        let Some(module) = graph.modules.get(file_id.0 as usize) else {
-            continue;
-        };
-
-        let mut matched_named = false;
-        for re in &module.re_exports {
-            if re.exported_name != "*" && re.imported_name != "*" && re.exported_name == name {
-                stack.push((re.source_file, re.imported_name.clone()));
-                matched_named = true;
-            }
-        }
-        if matched_named {
-            continue;
-        }
-
-        let locally_defined = module.exports.iter().any(|e| match &e.name {
-            ExportName::Named(n) => n.as_str() == name,
-            ExportName::Default => name == "default",
-        });
-        if locally_defined {
-            origins.push(ExportKey::new(file_id, name));
-            continue;
-        }
-
-        for re in &module.re_exports {
-            if re.exported_name == "*" {
-                stack.push((re.source_file, name.clone()));
-            }
-        }
-    }
-
-    origins
+    let namespace = match graph.resolve_export(start_file, start_name, ExportNamespace::Value) {
+        EffectiveExportResolution::Unique(_) => ExportNamespace::Value,
+        EffectiveExportResolution::Missing => ExportNamespace::Type,
+        EffectiveExportResolution::Ambiguous => return Vec::new(),
+    };
+    graph
+        .resolve_export_origin(start_file, start_name, namespace)
+        .map(|origin| ExportKey::new(origin.file_id(), origin.export().name.to_string()))
+        .into_iter()
+        .collect()
 }
 
 /// Copy access sets from barrel `ExportKey`s to every defining-site
@@ -564,39 +543,30 @@ pub(super) fn export_key_with_origins(graph: &ModuleGraph, key: &ExportKey) -> V
     keys
 }
 
-pub(super) fn entry_point_star_re_export_targets(
+pub(super) fn public_export_origin_keys(
     graph: &ModuleGraph,
     public_api_entry_points: &FxHashSet<FileId>,
-) -> FxHashSet<FileId> {
-    let mut targets: FxHashSet<FileId> = public_api_entry_points
+) -> FxHashSet<ExportKey> {
+    graph
+        .public_export_origins(public_api_entry_points)
         .iter()
-        .filter_map(|file_id| graph.modules.get(file_id.0 as usize))
-        .flat_map(|module| {
-            module
-                .re_exports
-                .iter()
-                .filter(|re_export| re_export.exported_name == "*")
-                .map(|re_export| re_export.source_file)
+        .map(|origin| ExportKey::new(origin.file_id(), origin.export_name()))
+        .collect()
+}
+
+fn public_class_export_origin_keys(
+    graph: &ModuleGraph,
+    public_api_entry_points: &FxHashSet<FileId>,
+) -> FxHashSet<ExportKey> {
+    use crate::graph::ExportNamespace;
+
+    [ExportNamespace::Value, ExportNamespace::Type]
+        .into_iter()
+        .flat_map(|namespace| {
+            graph.public_export_origins_in_namespace(public_api_entry_points, namespace)
         })
-        .collect();
-
-    let mut stack: Vec<FileId> = targets.iter().copied().collect();
-    while let Some(file_id) = stack.pop() {
-        let Some(module) = graph.modules.get(file_id.0 as usize) else {
-            continue;
-        };
-        for re_export in module
-            .re_exports
-            .iter()
-            .filter(|re_export| re_export.exported_name == "*")
-        {
-            if targets.insert(re_export.source_file) {
-                stack.push(re_export.source_file);
-            }
-        }
-    }
-
-    targets
+        .map(|origin| ExportKey::new(origin.file_id(), origin.export_name()))
+        .collect()
 }
 
 fn export_has_class_members(export: &crate::graph::ExportSymbol) -> bool {
@@ -608,31 +578,13 @@ fn export_has_class_members(export: &crate::graph::ExportSymbol) -> bool {
     })
 }
 
-pub(super) fn export_has_entry_point_re_export_reference(
-    graph: &ModuleGraph,
-    export: &crate::graph::ExportSymbol,
-    public_api_entry_points: &FxHashSet<FileId>,
-) -> bool {
-    export.references.iter().any(|reference| {
-        reference.kind == ReferenceKind::ReExport
-            && public_api_entry_points.contains(&reference.from_file)
-            && graph
-                .modules
-                .get(reference.from_file.0 as usize)
-                .is_some_and(|module| module.is_entry_point())
-    })
-}
-
 fn is_entry_point_public_class_export(
-    graph: &ModuleGraph,
     module: &crate::graph::ModuleNode,
     export: &crate::graph::ExportSymbol,
-    entry_star_targets: &FxHashSet<FileId>,
-    public_api_entry_points: &FxHashSet<FileId>,
+    public_class_exports: &FxHashSet<ExportKey>,
 ) -> bool {
     export_has_class_members(export)
-        && (entry_star_targets.contains(&module.file_id)
-            || export_has_entry_point_re_export_reference(graph, export, public_api_entry_points))
+        && public_class_exports.contains(&ExportKey::new(module.file_id, export.name.to_string()))
 }
 
 fn playwright_fixture_uses(resolved: &ResolvedModule) -> Vec<PlaywrightFixtureUseFact> {
@@ -645,6 +597,18 @@ fn playwright_fixture_definitions(
 ) -> Vec<PlaywrightFixtureDefinitionFact> {
     let view = SemanticFactView::new(&resolved.semantic_facts, &resolved.member_accesses);
     view.playwright_fixture_definitions()
+}
+
+fn playwright_conditional_fixture_definitions(
+    resolved: &ResolvedModule,
+) -> Vec<PlaywrightConditionalFixtureDefinitionFact> {
+    let view = SemanticFactView::new(&resolved.semantic_facts, &resolved.member_accesses);
+    view.playwright_conditional_fixture_definitions()
+}
+
+fn playwright_test_bindings(resolved: &ResolvedModule) -> Vec<PlaywrightTestBindingFact> {
+    let view = SemanticFactView::new(&resolved.semantic_facts, &resolved.member_accesses);
+    view.playwright_test_bindings()
 }
 
 fn playwright_fixture_aliases(resolved: &ResolvedModule) -> Vec<PlaywrightFixtureAliasFact> {
@@ -660,6 +624,13 @@ fn playwright_fixture_types(resolved: &ResolvedModule) -> Vec<PlaywrightFixtureT
 fn instance_export_bindings(resolved: &ResolvedModule) -> Vec<InstanceExportBindingFact> {
     let view = SemanticFactView::new(&resolved.semantic_facts, &resolved.member_accesses);
     view.instance_export_bindings()
+}
+
+fn exported_object_instance_properties(
+    module: &ResolvedModule,
+) -> impl Iterator<Item = &fallow_types::extract::ExportedObjectInstancePropertyFact> {
+    SemanticFactView::new(&module.semantic_facts, &module.member_accesses)
+        .exported_object_instance_properties()
 }
 
 fn factory_call_member_accesses(resolved: &ResolvedModule) -> Vec<FactoryCallMemberAccessFact> {
@@ -788,6 +759,7 @@ pub struct UnusedClassMemberCandidate {
 struct MemberPassIndexes<'a> {
     module_by_id: FxHashMap<FileId, &'a ResolvedModule>,
     local_keys_by_file: FxHashMap<FileId, FxHashMap<&'a str, Vec<ExportKey>>>,
+    exported_object_classes_by_property: FxHashMap<(FileId, &'a str, &'a str), Vec<&'a str>>,
     empty: FxHashMap<&'a str, Vec<ExportKey>>,
 }
 
@@ -799,13 +771,25 @@ impl<'a> MemberPassIndexes<'a> {
         let mut module_by_id: FxHashMap<FileId, &'a ResolvedModule> = FxHashMap::default();
         let mut local_keys_by_file: FxHashMap<FileId, FxHashMap<&'a str, Vec<ExportKey>>> =
             FxHashMap::default();
+        let mut exported_object_classes_by_property = FxHashMap::default();
         for module in resolved_modules {
             module_by_id.insert(module.file_id, module);
             local_keys_by_file.insert(module.file_id, build_local_to_export_keys(module));
+            for property in exported_object_instance_properties(module) {
+                exported_object_classes_by_property
+                    .entry((
+                        module.file_id,
+                        property.export_name.as_str(),
+                        property.property_path.as_str(),
+                    ))
+                    .or_insert_with(Vec::new)
+                    .push(property.class_local_name.as_str());
+            }
         }
         Self {
             module_by_id,
             local_keys_by_file,
+            exported_object_classes_by_property,
             empty: FxHashMap::default(),
         }
     }
@@ -841,11 +825,12 @@ pub(super) struct UnusedMemberScanInput<'a> {
 }
 
 struct PreparedMemberScan<'a> {
+    ambiguity: AmbiguityParticipants,
     heritage_context: MemberHeritageContext<'a>,
     accessed_members: FxHashMap<ExportKey, FxHashSet<String>>,
     self_accessed_members: FxHashMap<FileId, FxHashSet<String>>,
     whole_object_used_exports: FxHashSet<ExportKey>,
-    entry_star_targets: FxHashSet<FileId>,
+    public_class_exports: FxHashSet<ExportKey>,
     error_subclass_keys: FxHashSet<ExportKey>,
     ol_interaction_subclass_keys: FxHashSet<ExportKey>,
 }
@@ -933,11 +918,11 @@ impl MemberReportContext<'_, '_> {
         store_only_scan: bool,
         buckets: &mut MemberScanBuckets,
     ) {
-        if self.export_member_scan_skipped(module, export, store_only_scan) {
+        let export_name = export.name.to_string();
+        if self.export_member_scan_skipped(module, export, &export_name, store_only_scan) {
             return;
         }
 
-        let export_name = export.name.to_string();
         let export_key = ExportKey::new(module.file_id, export_name.clone());
         if self
             .prepared
@@ -965,8 +950,16 @@ impl MemberReportContext<'_, '_> {
         &self,
         module: &crate::graph::ModuleNode,
         export: &crate::graph::ExportSymbol,
+        export_name: &str,
         store_only_scan: bool,
     ) -> bool {
+        if self.prepared.ambiguity.contains_declaration(
+            module.file_id,
+            export_name,
+            export.is_type_only,
+        ) {
+            return true;
+        }
         if should_skip_export_member_scan(self.input.graph, module, export) {
             return true;
         }
@@ -987,13 +980,8 @@ impl MemberReportContext<'_, '_> {
     ) {
         let module = target.module;
         let file_self_accesses = self.prepared.self_accessed_members.get(&module.file_id);
-        let is_public_api_class_export = is_entry_point_public_class_export(
-            self.input.graph,
-            module,
-            export,
-            &self.prepared.entry_star_targets,
-            self.input.public_api_entry_points,
-        );
+        let is_public_api_class_export =
+            is_entry_point_public_class_export(module, export, &self.prepared.public_class_exports);
         let (super_class, implemented_interfaces) = self
             .prepared
             .heritage_context
@@ -1101,8 +1089,8 @@ fn prepare_member_scan(input: UnusedMemberScanInput<'_>) -> PreparedMemberScan<'
         whole_object_used_exports,
     } = collect_propagated_member_accesses(input, &heritage_context, &parent_to_children, &indexes);
 
-    let entry_star_targets =
-        entry_point_star_re_export_targets(input.graph, input.public_api_entry_points);
+    let public_class_exports =
+        public_class_export_origin_keys(input.graph, input.public_api_entry_points);
 
     let error_subclass_keys = build_error_subclass_export_keys(
         &parent_to_children,
@@ -1113,11 +1101,12 @@ fn prepare_member_scan(input: UnusedMemberScanInput<'_>) -> PreparedMemberScan<'
         build_ol_interaction_subclass_keys(input.resolved_modules, &parent_to_children);
 
     PreparedMemberScan {
+        ambiguity: input.graph.ambiguity_participants(),
         heritage_context,
         accessed_members,
         self_accessed_members,
         whole_object_used_exports,
-        entry_star_targets,
+        public_class_exports,
         error_subclass_keys,
         ol_interaction_subclass_keys,
     }
@@ -1189,20 +1178,37 @@ fn collect_propagated_member_accesses(
         mut accessed_members,
         mut self_accessed_members,
         mut whole_object_used_exports,
-    } = collect_direct_member_accesses(input.resolved_modules, indexes);
+    } = collect_direct_member_accesses(input.graph, input.resolved_modules, indexes);
 
     propagate_common_member_accesses(
         input,
         indexes,
-        &heritage_context.interface_to_implementers,
+        &heritage_context.class_heritage_by_file,
+        &heritage_context
+            .interface_implementations
+            .implementers_by_interface,
         &mut accessed_members,
         &mut whole_object_used_exports,
     );
 
+    for (implementer, required) in &heritage_context
+        .interface_implementations
+        .required_members_by_implementer
+    {
+        accessed_members
+            .entry(implementer.clone())
+            .or_default()
+            .extend(required.iter().cloned());
+    }
+
     propagate_interface_member_accesses(
-        &heritage_context.interface_to_implementers,
+        &heritage_context
+            .interface_implementations
+            .implementers_by_interface,
         &mut accessed_members,
     );
+
+    credit_external_override_members(input.resolved_modules, input.modules, &mut accessed_members);
 
     propagate_angular_template_member_accesses(
         input.graph,
@@ -1229,10 +1235,18 @@ fn collect_propagated_member_accesses(
 fn propagate_common_member_accesses(
     input: UnusedMemberScanInput<'_>,
     indexes: &MemberPassIndexes<'_>,
+    class_heritage_by_file: &FxHashMap<FileId, &[fallow_types::extract::ClassHeritageInfo]>,
     interface_to_implementers: &FxHashMap<ExportKey, Vec<ExportKey>>,
     accessed_members: &mut FxHashMap<ExportKey, FxHashSet<String>>,
     whole_object_used_exports: &mut FxHashSet<ExportKey>,
 ) {
+    propagate_computed_enum_key_accesses(
+        input.graph,
+        input.resolved_modules,
+        indexes,
+        accessed_members,
+    );
+    propagate_type_alias_surface_accesses(input.resolved_modules, indexes, accessed_members);
     propagate_playwright_fixture_accesses(
         input.graph,
         input.resolved_modules,
@@ -1256,12 +1270,21 @@ fn propagate_common_member_accesses(
         input.graph,
         input.resolved_modules,
         indexes,
+        class_heritage_by_file,
         accessed_members,
+    );
+    propagate_exported_object_instance_accesses(
+        input.graph,
+        input.resolved_modules,
+        indexes,
+        accessed_members,
+        whole_object_used_exports,
     );
     propagate_typed_property_accesses(
         input.graph,
         input.resolved_modules,
         indexes,
+        class_heritage_by_file,
         interface_to_implementers,
         accessed_members,
     );
@@ -1302,6 +1325,144 @@ fn propagate_common_member_accesses(
         accessed_members,
         whole_object_used_exports,
     );
+}
+
+fn propagate_computed_enum_key_accesses(
+    graph: &ModuleGraph,
+    resolved_modules: &[ResolvedModule],
+    indexes: &MemberPassIndexes<'_>,
+    accessed_members: &mut FxHashMap<ExportKey, FxHashSet<String>>,
+) {
+    let mut local_values: FxHashMap<(FileId, String, String), FxHashSet<String>> =
+        FxHashMap::default();
+    let mut exported_values: FxHashMap<(ExportKey, String), FxHashSet<String>> =
+        FxHashMap::default();
+
+    for module in resolved_modules {
+        let local_keys = indexes.local_keys(module.file_id);
+        let view = SemanticFactView::new(&module.semantic_facts, &module.member_accesses);
+        for fact in view.string_enum_member_values() {
+            local_values
+                .entry((
+                    module.file_id,
+                    fact.enum_name.clone(),
+                    fact.member_name.clone(),
+                ))
+                .or_default()
+                .insert(fact.value.clone());
+            if let Some(keys) = local_keys.get(fact.enum_name.as_str()) {
+                for key in keys {
+                    exported_values
+                        .entry((key.clone(), fact.member_name.clone()))
+                        .or_default()
+                        .insert(fact.value.clone());
+                }
+            }
+        }
+    }
+
+    let mut used_property_names = FxHashSet::default();
+    for module in resolved_modules {
+        let local_keys = indexes.local_keys(module.file_id);
+        let view = SemanticFactView::new(&module.semantic_facts, &module.member_accesses);
+        for fact in view.computed_enum_key_uses() {
+            let mut values = local_values
+                .get(&(
+                    module.file_id,
+                    fact.key_object.clone(),
+                    fact.key_member.clone(),
+                ))
+                .cloned()
+                .unwrap_or_default();
+
+            if !module
+                .unused_import_bindings
+                .contains(fact.key_object.as_str())
+                && let Some(keys) = local_keys.get(fact.key_object.as_str())
+            {
+                for key in keys {
+                    for origin in export_key_with_origins(graph, key) {
+                        if let Some(found) = exported_values.get(&(origin, fact.key_member.clone()))
+                        {
+                            values.extend(found.iter().cloned());
+                        }
+                    }
+                }
+            }
+
+            if values.len() == 1 {
+                used_property_names.extend(values);
+            }
+        }
+    }
+
+    if used_property_names.is_empty() {
+        return;
+    }
+    for module in &graph.modules {
+        for export in &module.exports {
+            for member in &export.members {
+                if matches!(
+                    member.kind,
+                    MemberKind::ClassMethod | MemberKind::ClassProperty
+                ) && used_property_names.contains(member.name.as_str())
+                {
+                    accessed_members
+                        .entry(ExportKey::new(module.file_id, export.name.to_string()))
+                        .or_default()
+                        .insert(member.name.clone());
+                }
+            }
+        }
+    }
+}
+
+fn propagate_type_alias_surface_accesses(
+    resolved_modules: &[ResolvedModule],
+    indexes: &MemberPassIndexes<'_>,
+    accessed_members: &mut FxHashMap<ExportKey, FxHashSet<String>>,
+) {
+    let mut targets_by_alias: FxHashMap<ExportKey, Vec<ExportKey>> = FxHashMap::default();
+    for module in resolved_modules {
+        let local_keys = indexes.local_keys(module.file_id);
+        let view = SemanticFactView::new(&module.semantic_facts, &module.member_accesses);
+        for fact in view.type_alias_surface_targets() {
+            let (Some(alias_keys), Some(target_keys)) = (
+                local_keys.get(fact.alias_name.as_str()),
+                local_keys.get(fact.target_name.as_str()),
+            ) else {
+                continue;
+            };
+            for alias in alias_keys {
+                targets_by_alias
+                    .entry(alias.clone())
+                    .or_default()
+                    .extend(target_keys.iter().cloned());
+            }
+        }
+    }
+
+    let mut queue: std::collections::VecDeque<ExportKey> = targets_by_alias
+        .keys()
+        .filter(|alias| accessed_members.contains_key(*alias))
+        .cloned()
+        .collect();
+    while let Some(alias) = queue.pop_front() {
+        let Some(members) = accessed_members.get(&alias).cloned() else {
+            continue;
+        };
+        let Some(targets) = targets_by_alias.get(&alias) else {
+            continue;
+        };
+        for target in targets {
+            let target_members = accessed_members.entry(target.clone()).or_default();
+            let old_len = target_members.len();
+            target_members.extend(members.iter().cloned());
+            if target_members.len() != old_len && targets_by_alias.contains_key(target) {
+                queue.push_back(target.clone());
+            }
+        }
+    }
 }
 
 fn should_skip_export_member_scan(
@@ -1365,8 +1526,8 @@ fn should_skip_member_for_unused_report(member: &MemberInfo, ctx: &MemberSkipCon
     // only by a sibling getter/action via `this.<member>` lands in the file's
     // self-access set. Without this, a store member used solely inside its own
     // store would be falsely flagged. Class members already credit this way;
-    // store members must too. (Setup stores do not use `this`; a returned key
-    // used only internally is a genuinely dead PUBLIC member.)
+    // store members must too. (Setup stores do not use `this`; the extractor
+    // credits a returned key that the setup body reads, issue #3348.)
     if (is_class_member_kind(member.kind) || matches!(member.kind, MemberKind::StoreMember))
         && ctx
             .file_self_accesses
@@ -1464,7 +1625,100 @@ struct MemberAccessCollections {
     whole_object_used_exports: FxHashSet<ExportKey>,
 }
 
+/// Project files that a namespace import (`import * as local`) of this module
+/// resolves to.
+fn namespace_import_targets<'r>(
+    resolved: &'r ResolvedModule,
+    local: &'r str,
+) -> impl Iterator<Item = FileId> + 'r {
+    resolved
+        .all_resolved_imports()
+        .filter(move |import| {
+            import.info.local_name == local
+                && matches!(
+                    import.info.imported_name,
+                    crate::extract::ImportedName::Namespace
+                )
+        })
+        .filter_map(|import| import.target.internal_file_id())
+}
+
+/// Project files that an imported binding names through a namespace re-export
+/// (`export * as Ns from "./x"`), also behind a chain of named re-exports.
+fn namespace_re_export_targets(graph: &ModuleGraph, key: &ExportKey) -> Vec<FileId> {
+    export_key_with_origins(graph, key)
+        .iter()
+        .filter_map(|origin| {
+            graph
+                .modules
+                .get(origin.file_id.0 as usize)
+                .map(|m| (m, origin))
+        })
+        .flat_map(|(module, origin)| {
+            module.re_exports.iter().filter(move |edge| {
+                edge.imported_name == "*" && edge.exported_name == origin.export_name
+            })
+        })
+        .map(|edge| edge.source_file)
+        .collect()
+}
+
+/// Resolves the root of a dotted receiver `Ns.Class` to the project files
+/// that `Ns` names: a namespace import, or an imported `export * as Ns from`
+/// binding. One level only: `Ns.Inner.Class` is not resolved. Results are
+/// cached per root because the same root repeats across accesses in a file.
+struct NamespaceRootTargets<'g, 'r> {
+    graph: &'g ModuleGraph,
+    resolved: &'r ResolvedModule,
+    local_to_export_keys: &'g FxHashMap<&'g str, Vec<ExportKey>>,
+    cache: FxHashMap<&'r str, Vec<FileId>>,
+}
+
+impl<'g, 'r> NamespaceRootTargets<'g, 'r> {
+    fn new(
+        graph: &'g ModuleGraph,
+        resolved: &'r ResolvedModule,
+        local_to_export_keys: &'g FxHashMap<&'g str, Vec<ExportKey>>,
+    ) -> Self {
+        Self {
+            graph,
+            resolved,
+            local_to_export_keys,
+            cache: FxHashMap::default(),
+        }
+    }
+
+    /// Export keys for a dotted receiver, or an empty list when the receiver
+    /// is not `Ns.Class` with a resolvable `Ns`.
+    fn export_keys(&mut self, object: &'r str) -> Vec<ExportKey> {
+        let Some((root, export_name)) = object.split_once('.') else {
+            return Vec::new();
+        };
+        if root == "this" || export_name.contains('.') {
+            return Vec::new();
+        }
+        let (graph, resolved, local_to_export_keys) =
+            (self.graph, self.resolved, self.local_to_export_keys);
+        self.cache
+            .entry(root)
+            .or_insert_with(|| {
+                let re_export_targets = local_to_export_keys
+                    .get(root)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|key| namespace_re_export_targets(graph, key));
+                namespace_import_targets(resolved, root)
+                    .chain(re_export_targets)
+                    .collect()
+            })
+            .iter()
+            .map(|file_id| ExportKey::new(*file_id, export_name.to_string()))
+            .collect()
+    }
+}
+
 fn collect_direct_member_accesses(
+    graph: &ModuleGraph,
     resolved_modules: &[ResolvedModule],
     indexes: &MemberPassIndexes<'_>,
 ) -> MemberAccessCollections {
@@ -1474,6 +1728,7 @@ fn collect_direct_member_accesses(
 
     for resolved in resolved_modules {
         let local_to_export_keys = indexes.local_keys(resolved.file_id);
+        let mut namespace_roots = NamespaceRootTargets::new(graph, resolved, local_to_export_keys);
         for access in SemanticFactView::new(&resolved.semantic_facts, &resolved.member_accesses)
             .ordinary_member_accesses()
         {
@@ -1491,12 +1746,52 @@ fn collect_direct_member_accesses(
                         .or_default()
                         .insert(access.member.clone());
                 }
+                continue;
+            }
+            for export_key in namespace_roots.export_keys(&access.object) {
+                accessed_members
+                    .entry(export_key)
+                    .or_default()
+                    .insert(access.member.clone());
+            }
+        }
+
+        for access in SemanticFactView::new(&resolved.semantic_facts, &resolved.member_accesses)
+            .qualified_class_member_accesses()
+        {
+            for target_file_id in namespace_import_targets(resolved, &access.namespace_local) {
+                accessed_members
+                    .entry(ExportKey::new(
+                        target_file_id,
+                        access.class_export_name.clone(),
+                    ))
+                    .or_default()
+                    .insert(access.member.clone());
             }
         }
 
         for local_name in resolved.whole_object_uses.iter() {
             if let Some(export_keys) = local_to_export_keys.get(local_name.as_str()) {
                 whole_object_used_exports.extend(export_keys.iter().cloned());
+            }
+            if let Some((namespace_local, export_name)) = local_name.split_once('.')
+                && !export_name.contains('.')
+            {
+                for target_file_id in namespace_import_targets(resolved, namespace_local) {
+                    whole_object_used_exports
+                        .insert(ExportKey::new(target_file_id, export_name.to_string()));
+                }
+            }
+            for target_file_id in namespace_import_targets(resolved, local_name) {
+                let Some(target) = indexes.module_by_id.get(&target_file_id) else {
+                    continue;
+                };
+                whole_object_used_exports.extend(
+                    target
+                        .exports
+                        .iter()
+                        .map(|export| ExportKey::new(target_file_id, export.name.to_string())),
+                );
             }
         }
     }

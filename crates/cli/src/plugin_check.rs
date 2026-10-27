@@ -189,6 +189,9 @@ fn warning_value(warning: &CheckWarning) -> Value {
     if let Some(entry) = &warning.entry {
         value["entry"] = json!(entry);
     }
+    if let Some(limit) = warning.kind.expansion_limit() {
+        value["limit"] = json!(limit);
+    }
     value
 }
 
@@ -198,13 +201,11 @@ fn warning_value(warning: &CheckWarning) -> Value {
 /// direct stat.
 fn entry_path_exists(root: &Path, entry: &str) -> bool {
     expand_braces(entry).iter().any(|pattern| {
-        let full = root.join(pattern);
         if pattern.contains(['*', '?', '[']) {
-            glob::glob(&full.to_string_lossy())
-                .ok()
+            fallow_config::glob_validation::expand_disk_glob(root, pattern)
                 .is_some_and(|mut paths| paths.next().is_some())
         } else {
-            full.exists()
+            root.join(pattern).exists()
         }
     })
 }
@@ -375,9 +376,23 @@ fn human_warning(warning: &Value) -> String {
             slot("glob")
         ),
         "manifest-parse-failed" => format!(
-            "manifest-parse-failed: manifest '{}' could not be read or parsed (check it is valid \
-             JSON/JSONC).",
+            "manifest-parse-failed: manifest '{}' could not be read or parsed using the rule's \
+             declared format.",
             slot("manifest")
+        ),
+        "field-values-limit-exceeded" => format!(
+            "field-values-limit-exceeded: field path '{}' in manifest '{}' exceeded the value \
+             limit of {}; reduce the manifest array or split the rule.",
+            slot("field_path"),
+            slot("manifest"),
+            warning.get("limit").and_then(Value::as_u64).unwrap_or(0)
+        ),
+        "entry-expansion-limit-exceeded" => format!(
+            "entry-expansion-limit-exceeded: template '{}' in manifest '{}' exceeded the concrete \
+             entry limit of {}; reduce its interpolation fan-out.",
+            slot("entry"),
+            slot("manifest"),
+            warning.get("limit").and_then(Value::as_u64).unwrap_or(0)
         ),
         "entry-outside-root" => format!(
             "entry-outside-root: entry '{}' (from '{}') resolved outside the project root and was \
@@ -449,6 +464,8 @@ mod tests {
                     | WarningKind::FieldPathUnresolved
                     | WarningKind::EntriesEmpty
                     | WarningKind::ManifestParseFailed
+                    | WarningKind::FieldValuesLimitExceeded
+                    | WarningKind::EntryExpansionLimitExceeded
                     | WarningKind::EntryOutsideRoot
                     | WarningKind::SeededPathsMissing => {}
                 }
@@ -459,6 +476,8 @@ mod tests {
                 WarningKind::FieldPathUnresolved,
                 WarningKind::EntriesEmpty,
                 WarningKind::ManifestParseFailed,
+                WarningKind::FieldValuesLimitExceeded,
+                WarningKind::EntryExpansionLimitExceeded,
                 WarningKind::EntryOutsideRoot,
                 WarningKind::SeededPathsMissing,
             ]
@@ -496,6 +515,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_warning_points_to_the_declared_format() {
+        let warning = warning_value(&CheckWarning {
+            kind: WarningKind::ManifestParseFailed,
+            glob: None,
+            field_path: None,
+            manifest: Some("extension/manifest.json".to_string()),
+            entry: None,
+        });
+
+        assert_eq!(
+            human_warning(&warning),
+            "manifest-parse-failed: manifest 'extension/manifest.json' could not be read or parsed using the rule's declared format."
+        );
+    }
+
+    #[test]
     fn plugin_check_json_respects_explicit_style() {
         let doc = json!({"kind": "plugin-check", "plugins": []});
         let compact = render_plugin_check_json(&doc, crate::json_style::JsonStyle::Compact)
@@ -514,32 +549,34 @@ mod tests {
         );
     }
 
-    fn kibana_fixture() -> std::path::PathBuf {
+    fn manifest_fixture() -> std::path::PathBuf {
         // Canonicalize to mirror how `main.rs` resolves `--root` before dispatch
         // (a `..`-relative root would make every seeded entry fail the
         // under-root check and spuriously warn `entry-outside-root`).
         std::fs::canonicalize(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/manifest-entries-kibana"),
+            std::path::PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+            )
+            .join("../../tests/fixtures/manifest-entries-external"),
         )
         .unwrap()
     }
 
     #[test]
-    fn doc_reports_active_kibana_plugin_seeded_entries() {
-        let doc = build_plugin_check_doc(&kibana_fixture()).expect("build doc");
+    fn doc_reports_active_manifest_plugin_seeded_entries() {
+        let doc = build_plugin_check_doc(&manifest_fixture()).expect("build doc");
         assert_eq!(doc["kind"], "plugin-check");
         let plugins = doc["plugins"].as_array().unwrap();
-        let kibana = plugins.iter().find(|p| p["name"] == "kibana").unwrap();
-        assert_eq!(kibana["active"], true);
-        let rule = &kibana["manifest_rules"][0];
+        let acme = plugins.iter().find(|p| p["name"] == "acme").unwrap();
+        assert_eq!(acme["active"], true);
+        let rule = &acme["manifest_rules"][0];
         assert_eq!(rule["warnings"].as_array().unwrap().len(), 0);
 
         let beta = rule["matched"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["path"] == "plugins/beta/kibana.jsonc")
+            .find(|m| m["path"] == "plugins/beta/acme.jsonc")
             .unwrap();
         // beta has server:false, so only public is seeded.
         let seeded: Vec<&str> = beta["seeded"]
@@ -585,5 +622,84 @@ mod tests {
             "activation_requirement should name the unmet detection, got {:?}",
             plugin["activation_requirement"]
         );
+    }
+
+    #[test]
+    fn doc_reports_wildcard_entries_and_exists_gates_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"extension","dependencies":{"web-ext":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("fallow-plugin-web-ext.jsonc"),
+            r#"{
+                "name": "web-ext-manifest",
+                "enablers": ["web-ext"],
+                "entryPointRole": "runtime",
+                "manifestEntries": [{
+                    "manifests": "**/manifest.json",
+                    "format": "json",
+                    "when": {
+                        "manifest_version": 3,
+                        "background.service_worker": { "exists": true }
+                    },
+                    "entries": [
+                        { "path": "${background.service_worker}" },
+                        { "path": "${content_scripts[*].js}" }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let extension = root.join("extension");
+        std::fs::create_dir_all(extension.join("content")).unwrap();
+        std::fs::write(
+            extension.join("manifest.json"),
+            r#"{
+                "manifest_version": 3,
+                "background": { "service_worker": "background.js" },
+                "content_scripts": [
+                    { "js": ["content/a.js", "content/b.js"] },
+                    { "js": ["content/c.js"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        for path in [
+            "background.js",
+            "content/a.js",
+            "content/b.js",
+            "content/c.js",
+        ] {
+            std::fs::write(extension.join(path), "export {};").unwrap();
+        }
+
+        let doc = build_plugin_check_doc(root).expect("build plugin-check document");
+        let plugin = doc["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|plugin| plugin["name"] == "web-ext-manifest")
+            .expect("external plugin report");
+        assert_eq!(plugin["active"], true);
+        let rule = &plugin["manifest_rules"][0];
+        assert!(rule["warnings"].as_array().unwrap().is_empty());
+        let seeded = rule["matched"][0]["seeded"].as_array().unwrap();
+        assert_eq!(
+            seeded
+                .iter()
+                .map(|entry| entry["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "extension/background.js",
+                "extension/content/a.js",
+                "extension/content/b.js",
+                "extension/content/c.js",
+            ]
+        );
+        assert!(seeded.iter().all(|entry| entry["path_exists"] == true));
     }
 }

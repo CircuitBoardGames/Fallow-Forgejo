@@ -239,11 +239,21 @@ test("verifyBinaryAt uses the embedded production public key", () => {
   }
 });
 
+// Mirror binaryTargetsForPlatform: the suffix comes from the platformId under
+// test, never from the live process.platform. A `dirOverride` run without an
+// explicit platformId is labelled "test-platform" by
+// resolvePlatformPackageForVerify, so the binary it looks for is plain `fallow`
+// on every host -- a fixture keyed off process.platform writes `fallow.exe` on a
+// Windows host and the verify then finds nothing.
+function extForPlatformId(platformId) {
+  return typeof platformId === "string" && platformId.startsWith("win32") ? ".exe" : "";
+}
+
 function makePlatformDir(privateKey, options) {
   const opts = options || {};
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fallow-vbtest-"));
-  const ext = process.platform === "win32" ? ".exe" : "";
-  for (const base of ["fallow"]) {
+  const ext = extForPlatformId(opts.platformId);
+  for (const base of ["fallow", "fallow-similar-code"]) {
     const binaryPath = path.join(dir, `${base}${ext}`);
     const content = Buffer.from(`mock ${base} contents`);
     fs.writeFileSync(binaryPath, content);
@@ -328,6 +338,42 @@ test("verifyInstalled with dirOverride returns ok when every binary verifies", a
   assert.equal(result.package, "<override>");
 });
 
+// binaryTargetsForPlatform reads windows-ness off the platformId so a Windows
+// verify can be synthesized anywhere. Nothing exercised that, which left the
+// `.exe` target unverified on Linux CI and unverified on Windows too.
+test("verifyInstalled verifies the .exe target for a win32 platformId on any host", async (t) => {
+  const { privateKey, rawPub } = makeKeypair();
+  const platformId = "win32-x64-msvc";
+  const dir = makePlatformDir(privateKey, { platformId });
+  t.after(() => cleanup(dir));
+  assert.ok(fs.existsSync(path.join(dir, "fallow.exe")), "fixture must write the .exe target");
+
+  const result = await verifyInstalled({
+    dirOverride: dir,
+    platformId,
+    verifyFn: (p) => _verifyWithKey(p, rawPub),
+    digestProvider: makeDigestProvider(dir),
+  });
+  assert.equal(result.ok, true);
+});
+
+test("verifyInstalled reports the .exe name when a win32 signature is absent", async (t) => {
+  const { privateKey, rawPub } = makeKeypair();
+  const platformId = "win32-arm64-msvc";
+  const dir = makePlatformDir(privateKey, { platformId, skipSigFor: "fallow" });
+  t.after(() => cleanup(dir));
+
+  const result = await verifyInstalled({
+    dirOverride: dir,
+    platformId,
+    verifyFn: (p) => _verifyWithKey(p, rawPub),
+    digestProvider: makeDigestProvider(dir),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "sig-missing");
+  assert.match(result.message, /fallow\.exe/);
+});
+
 test("verifyInstalled resolves a global npm install from the fallow package directory", async (t) => {
   const pkg = currentPlatformPackage();
   if (!pkg) {
@@ -349,7 +395,7 @@ test("verifyInstalled resolves a global npm install from the fallow package dire
   );
 
   const ext = process.platform === "win32" ? ".exe" : "";
-  for (const base of ["fallow"]) {
+  for (const base of ["fallow", "fallow-similar-code"]) {
     const binaryPath = path.join(platformDir, `${base}${ext}`);
     const content = Buffer.from(`global install ${base}`);
     fs.writeFileSync(binaryPath, content);
@@ -460,10 +506,10 @@ test("verifyInstalled honors FALLOW_SKIP_BINARY_VERIFY", async (t) => {
   assert.equal(result.skipped, true);
 });
 
-function computeDigestsForDir(dir) {
-  const ext = process.platform === "win32" ? ".exe" : "";
+function computeDigestsForDir(dir, platformId) {
+  const ext = extForPlatformId(platformId);
   const out = {};
-  for (const base of ["fallow"]) {
+  for (const base of ["fallow", "fallow-similar-code"]) {
     const fileName = `${base}${ext}`;
     const full = path.join(dir, fileName);
     out[fileName] =
@@ -549,7 +595,7 @@ test("verifyInstalled falls back to the provider when the embedded digest is mis
     },
   });
   assert.equal(result.ok, true);
-  assert.equal(providerCalls, 1);
+  assert.equal(providerCalls, 2);
 });
 
 test("verifyInstalled falls back to the provider when fallowDigests is partial / malformed", async (t) => {
@@ -573,15 +619,15 @@ test("verifyInstalled falls back to the provider when fallowDigests is partial /
     },
   });
   assert.equal(result.ok, true);
-  // One call for the single shipped binary because its entry fails to normalize.
-  assert.equal(providerCalls, 1);
+  // Both shipped binaries fall back because their embedded entries are absent or malformed.
+  assert.equal(providerCalls, 2);
 });
 
 test("verifyInstalled returns digest-mismatch when the embedded digest disagrees with the binary", async (t) => {
   const { privateKey, rawPub } = makeKeypair();
   const dir = makePlatformDir(privateKey);
   t.after(() => cleanup(dir));
-  const ext = process.platform === "win32" ? ".exe" : "";
+  const ext = extForPlatformId();
   writeManifest(dir, {
     name: "@fallow-cli/x",
     version: "1.0.0",

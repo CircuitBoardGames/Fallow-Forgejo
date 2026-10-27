@@ -6,8 +6,16 @@
 //! [`ResolvedConfig`] the analysis crates consume. Also hosts workspace and
 //! `package.json` discovery, declarative external plugin definitions, rule
 //! packs, and the in-place config editing used by `fallow fix`.
+//!
+//! Config section structs such as [`RulesConfig`] are not `#[non_exhaustive]`
+//! and gain new public fields in minor releases as rules are added, so
+//! exhaustive struct literals in downstream code are source-breaking on
+//! upgrade. Construct them with struct update syntax, for example
+//! `RulesConfig { unused_files: Severity::Off, ..RulesConfig::default() }`,
+//! to stay source-compatible.
 
 #![warn(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 #![cfg_attr(
     test,
     allow(
@@ -18,20 +26,28 @@
 )]
 
 mod config;
+mod config_inputs;
 mod config_writer;
 mod external_plugin;
+/// Extglob groups, such as `!(*.spec)`, rewritten for `globset`.
+pub mod extglob;
 mod fixability;
 /// JSONC parsing helpers pinning the dialect fallow accepts.
 pub mod jsonc;
 pub mod levenshtein;
 mod rule_pack;
+mod source_walk;
 mod workspace;
+/// YAML parsing behind one internal API.
+pub mod yaml;
 
 pub use config::*;
+pub use config_inputs::*;
 pub use config_writer::*;
 pub use external_plugin::*;
 pub use fixability::*;
 pub use rule_pack::*;
+pub use source_walk::{source_walk_builder, source_walked_workspaces};
 pub use workspace::*;
 
 use std::path::{Path, PathBuf};

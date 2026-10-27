@@ -122,6 +122,21 @@ mod gated {
             ]
         }
 
+        fn coverage_analyze_args(&self) -> Vec<String> {
+            let fixture = fixture_path("coverage-gaps");
+            vec![
+                "coverage".to_owned(),
+                "analyze".to_owned(),
+                "--root".to_owned(),
+                fixture.to_string_lossy().into_owned(),
+                "--runtime-coverage".to_owned(),
+                self.coverage_file.to_string_lossy().into_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+                "--quiet".to_owned(),
+            ]
+        }
+
         fn multi_capture_dir(&self) -> PathBuf {
             let dir = self.tmp.path().join("multi-capture");
             fs::create_dir_all(&dir).expect("create multi-capture dir");
@@ -255,6 +270,149 @@ mod gated {
             json.pointer("/runtime_coverage/schema_version"),
             Some(&serde_json::Value::String("1".to_owned())),
             "runtime_coverage schema_version must be stable for agent consumers"
+        );
+    }
+
+    #[test]
+    fn private_member_does_not_inherit_istanbul_coverage_in_sidecar_request() {
+        let harness = Harness::new();
+        let project_root = harness.tmp.path().join("private-member-project");
+        let source_dir = project_root.join("src");
+        fs::create_dir_all(&source_dir).expect("create fixture source directory");
+        fs::write(
+            project_root.join("package.json"),
+            r#"{"name":"private-member-fixture","version":"1.0.0","type":"module"}"#,
+        )
+        .expect("write fixture package manifest");
+        let source_path = source_dir.join("vault.js");
+        fs::write(
+            &source_path,
+            "const makeVault = (\n  Vault = class {\n    #wipe() {}\n  }\n) => Vault;\nexport { makeVault };\n",
+        )
+        .expect("write private-member fixture");
+
+        let coverage_path = project_root.join("coverage-final.json");
+        let coverage = serde_json::json!({
+            (source_path.to_string_lossy().into_owned()): {
+                "path": source_path,
+                "statementMap": {},
+                "fnMap": {
+                    "0": {
+                        "name": "(anonymous_0)",
+                        "line": 5,
+                        "decl": {
+                            "start": { "line": 1, "column": 18 },
+                            "end": { "line": 1, "column": 19 }
+                        },
+                        "loc": {
+                            "start": { "line": 5, "column": 5 },
+                            "end": { "line": 5, "column": 10 }
+                        }
+                    }
+                },
+                "branchMap": {},
+                "s": {},
+                "f": { "0": 1 },
+                "b": {}
+            }
+        });
+        fs::write(
+            &coverage_path,
+            serde_json::to_vec(&coverage).expect("serialize Istanbul fixture"),
+        )
+        .expect("write Istanbul fixture");
+
+        let mut cmd = harness.fallow();
+        cmd.env("FALLOW_STUB_MODE", "assert-private-member-uncovered");
+        cmd.arg("health")
+            .arg("--root")
+            .arg(&project_root)
+            .arg("--runtime-coverage")
+            .arg(&coverage_path)
+            .arg("--format")
+            .arg("json")
+            .arg("--quiet");
+        let (stdout, stderr, code) = run_with(cmd);
+
+        assert_eq!(
+            code, 0,
+            "private member must remain uncovered in the sidecar request; stdout={stdout}; stderr={stderr}"
+        );
+    }
+
+    #[test]
+    fn coverage_analyze_benchmark_transport_matches_signed_stub_output() {
+        let harness = Harness::new();
+        let root = fixture_path("coverage-gaps");
+        let response = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": fallow_cov_protocol::PROTOCOL_VERSION,
+            "verdict": "clean",
+            "summary": {
+                "functions_tracked": 0,
+                "functions_hit": 0,
+                "functions_unhit": 0,
+                "functions_untracked": 0,
+                "coverage_percent": 0.0,
+                "trace_count": 0,
+                "period_days": 0,
+                "deployments_seen": 0,
+                "capture_quality": null
+            },
+            "findings": [],
+            "hot_paths": [],
+            "blast_radius": [],
+            "importance": [],
+            "watermark": null,
+            "errors": [],
+            "warnings": []
+        }))
+        .expect("serialize clean sidecar response");
+
+        let benchmark = fallow_cli::benchmark_runtime_coverage_analyze_json(
+            &root,
+            &harness.coverage_file,
+            &response,
+            1,
+        );
+        assert_eq!(benchmark.0, std::process::ExitCode::SUCCESS);
+        assert!(benchmark.3 > 0, "request JSON must be measured");
+        let benchmark_json: serde_json::Value =
+            serde_json::from_str(&benchmark.4).expect("benchmark JSON should parse");
+
+        let mut mismatched_response: serde_json::Value =
+            serde_json::from_slice(&response).expect("clean response should parse");
+        mismatched_response["protocol_version"] = serde_json::json!("99.0.0");
+        let mismatch = fallow_cli::benchmark_runtime_coverage_analyze_json(
+            &root,
+            &harness.coverage_file,
+            &serde_json::to_vec(&mismatched_response).expect("serialize mismatch response"),
+            1,
+        );
+        assert_eq!(
+            mismatch.0,
+            std::process::ExitCode::from(4),
+            "in-process response must pass through the production protocol gate"
+        );
+
+        let mut cmd = harness.fallow();
+        cmd.env("FALLOW_LICENSE", sign::mint_runtime_coverage_jwt());
+        cmd.env("FALLOW_STUB_MODE", "enforce-license-gate");
+        for arg in harness.coverage_analyze_args() {
+            cmd.arg(arg);
+        }
+        let (stdout, stderr, code) = run_with(cmd);
+        assert_eq!(code, 0, "signed stub coverage analyze failed: {stderr}");
+        assert!(
+            !stdout.trim_end().contains('\n'),
+            "compact JSON should stay on one line"
+        );
+        let signed_json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("signed stub JSON should parse");
+
+        assert_eq!(
+            benchmark_json.get("runtime_coverage"),
+            signed_json.get("runtime_coverage"),
+            "in-process benchmark transport must preserve signed sidecar semantics"
         );
     }
 
@@ -502,6 +660,208 @@ mod gated {
         assert_eq!(
             quality.get("instances_observed"),
             Some(&serde_json::json!(1))
+        );
+    }
+
+    /// Write a V8 dump for `tests/fixtures/runtime-optimization-targets`. The
+    /// ranges are the output of `NODE_V8_COVERAGE=<dir> node src/app.js` on the
+    /// fixture: `lookup` runs 200 times and calls `resolve` 3 times per call,
+    /// and the loop body of `resolve` runs 4 times per call. The two counts
+    /// differ, so the test shows that the ratio of a function counts its own
+    /// loop, not the calls from its caller.
+    fn write_optimization_dump(dir: &Path, block_coverage: bool) -> PathBuf {
+        let app = fixture_path("runtime-optimization-targets").join("src/app.js");
+        let url = url::Url::from_file_path(&app).expect("fixture file url");
+        let dump = serde_json::json!({
+            "result": [{
+                "scriptId": "1",
+                "url": url.as_str(),
+                "functions": [
+                    {
+                        "functionName": "",
+                        "ranges": [
+                            { "startOffset": 0, "endOffset": 324, "count": 1 },
+                            { "startOffset": 311, "endOffset": 323, "count": 200 }
+                        ],
+                        "isBlockCoverage": block_coverage
+                    },
+                    {
+                        "functionName": "resolve",
+                        "ranges": [
+                            { "startOffset": 0, "endOffset": 130, "count": 600 },
+                            { "startOffset": 75, "endOffset": 113, "count": 2400 },
+                            { "startOffset": 99, "endOffset": 109, "count": 600 }
+                        ],
+                        "isBlockCoverage": block_coverage
+                    },
+                    {
+                        "functionName": "lookup",
+                        "ranges": [
+                            { "startOffset": 147, "endOffset": 275, "count": 200 }
+                        ],
+                        "isBlockCoverage": block_coverage
+                    }
+                ]
+            }]
+        });
+        let path = dir.join("coverage-optimization.json");
+        fs::write(&path, serde_json::to_vec(&dump).expect("serialize dump")).expect("write dump");
+        path
+    }
+
+    fn optimization_hot_paths(block_coverage: bool) -> Vec<serde_json::Value> {
+        let harness = Harness::new();
+        let dump = write_optimization_dump(harness.tmp.path(), block_coverage);
+        let mut cmd = harness.fallow();
+        cmd.env("FALLOW_LICENSE", sign::mint_runtime_coverage_jwt());
+        cmd.env("FALLOW_STUB_MODE", "hot-from-static");
+        let fixture = fixture_path("runtime-optimization-targets");
+        cmd.args(["health", "--root"])
+            .arg(&fixture)
+            .arg("--runtime-coverage")
+            .arg(&dump)
+            .args(["--format", "json", "--quiet"]);
+        let (stdout, stderr, code) = run_with(cmd);
+        assert_eq!(code, 0, "stderr={stderr}; stdout={stdout}");
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("health JSON");
+        json.pointer("/runtime_coverage/hot_paths")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .expect("hot paths array")
+    }
+
+    fn hot_path<'a>(hot_paths: &'a [serde_json::Value], function: &str) -> &'a serde_json::Value {
+        hot_paths
+            .iter()
+            .find(|entry| entry["function"] == function)
+            .unwrap_or_else(|| panic!("hot path {function} missing: {hot_paths:?}"))
+    }
+
+    #[test]
+    fn hot_paths_rank_speed_work_by_inner_iterations_from_block_coverage() {
+        let hot_paths = optimization_hot_paths(true);
+
+        let resolve = &hot_path(&hot_paths, "resolve")["optimization_target"];
+        assert_eq!(resolve["cost_basis"], "inner_iterations");
+        assert_eq!(resolve["inner_iterations_per_call"], serde_json::json!(4.0));
+        assert_eq!(resolve["cost_score"], 4000);
+        assert_eq!(resolve["line_count"], 7);
+
+        let lookup = &hot_path(&hot_paths, "lookup")["optimization_target"];
+        assert_eq!(lookup["cost_basis"], "inner_iterations");
+        assert_eq!(lookup["inner_iterations_per_call"], serde_json::json!(1.0));
+        assert_eq!(lookup["cost_score"], 1000);
+    }
+
+    #[test]
+    fn hot_paths_fall_back_to_cognitive_cost_without_block_coverage() {
+        let hot_paths = optimization_hot_paths(false);
+
+        let resolve = &hot_path(&hot_paths, "resolve")["optimization_target"];
+        assert_eq!(resolve["cost_basis"], "cognitive");
+        assert!(resolve.get("inner_iterations_per_call").is_none());
+        let cognitive = resolve["cognitive"].as_u64().expect("cognitive");
+        assert!(cognitive > 0, "resolve has a loop and a branch");
+        assert_eq!(resolve["cost_score"].as_u64(), Some(1000 * cognitive));
+
+        let lookup = &hot_path(&hot_paths, "lookup")["optimization_target"];
+        assert_eq!(lookup["cost_basis"], "cognitive");
+        assert_eq!(lookup["cognitive"], 0);
+        assert_eq!(
+            lookup["cost_score"], 1000,
+            "a function with cognitive 0 still costs one unit per call"
+        );
+    }
+
+    /// Write a project where `src/grade.test.ts` tests `grade`. Production
+    /// mode keeps the test file out of discovery.
+    fn write_tested_function_project(root: &Path, config: Option<&str>) {
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"repro","private":true,"type":"module","main":"src/index.ts","devDependencies":{"vitest":"3.2.0"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(
+            root.join("src/grade.ts"),
+            "export function grade(score: number): string {\n  return score > 50 ? \"pass\" : \"fail\";\n}\n",
+        )
+        .expect("write grade.ts");
+        fs::write(
+            root.join("src/index.ts"),
+            "import { grade } from \"./grade\";\nconsole.log(grade(75));\n",
+        )
+        .expect("write index.ts");
+        fs::write(
+            root.join("src/grade.test.ts"),
+            "import { expect, test } from \"vitest\";\nimport { grade } from \"./grade\";\n\ntest(\"grade\", () => {\n  expect(grade(95)).toBe(\"pass\");\n});\n",
+        )
+        .expect("write grade.test.ts");
+        if let Some(config) = config {
+            fs::write(root.join(".fallowrc.json"), config).expect("write config");
+        }
+    }
+
+    /// Run `health --runtime-coverage` and return the test coverage evidence
+    /// for the `grade` function.
+    fn grade_test_coverage(harness: &Harness, root: &Path, production: bool) -> String {
+        let mut cmd = harness.fallow();
+        cmd.env("FALLOW_LICENSE", sign::mint_runtime_coverage_jwt());
+        cmd.env("FALLOW_STUB_MODE", "findings-from-static");
+        cmd.arg("health")
+            .arg("--root")
+            .arg(root)
+            .arg("--runtime-coverage")
+            .arg(&harness.coverage_file)
+            .args(["--format", "json", "--quiet", "--no-cache"]);
+        if production {
+            cmd.arg("--production");
+        }
+        let (stdout, stderr, code) = run_with(cmd);
+        assert!(
+            code == 0 || code == 1,
+            "health must run; code={code}; stderr={stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|err| panic!("expected JSON output; err={err}; stdout={stdout}"));
+        let findings = json
+            .pointer("/runtime_coverage/findings")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("runtime coverage findings missing: {stdout}"));
+        let grade = findings
+            .iter()
+            .find(|finding| finding["function"] == "grade")
+            .unwrap_or_else(|| panic!("finding for `grade` missing: {stdout}"));
+        grade["evidence"]["test_coverage"]
+            .as_str()
+            .expect("test_coverage is a string")
+            .to_owned()
+    }
+
+    #[test]
+    fn production_runtime_coverage_credits_the_test_files() {
+        let harness = Harness::new();
+        let root = harness.tmp.path().join("tested-function-project");
+        write_tested_function_project(&root, None);
+
+        assert_eq!(grade_test_coverage(&harness, &root, false), "covered");
+        assert_eq!(
+            grade_test_coverage(&harness, &root, true),
+            "covered",
+            "production mode must still credit the test file in the runtime coverage evidence"
+        );
+    }
+
+    #[test]
+    fn production_runtime_coverage_credits_the_test_files_without_file_scores() {
+        let harness = Harness::new();
+        let root = harness.tmp.path().join("tested-function-project");
+        write_tested_function_project(&root, Some(r#"{"health":{"maxCrap":0}}"#));
+
+        assert_eq!(
+            grade_test_coverage(&harness, &root, true),
+            "covered",
+            "production mode must credit the test file when no file scores run"
         );
     }
 

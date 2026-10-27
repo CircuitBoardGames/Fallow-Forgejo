@@ -82,6 +82,66 @@ fn eslint_relative_extends_config_is_not_reported_unused() {
 }
 
 #[test]
+fn extensionless_import_prefers_directory_index_over_non_module_sibling() {
+    for (index, sibling) in [
+        "tsx", "ts", "js", "jsx", "mts", "cts", "mjs", "cjs", "gts", "gjs",
+    ]
+    .into_iter()
+    .flat_map(|index| {
+        [
+            "css", "scss", "vue", "svelte", "astro", "mdx", "graphql", "gql",
+        ]
+        .map(move |sibling| (index, sibling))
+    }) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/Widget")).expect("src dir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "directory-index-sibling", "private": true }"#,
+        )
+        .expect("package json");
+        std::fs::write(
+            root.join("src/index.ts"),
+            "import { Widget } from './Widget';\nconsole.log(Widget());\n",
+        )
+        .expect("entry");
+        std::fs::write(
+            root.join(format!("src/Widget/index.{index}")),
+            "export function Widget() { return 'widget'; }\n\
+             export function UnusedHelper() { return 'unused'; }\n",
+        )
+        .expect("directory index");
+        std::fs::write(root.join(format!("src/Widget.{sibling}")), "{}\n").expect("sibling");
+
+        let config = create_config(root.to_path_buf());
+        let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+        let unused_files: Vec<String> = results
+            .unused_files
+            .iter()
+            .map(|file| file.file.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            !unused_files
+                .iter()
+                .any(|path| path.ends_with(&format!("Widget/index.{index}"))),
+            "./Widget must resolve to Widget/index.{index}, not Widget.{sibling}: {unused_files:?}"
+        );
+        let unused_exports: Vec<&str> = results
+            .unused_exports
+            .iter()
+            .map(|e| e.export.export_name.as_str())
+            .collect();
+        assert_eq!(
+            unused_exports,
+            ["UnusedHelper"],
+            "only UnusedHelper is unused in Widget/index.{index} with a Widget.{sibling} sibling"
+        );
+    }
+}
+
+#[test]
 fn type_only_bidirectional_import_not_reported_as_cycle() {
     let root = fixture_path("type-only-cycle");
     let config = create_config(root);
@@ -634,6 +694,201 @@ export const app = UserMenu;
             .iter()
             .any(|path| path.ends_with("src/components/UserMenu.tsx")),
         "an import that explicitly names a platform variant must not credit the family: {unused_files:?}"
+    );
+}
+
+/// Write a small project whose `src/index.ts` entry imports the given files.
+/// `manifest` is the full `package.json` body so a test can opt in or out of
+/// the React Native plugin.
+fn write_platform_family_project(root: &std::path::Path, manifest: &str, files: &[(&str, &str)]) {
+    std::fs::write(root.join("package.json"), manifest).expect("package json");
+    for (relative, source) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("file parent")).expect("file dir");
+        std::fs::write(path, source).expect("project file");
+    }
+}
+
+const REACT_NATIVE_FAMILY_MANIFEST: &str = r#"{
+    "name": "react-native-platform-family-duplicates",
+    "private": true,
+    "main": "src/index.ts",
+    "dependencies": {
+        "react-native": "0.80.0"
+    }
+}"#;
+
+const PLAIN_FAMILY_MANIFEST: &str = r#"{
+    "name": "plain-platform-suffix-siblings",
+    "private": true,
+    "main": "src/index.ts"
+}"#;
+
+fn duplicate_locations(
+    results: &fallow_types::results::AnalysisResults,
+    name: &str,
+) -> Option<Vec<String>> {
+    results
+        .duplicate_exports
+        .iter()
+        .find(|d| d.export.export_name == name)
+        .map(|d| {
+            d.export
+                .locations
+                .iter()
+                .map(|location| location.path.to_string_lossy().replace('\\', "/"))
+                .collect()
+        })
+}
+
+#[test]
+fn react_native_platform_family_is_not_a_duplicate_export() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_platform_family_project(
+        root,
+        REACT_NATIVE_FAMILY_MANIFEST,
+        &[
+            (
+                "src/index.ts",
+                "import { UserMenu } from \"./components/UserMenu\";\nexport const app = UserMenu;\n",
+            ),
+            (
+                "src/components/UserMenu.tsx",
+                "export const UserMenu = 'default';\n",
+            ),
+            (
+                "src/components/UserMenu.ios.tsx",
+                "export const UserMenu = 'ios';\n",
+            ),
+        ],
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert_eq!(
+        duplicate_locations(&results, "UserMenu"),
+        None,
+        "one Metro platform-extension family is a single module selected per platform, not a duplicate"
+    );
+}
+
+#[test]
+fn react_native_web_platform_family_is_not_a_duplicate_export() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_platform_family_project(
+        root,
+        REACT_NATIVE_FAMILY_MANIFEST,
+        &[
+            (
+                "src/index.ts",
+                "import { UserMenu } from \"./components/UserMenu\";\nexport const app = UserMenu;\n",
+            ),
+            (
+                "src/components/UserMenu.tsx",
+                "export const UserMenu = 'native';\n",
+            ),
+            (
+                "src/components/UserMenu.web.tsx",
+                "export const UserMenu = 'web';\n",
+            ),
+        ],
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert_eq!(
+        duplicate_locations(&results, "UserMenu"),
+        None,
+        "a `.web` variant next to the base file is a platform family too"
+    );
+}
+
+#[test]
+fn react_native_platform_family_still_reports_unrelated_duplicate() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_platform_family_project(
+        root,
+        REACT_NATIVE_FAMILY_MANIFEST,
+        &[
+            (
+                "src/index.ts",
+                "import { UserMenu } from \"./components/UserMenu\";\nimport { UserMenu as LegacyUserMenu } from \"./legacy/UserMenu\";\nexport const app = [UserMenu, LegacyUserMenu];\n",
+            ),
+            (
+                "src/components/UserMenu.tsx",
+                "export const UserMenu = 'default';\n",
+            ),
+            (
+                "src/components/UserMenu.ios.tsx",
+                "export const UserMenu = 'ios';\n",
+            ),
+            (
+                "src/legacy/UserMenu.tsx",
+                "export const UserMenu = 'legacy';\n",
+            ),
+        ],
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let locations = duplicate_locations(&results, "UserMenu")
+        .expect("a genuine duplicate outside the family must still be reported");
+    assert!(
+        locations
+            .iter()
+            .any(|path| path.ends_with("src/legacy/UserMenu.tsx")),
+        "the finding must name the unrelated file: {locations:?}"
+    );
+    assert!(
+        locations
+            .iter()
+            .any(|path| path.ends_with("src/components/UserMenu.tsx")),
+        "the family is represented by its base file: {locations:?}"
+    );
+    assert!(
+        !locations
+            .iter()
+            .any(|path| path.ends_with("src/components/UserMenu.ios.tsx")),
+        "platform variants collapse into the family representative: {locations:?}"
+    );
+}
+
+#[test]
+fn platform_suffix_siblings_without_mobile_plugin_stay_duplicate_exports() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_platform_family_project(
+        root,
+        PLAIN_FAMILY_MANIFEST,
+        &[
+            (
+                "src/index.ts",
+                "import { Foo } from \"./components/Foo\";\nimport { Foo as IosFoo } from \"./components/Foo.ios\";\nexport const app = [Foo, IosFoo];\n",
+            ),
+            ("src/components/Foo.tsx", "export const Foo = 'default';\n"),
+            ("src/components/Foo.ios.tsx", "export const Foo = 'ios';\n"),
+        ],
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let locations = duplicate_locations(&results, "Foo")
+        .expect("without the React Native or Expo plugin a `.ios` suffix is just a file name");
+    assert!(
+        locations
+            .iter()
+            .any(|path| path.ends_with("src/components/Foo.tsx"))
+            && locations
+                .iter()
+                .any(|path| path.ends_with("src/components/Foo.ios.tsx")),
+        "both sibling files must be reported: {locations:?}"
     );
 }
 
@@ -1896,6 +2151,34 @@ fn interface_member_usage_does_not_flag_implementer_members() {
         "detach should be credited through interface-typed access: {unused_members:?}"
     );
     assert!(
+        !unused_members.contains(&"FixedSizeScrollStrategy.refresh".to_string()),
+        "refresh should be credited through a nested type assertion: {unused_members:?}"
+    );
+    assert!(
+        !unused_members.contains(&"FixedSizeScrollStrategy.reset".to_string()),
+        "reset should be credited through a nullable asserted binding: {unused_members:?}"
+    );
+    assert!(
+        !unused_members.contains(&"FixedSizeScrollStrategy.inspect".to_string()),
+        "inspect should be credited through a class-typed property chain: {unused_members:?}"
+    );
+    assert!(
+        !unused_members.contains(&"FixedSizeScrollStrategy.notify".to_string()),
+        "notify should be credited through a local initialized from a typed field: {unused_members:?}"
+    );
+    assert!(
+        !unused_members.contains(&"FixedSizeScrollStrategy.audit".to_string()),
+        "audit should be credited through a function-type alias parameter: {unused_members:?}"
+    );
+    assert!(
+        !unused_members.contains(&"FixedSizeScrollStrategy.requiredByContract".to_string()),
+        "a required interface member cannot be removed from its implementer: {unused_members:?}"
+    );
+    assert!(
+        unused_members.contains(&"FixedSizeScrollStrategy.optionalByContract".to_string()),
+        "an optional interface member should remain removable when unused: {unused_members:?}"
+    );
+    assert!(
         unused_members.contains(&"FixedSizeScrollStrategy.unusedHelper".to_string()),
         "unrelated members should still be reported: {unused_members:?}"
     );
@@ -2986,4 +3269,59 @@ fn unused_dev_dependencies(results: &fallow_core::results::AnalysisResults) -> V
         .iter()
         .map(|dep| dep.dep.package_name.clone())
         .collect()
+}
+
+#[test]
+fn wildcard_subpath_export_target_matches_nested_directories() {
+    let root = fixture_path("wildcard-subpath-export-nested");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_files: Vec<String> = unused_file_paths(&results)
+        .into_iter()
+        .map(|path| relative_to_fixture(&root, &path))
+        .collect();
+    let unused_exports: Vec<(String, String)> = results
+        .unused_exports
+        .iter()
+        .map(|export| {
+            (
+                relative_to_fixture(&root, &export.export.path.to_string_lossy()),
+                export.export.export_name.clone(),
+            )
+        })
+        .collect();
+
+    assert!(
+        !unused_files.contains(&"packages/ui/src/a/b/orphan.ts".to_string()),
+        "a `*` in an exports target matches files in nested directories: {unused_files:?}"
+    );
+    assert!(
+        !unused_exports
+            .iter()
+            .any(|(file, _)| file == "packages/lib/src/nested/deep.ts"),
+        "a nested file that matches `./src/*.ts` is a public entry point: {unused_exports:?}"
+    );
+    assert!(
+        unused_files.contains(&"packages/lib/src/nested/helper.js".to_string()),
+        "a file that does not end with the target suffix stays out of the entry set: {unused_files:?}"
+    );
+    assert_eq!(
+        unused_files,
+        vec!["packages/lib/src/nested/helper.js".to_string()],
+        "only the file outside the export target is unused: {unused_files:?}"
+    );
+    assert!(
+        unused_exports.is_empty(),
+        "every export is public through a wildcard subpath: {unused_exports:?}"
+    );
+}
+
+fn relative_to_fixture(root: &std::path::Path, path: &str) -> String {
+    let normalized_root = root.to_string_lossy().replace('\\', "/");
+    let normalized = path.replace('\\', "/");
+    match normalized.strip_prefix(&normalized_root) {
+        Some(rest) => rest.trim_start_matches('/').to_string(),
+        None => normalized,
+    }
 }

@@ -23,7 +23,7 @@ env:
 jobs:
   audit:
     name: Workspace visibility audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     steps:
@@ -43,6 +43,7 @@ jobs:
           install_root="${RUNNER_TEMP}/cargo-hawk"
           mkdir -p "${install_root}"
           curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --retry 5 --retry-connrefused --retry-delay 2 \
             --output "${RUNNER_TEMP}/${HAWK_ARCHIVE}" \
             "${archive_url}"
           printf '%s *%s\n' "${HAWK_SHA256}" "${RUNNER_TEMP}/${HAWK_ARCHIVE}" \
@@ -73,7 +74,7 @@ jobs:
 
       - name: Upload audit log
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hawk-audit-log
           path: hawk.log

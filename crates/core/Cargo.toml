@@ -45,7 +45,6 @@ regex = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml_ng = { workspace = true }
 toml = { workspace = true }
 
 # Hashing
@@ -58,13 +57,13 @@ indicatif = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-codspeed = ["criterion2/codspeed"]
+codspeed = []
 schema = ["fallow-types/schema"]
 
 [dev-dependencies]
-criterion2 = { workspace = true }
+criterion = { workspace = true }
 proptest = { workspace = true }
-dhat = { workspace = true }
+postcard = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
@@ -75,13 +74,13 @@ name = "analysis"
 harness = false
 
 [[bench]]
+name = "entry_point_discovery"
+harness = false
+
+[[bench]]
 name = "large_analysis"
 harness = false
 
 [[bench]]
 name = "scaling_analysis"
-harness = false
-
-[[bench]]
-name = "allocations"
 harness = false

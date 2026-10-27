@@ -1,4 +1,5 @@
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as path from "node:path";
 // VS Code injects this module into the extension host at runtime.
 // fallow-ignore-next-line unlisted-dependency
@@ -41,9 +42,7 @@ const testContext = (): vscode.ExtensionContext =>
     workspaceState: inMemoryMemento(),
   }) as vscode.ExtensionContext;
 
-const fallowDiagnostics = async (
-  uri: vscode.Uri,
-): Promise<readonly vscode.Diagnostic[]> => {
+const fallowDiagnostics = async (uri: vscode.Uri): Promise<readonly vscode.Diagnostic[]> => {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const diagnostics = vscode.languages
@@ -58,7 +57,16 @@ const fallowDiagnostics = async (
 };
 
 describe("Fallow VS Code real-process contracts", () => {
-  it("parses the current CLI envelope and receives current LSP diagnostics", async () => {
+  it("runs the exact packaged extension requested by the host smoke", () => {
+    const expectedPath = process.env["FALLOW_EXTENSION_PATH"];
+    if (!expectedPath) return;
+
+    const extension = vscode.extensions.getExtension("fallow-rs.fallow-vscode");
+    assert.ok(extension, "extension should be discoverable");
+    assert.equal(fs.realpathSync(extension.extensionPath), fs.realpathSync(expectedPath));
+  });
+
+  it("parses the current CLI envelope with complete type-aware evidence", async () => {
     const extension = vscode.extensions.getExtension("fallow-rs.fallow-vscode");
     assert.ok(extension, "extension should be discoverable");
     const api = (await extension.activate()) as ExtensionApi;
@@ -70,7 +78,16 @@ describe("Fallow VS Code real-process contracts", () => {
       result.check.unused_files.some((finding) => finding.path === "src/orphan.ts"),
       "current CLI should report the real fixture's unused file",
     );
+    const unusedExport = result.check.unused_exports.find(
+      (finding) => finding.path === "src/used.ts" && finding.export_name === "unused",
+    );
+    assert.ok(unusedExport, "current CLI should report the fixture's unused export");
+    assert.equal(unusedExport.semantic?.status, "complete");
+    assert.equal(unusedExport.semantic?.decision, "confirmed-no-static-references");
+  });
 
+  const lspTest = process.platform === "win32" ? it.skip : it;
+  lspTest("receives current LSP diagnostics", async () => {
     const orphanUri = vscode.Uri.joinPath(workspaceFolder().uri, "src", "orphan.ts");
     const document = await vscode.workspace.openTextDocument(orphanUri);
     await vscode.window.showTextDocument(document);

@@ -80,16 +80,34 @@ render_with_fallow() {
   local output=$2
   prepare_fallow_render_args "$format" || return 1
   load_gitlab_diff_refs
-  FALLOW_MAX_COMMENTS="$MAX" fallow "${FALLOW_RENDER_ARGS[@]}" > "$output" 2> fallow-review-stderr.log || true
+  local render_status=0
+  FALLOW_MAX_COMMENTS="$MAX" fallow "${FALLOW_RENDER_ARGS[@]}" > "$output" 2> fallow-review-stderr.log || render_status=$?
+  if [ "$render_status" -ne 0 ] \
+      && saved_render_is_unsupported fallow-review-stderr.log \
+      && prepare_fallow_direct_render_args "$format"; then
+    echo "WARNING: Installed fallow does not support saved ${format} rendering; using compatible direct rendering"
+    render_status=0
+    FALLOW_MAX_COMMENTS="$MAX" fallow "${FALLOW_RENDER_ARGS[@]}" > "$output" 2> fallow-review-stderr.log || render_status=$?
+    [ "$render_status" -eq 1 ] && render_status=0
+  fi
   # Surface fallow's structured-error envelope before the schema check so the
   # CLI message lands in the GitLab job log rather than a generic warning.
   if jq -e '.error == true' "$output" > /dev/null 2>&1; then
     echo "WARNING: fallow render failed: $(jq -r '.message // "unknown error"' "$output")"
     return 1
   fi
-  # Accept both v1 (historical) and v2 (issue #528) schema markers so a
-  # consumer running an older bundled template against a newer fallow binary
-  # continues to render. Future-tolerant: any `fallow-review-envelope/v<N>`
+  if [ "$render_status" -ne 0 ]; then
+    echo "WARNING: fallow render failed (exit ${render_status})"
+    if [ -s fallow-review-stderr.log ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        printf 'fallow: %s\n' "$line"
+      done < fallow-review-stderr.log
+    fi
+    return 1
+  fi
+  # Accept versioned schema markers so a consumer running an older bundled
+  # template against a newer fallow binary continues to render. Future-tolerant:
+  # any `fallow-review-envelope/v<N>`
   # passes, on the assumption that the back-compat fields (`body`,
   # `comments[].{body,position}`) remain in every future version.
   jq -e '
@@ -108,13 +126,26 @@ if render_with_fallow review-gitlab fallow-review.json; then
       --project-id "$CI_PROJECT_ID" \
       --api-url "$CI_API_V4_URL" \
       --envelope fallow-review.json > fallow-review-post.json 2> fallow-review-post-stderr.log; then
-    if jq -e '(.apply_errors // []) | length > 0 or (.post_errors // []) | length > 0' fallow-review-post.json > /dev/null 2>&1; then
+    if jq -e '((.apply_errors // []) | length > 0) or ((.post_errors // []) | length > 0)' fallow-review-post.json > /dev/null 2>&1; then
       HINT=$(jq -r '.apply_hint // "refresh provider state and rerun the job"' fallow-review-post.json)
-      echo "WARNING: fallow post-review incomplete: $HINT"
+      UNAPPLIED=$(jq -r '(.unapplied_fingerprints // []) | join(", ")' fallow-review-post.json)
+      if [ -n "$UNAPPLIED" ]; then
+        echo "WARNING: fallow post-review incomplete: $HINT (unapplied fingerprints: $UNAPPLIED)"
+      else
+        echo "WARNING: fallow post-review incomplete: $HINT"
+      fi
     fi
     ACTION=$(jq -r '.action // "unknown"' fallow-review-post.json)
     POSTED=$(jq -r '.comments_posted // 0' fallow-review-post.json)
-    echo "Review action: ${ACTION} (${POSTED} inline comments posted)"
+    RESOLUTIONS=$(jq -r '.resolution_comments_posted // 0' fallow-review-post.json)
+    THREADS=$(jq -r '.threads_resolved // 0' fallow-review-post.json)
+    COMMENT_NOUN="inline comments"
+    RESOLUTION_NOUN="resolution replies"
+    THREAD_NOUN="threads"
+    if [ "$POSTED" = "1" ]; then COMMENT_NOUN="inline comment"; fi
+    if [ "$RESOLUTIONS" = "1" ]; then RESOLUTION_NOUN="resolution reply"; fi
+    if [ "$THREADS" = "1" ]; then THREAD_NOUN="thread"; fi
+    echo "Review action: ${ACTION} (${POSTED} ${COMMENT_NOUN} posted, ${RESOLUTIONS} ${RESOLUTION_NOUN} posted, ${THREADS} ${THREAD_NOUN} resolved)"
   else
     echo "WARNING: Failed to post review comments"
   fi

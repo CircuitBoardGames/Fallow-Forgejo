@@ -9,21 +9,22 @@
 //! Sass syntax recovers into a partial, inaccurate result rather than failing).
 //! A hard parse failure yields `None`.
 
+use cssparser::{Delimiter, Parser, ParserInput, parse_important};
 use lightningcss::printer::PrinterOptions;
-use lightningcss::properties::Property;
 use lightningcss::properties::animation::AnimationName;
 use lightningcss::properties::box_shadow::BoxShadow;
 use lightningcss::properties::custom::{
-    CustomProperty, CustomPropertyName, Token, TokenOrValue, Variable,
+    CustomProperty, CustomPropertyName, Token, TokenOrValue, UnparsedProperty, Variable,
 };
 use lightningcss::properties::font::FontFamily;
+use lightningcss::properties::{Property, PropertyId};
 use lightningcss::rules::CssRule;
 use lightningcss::rules::font_face::FontFaceProperty;
 use lightningcss::rules::keyframes::KeyframesName;
 use lightningcss::rules::style::StyleRule;
 use lightningcss::selector::{Component, Selector};
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::traits::ToCss;
+use lightningcss::traits::{Parse, ToCss};
 use lightningcss::values::color::CssColor;
 use lightningcss::visitor::{VisitTypes, Visitor};
 use rustc_hash::FxHashSet;
@@ -41,7 +42,7 @@ const NOTABLE_NESTING_DEPTH: u8 = 3;
 /// Upper bound on per-file recorded rules. Compiled utility frameworks can emit
 /// thousands of `!important` rules; the scalar aggregates stay accurate while
 /// the per-rule finding list is capped to keep output and storage bounded.
-const MAX_NOTABLE_RULES: usize = 500;
+pub const MAX_NOTABLE_RULES: usize = 500;
 
 /// Minimum declaration count for a rule to be fingerprinted as a duplicate-block
 /// candidate. Small blocks (e.g. `display: flex; align-items: center`) repeat
@@ -51,18 +52,19 @@ const MIN_BLOCK_DECLARATIONS: usize = 4;
 /// Upper bound on per-file declaration-block fingerprints. The `MIN_BLOCK`
 /// floor already bounds compiled utility CSS (whose rules are tiny), so this
 /// only guards a pathological hand-written stylesheet.
-const MAX_DECLARATION_BLOCKS: usize = 2000;
+pub const MAX_DECLARATION_BLOCKS: usize = 2000;
 
 /// Upper bound on per-file located raw values. One noisy compiled stylesheet
 /// should not dominate health or audit output.
-const MAX_RAW_STYLE_VALUES: usize = 200;
+pub const MAX_RAW_STYLE_VALUES: usize = 200;
 
 /// Mask for a single 10-bit CSS specificity component.
 const SPECIFICITY_COMPONENT_MASK: u32 = 0x3FF;
 
 /// Compute structural CSS analytics for a standard-CSS stylesheet source.
 ///
-/// Returns `None` only on a hard parse failure; with error recovery on,
+/// Returns `None` on a hard parse failure and on a stylesheet that nests
+/// brackets too deep for the parser stack; with error recovery on,
 /// individual malformed rules are skipped and the rest of the sheet still
 /// contributes. Callers must gate by extension and NOT pass `.scss` sources:
 /// Sass syntax is not standard CSS and recovers into an inaccurate partial
@@ -70,6 +72,10 @@ const SPECIFICITY_COMPONENT_MASK: u32 = 0x3FF;
 /// `:global()` selectors are understood.
 #[must_use]
 pub fn compute_css_analytics(source: &str) -> Option<CssAnalytics> {
+    crate::parse_style_bounded(source, || css_analytics_unbounded(source)).flatten()
+}
+
+fn css_analytics_unbounded(source: &str) -> Option<CssAnalytics> {
     let options = ParserOptions {
         error_recovery: true,
         css_modules: Some(lightningcss::css_modules::Config::default()),
@@ -205,6 +211,53 @@ impl Visitor<'_> for FirstRgbColorCollector {
 /// normalize it to RGB. Supports hex, named colors, rgb(), hsl(), and hwb().
 #[must_use]
 pub fn parse_css_color_rgb(value: &str) -> Option<(f64, f64, f64)> {
+    crate::parse_style_bounded(value, || css_color_rgb_unbounded(value)).flatten()
+}
+
+fn css_color_rgb_unbounded(value: &str) -> Option<(f64, f64, f64)> {
+    if let Ok(color) = CssColor::parse_string(value)
+        && let Some(rgb) = concrete_rgb(&color)
+    {
+        return Some(rgb);
+    }
+    if let Some(color) = parse_declaration_color(value)
+        && let Some(rgb) = concrete_rgb(&color)
+    {
+        return Some(rgb);
+    }
+    parse_css_color_rgb_via_stylesheet(value)
+}
+
+fn concrete_rgb(color: &CssColor) -> Option<(f64, f64, f64)> {
+    let CssColor::RGBA(rgba) = color else {
+        return None;
+    };
+    Some((
+        f64::from(rgba.red),
+        f64::from(rgba.green),
+        f64::from(rgba.blue),
+    ))
+}
+
+fn parse_declaration_color(value: &str) -> Option<CssColor> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let color = parser
+        .parse_until_before(Delimiter::Semicolon, |input| {
+            let color = CssColor::parse(input)?;
+            let _ = input.try_parse(parse_important);
+            input.expect_exhausted()?;
+            Ok(color)
+        })
+        .ok()?;
+    if !parser.is_exhausted() {
+        parser.expect_semicolon().ok()?;
+        parser.expect_exhausted().ok()?;
+    }
+    Some(color)
+}
+
+fn parse_css_color_rgb_via_stylesheet(value: &str) -> Option<(f64, f64, f64)> {
     let source = format!(".x{{color:{value};}}");
     let options = ParserOptions {
         error_recovery: true,
@@ -404,6 +457,9 @@ fn collect_property_tokens(property: &Property<'_>, acc: &mut Accumulator, rule_
                 collect_animation_name(&animation.name, &mut acc.referenced_keyframes);
             }
         }
+        Property::Unparsed(unparsed) => {
+            collect_unparsed_animation_references(unparsed, &mut acc.referenced_keyframes);
+        }
         Property::FontFamily(families) => {
             collect_font_family_references(families, &mut acc.referenced_font_families);
         }
@@ -531,6 +587,107 @@ fn collect_animation_references(names: &[AnimationName<'_>], out: &mut FxHashSet
     for name in names {
         collect_animation_name(name, out);
     }
+}
+
+/// The CSS-wide keywords plus `none`. In an `animation-name` list these are the
+/// only identifiers that are not keyframe names.
+const ANIMATION_NAME_KEYWORDS: &[&str] = &[
+    "none",
+    "initial",
+    "inherit",
+    "unset",
+    "revert",
+    "revert-layer",
+];
+
+/// Keywords that can fill a non-name slot of an `animation` shorthand layer.
+/// The shorthand also rejects every keyword of [`ANIMATION_NAME_KEYWORDS`].
+const ANIMATION_SHORTHAND_KEYWORDS: &[&str] = &[
+    "linear",
+    "ease",
+    "ease-in",
+    "ease-out",
+    "ease-in-out",
+    "step-start",
+    "step-end",
+    "infinite",
+    "normal",
+    "reverse",
+    "alternate",
+    "alternate-reverse",
+    "forwards",
+    "backwards",
+    "both",
+    "running",
+    "paused",
+    "auto",
+    "replace",
+    "add",
+    "accumulate",
+];
+
+/// Credit the literal keyframe names in an `animation` / `animation-name`
+/// declaration that lightningcss keeps as a raw token list because the value
+/// contains `var()` or `env()`, for example
+/// `animation: pulse var(--duration) ease` (issue #3349).
+///
+/// lightningcss also keeps an invalid value as raw tokens. The browser drops
+/// such a declaration, so a value without `var()` or `env()` credits nothing.
+/// In each comma-separated layer, a top-level identifier counts only when it
+/// is the one non-keyword identifier of that layer, so a `var()` in the name
+/// slot or an unknown keyword stays unresolved.
+fn collect_unparsed_animation_references(
+    unparsed: &UnparsedProperty<'_>,
+    out: &mut FxHashSet<String>,
+) {
+    let is_shorthand = match unparsed.property_id {
+        PropertyId::Animation(_) => true,
+        PropertyId::AnimationName(_) => false,
+        _ => return,
+    };
+    if !has_substitution(&unparsed.value.0) {
+        return;
+    }
+    for layer in unparsed
+        .value
+        .0
+        .split(|token| matches!(token, TokenOrValue::Token(Token::Comma)))
+    {
+        if let Some(name) = layer_animation_name(layer, is_shorthand) {
+            out.insert(name);
+        }
+    }
+}
+
+/// Returns `true` when a token list holds a `var()` or `env()` at any depth.
+fn has_substitution(tokens: &[TokenOrValue<'_>]) -> bool {
+    tokens.iter().any(|token| match token {
+        TokenOrValue::Var(_) | TokenOrValue::Env(_) => true,
+        TokenOrValue::Function(function) => has_substitution(&function.arguments.0),
+        _ => false,
+    })
+}
+
+/// Returns the keyframe name of one animation layer when exactly one
+/// top-level identifier in it is not a keyword.
+fn layer_animation_name(layer: &[TokenOrValue<'_>], is_shorthand: bool) -> Option<String> {
+    let is_keyword = |ident: &str| {
+        ANIMATION_NAME_KEYWORDS
+            .iter()
+            .chain(if is_shorthand {
+                ANIMATION_SHORTHAND_KEYWORDS.iter()
+            } else {
+                [].iter()
+            })
+            .any(|keyword| ident.eq_ignore_ascii_case(keyword))
+    };
+    let mut names = layer.iter().filter_map(|token| match token {
+        TokenOrValue::Token(Token::Ident(ident)) if !is_keyword(ident) => Some(ident.to_string()),
+        TokenOrValue::AnimationName(AnimationName::Ident(ident)) => Some(ident.0.to_string()),
+        _ => None,
+    });
+    let name = names.next()?;
+    names.next().is_none().then_some(name)
 }
 
 fn collect_font_family_references(families: &[FontFamily<'_>], out: &mut FxHashSet<String>) {
@@ -799,6 +956,109 @@ mod tests {
     }
 
     #[test]
+    fn direct_color_parser_matches_stylesheet_parser_corpus() {
+        let values = [
+            // Hex and named colors.
+            "#000",
+            "#fff",
+            "#f00",
+            "#0f08",
+            "#112233",
+            "#11223344",
+            "#abcdef",
+            "#ABCDEF",
+            "red",
+            "rebeccapurple",
+            "transparent",
+            // Functional RGB syntax, alpha, and clamping.
+            "rgb(255 0 0)",
+            "rgb(100% 0% 0%)",
+            "rgb(255, 0, 0)",
+            "rgba(255, 0, 0, 0.5)",
+            "rgba(255 0 0 / 0)",
+            "rgba(255 0 0 / 1)",
+            "rgb(255 0 0 / 25%)",
+            "rgb(300 -10 0)",
+            // HSL and HWB normalization.
+            "hsl(0 100% 50%)",
+            "hsl(120deg 100% 25% / 0.5)",
+            "hsla(240, 100%, 50%, 25%)",
+            "hwb(0 0% 0%)",
+            "hwb(120 10% 20% / 50%)",
+            // CSS whitespace and comments.
+            " red ",
+            "\t#f00\n",
+            "rgb( 255  0  0 / .5 )",
+            "r/**/ed",
+            "rgb(255/**/ 0 0)",
+            "/* before */ red /* after */",
+            // Valid CSS colors that do not resolve to a concrete RGBA value.
+            "currentColor",
+            "CURRENTCOLOR",
+            "CanvasText",
+            "ButtonFace",
+            "AccentColorText",
+            "var(--brand)",
+            "color-mix(in srgb, red 50%, blue)",
+            "lab(50% 40 30)",
+            "lch(50% 40 30)",
+            "oklab(50% .1 .1)",
+            "oklch(50% .1 30)",
+            "color(display-p3 1 0 0)",
+            // Malformed or trailing input.
+            "",
+            "#ff",
+            "not-a-color",
+            "rgb(255 0)",
+            "red junk",
+            "red, blue",
+            "red !important junk",
+            "red ! important junk",
+            "red !important !important",
+            "red,",
+            // Declaration-level syntax accepted by the old wrapper.
+            "red !important",
+            "red ! important",
+            "red ! IMPORTANT",
+            "red !/**/important",
+            "red/**/!important",
+            "red ! important;",
+            "red !important ;",
+            "red !important; color: blue",
+            "red !important; junk",
+            "#f00!important",
+            "red;",
+            "red ; ",
+            "red;;",
+            "red; junk",
+            "red; color: blue",
+            "red; --custom: value",
+            "red; :junk",
+            // Error-recovery syntax that requires the stylesheet fallback.
+            "not-a-color; color: blue",
+            "var(--x); color: blue",
+            "red; @media {}",
+            "red; --x: }",
+            "currentColor; color: blue",
+            "CanvasText; color: blue",
+            "lab(50% 40 30); color: blue",
+            "color(display-p3 1 0 0); color: blue",
+            "red; color: blue !important",
+            "rgb(1 2 3); color: blue !important",
+        ];
+
+        let mismatches = values
+            .into_iter()
+            .filter_map(|value| {
+                let direct = parse_css_color_rgb(value);
+                let stylesheet = parse_css_color_rgb_via_stylesheet(value);
+                (direct != stylesheet).then_some((value, direct, stylesheet))
+            })
+            .collect::<Vec<_>>();
+        assert!(mismatches.is_empty(), "parser mismatches: {mismatches:#?}");
+    }
+
+    #[test]
     fn collects_colors_nested_in_shorthands() {
         // The color inside the `border` shorthand must be caught, not just the
         // standalone `background` color: that is the point of the value visitor.
@@ -919,6 +1179,99 @@ mod tests {
             "referenced: {:?}",
             a.referenced_keyframes
         );
+    }
+
+    #[test]
+    fn animation_shorthand_with_var_references_keyframes() {
+        // A `var()` in the shorthand makes lightningcss keep the declaration as
+        // an unparsed token list. The literal name must still be credited.
+        let a = analytics(
+            "@keyframes pulse { from {} }\n\
+             .a { animation: pulse var(--duration) ease; }",
+        );
+        assert_eq!(a.referenced_keyframes, vec!["pulse".to_string()]);
+    }
+
+    #[test]
+    fn animation_shorthand_with_var_credits_each_comma_layer() {
+        let a = analytics(
+            "@keyframes fade { from {} }\n@keyframes slide { from {} }\n\
+             .a { animation: fade 1s infinite, slide var(--d) cubic-bezier(0, 0, 1, 1) both; }\n\
+             .b { -webkit-animation: fade var(--d); }",
+        );
+        assert_eq!(
+            a.referenced_keyframes,
+            vec!["fade".to_string(), "slide".to_string()]
+        );
+    }
+
+    #[test]
+    fn var_in_animation_name_position_stays_unresolved() {
+        let a = analytics(
+            "@keyframes pulse { from {} }\n\
+             .a { animation: var(--name) 1s ease-in-out infinite alternate both; }\n\
+             .b { animation-name: var(--other); }",
+        );
+        assert!(
+            a.referenced_keyframes.is_empty(),
+            "no literal name: {:?}",
+            a.referenced_keyframes
+        );
+    }
+
+    #[test]
+    fn invalid_animation_value_credits_no_keyframe() {
+        // An invalid value also reaches the unparsed path. The browser drops
+        // the declaration, so no name in it counts as a reference.
+        let a = analytics(
+            "@keyframes spin { from {} }\n\
+             .a { animation: spin 1s smooth; }\n\
+             .b { animation: spin 1x; }",
+        );
+        assert!(
+            a.referenced_keyframes.is_empty(),
+            "invalid values credit nothing: {:?}",
+            a.referenced_keyframes
+        );
+    }
+
+    #[test]
+    fn ambiguous_var_layer_credits_no_keyframe() {
+        // Two non-keyword identifiers in one layer leave the name unknown.
+        let a = analytics(".a { animation: spin var(--d) smooth, fade var(--d); }");
+        assert_eq!(a.referenced_keyframes, vec!["fade".to_string()]);
+    }
+
+    #[test]
+    fn animation_composition_keywords_are_not_names() {
+        let a = analytics(".a { animation: x var(--d) replace add accumulate; }");
+        assert_eq!(a.referenced_keyframes, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn var_nested_in_function_reaches_the_name() {
+        let a = analytics(".a { animation: pulse calc(var(--d) * 2) ease; }");
+        assert_eq!(a.referenced_keyframes, vec!["pulse".to_string()]);
+    }
+
+    #[test]
+    fn animation_name_list_with_var_credits_easing_named_keyframe() {
+        // In `animation-name`, only `none` and the CSS-wide keywords are not
+        // names, so a keyframe called `ease` counts.
+        let a = analytics(
+            "@keyframes ease { from {} }\n\
+             .a { animation-name: var(--x), ease, none, inherit; }",
+        );
+        assert_eq!(a.referenced_keyframes, vec!["ease".to_string()]);
+    }
+
+    #[test]
+    fn animation_name_list_with_var_credits_literal_names() {
+        let a = analytics(
+            "@keyframes spin { from {} }\n\
+             .a { animation-name: var(--first), spin; }",
+        );
+        assert_eq!(a.referenced_keyframes, vec!["spin".to_string()]);
     }
 
     #[test]

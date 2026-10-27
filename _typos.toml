@@ -39,6 +39,12 @@ dependnecy = "dependnecy"
 # Intentional misspelling in #449 unknown-suppression-kind tests.
 # `unsed-export` is the close-typo Levenshtein-suggestion fixture.
 unsed = "unsed"
+# Intentional misspelling in the MCP unknown-tool did-you-mean tests.
+# `check_helth` is the close-typo fixture the suggestion path must resolve.
+helth = "helth"
+# Intentional misspelling in the MCP unknown-issue-type did-you-mean test.
+# `unused-exort` is the close-typo fixture the suggestion path must resolve.
+exort = "exort"
 # `unparseable` is a valid variant spelling used in VS Code license parsing.
 unparseable = "unparseable"
 # `vulnerabilit` is a deliberate truncated substring matched via `.includes()`
@@ -47,3 +53,6 @@ vulnerabilit = "vulnerabilit"
 # `sais` is the SA-IS algorithm (Suffix Array by Induced Sorting) used for
 # clone-detection suffix array construction, not a misspelling of "says".
 sais = "sais"
+# Candle API identifiers used by the local similar-code model implementation.
+mmaped = "mmaped"
+arange = "arange"

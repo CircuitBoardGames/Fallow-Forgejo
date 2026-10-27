@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use fallow_config::OutputFormat;
 
 use super::{Cli, Command, CoverageCli, ImpactCli, RulePackCli};
@@ -10,6 +11,7 @@ pub enum Format {
     Json,
     Sarif,
     Compact,
+    #[value(alias = "md")]
     Markdown,
     #[value(
         name = "codeclimate",
@@ -73,22 +75,7 @@ pub fn format_from_env() -> Option<Format> {
 }
 
 pub fn parse_format_arg(value: &str) -> Option<Format> {
-    match value.to_lowercase().as_str() {
-        "json" => Some(Format::Json),
-        "human" => Some(Format::Human),
-        "sarif" => Some(Format::Sarif),
-        "compact" => Some(Format::Compact),
-        "markdown" | "md" => Some(Format::Markdown),
-        "codeclimate" | "gitlab-codequality" | "gitlab-code-quality" => Some(Format::CodeClimate),
-        "pr-comment-github" => Some(Format::PrCommentGithub),
-        "pr-comment-gitlab" => Some(Format::PrCommentGitlab),
-        "review-github" => Some(Format::ReviewGithub),
-        "review-gitlab" => Some(Format::ReviewGitlab),
-        "badge" => Some(Format::Badge),
-        "github-annotations" => Some(Format::GithubAnnotations),
-        "github-summary" => Some(Format::GithubSummary),
-        _ => None,
-    }
+    Format::from_str(value, true).ok()
 }
 
 /// Read `FALLOW_QUIET` env var: "1" or "true" means quiet.
@@ -106,7 +93,8 @@ pub fn bool_from_env(name: &str) -> Option<bool> {
 }
 
 pub fn resolve_format(cli: &Cli) -> FormatConfig {
-    let cli_format_was_explicit = std::env::args().any(|a| {
+    let cli_format_was_explicit = std::env::args_os().any(|arg| {
+        let a = arg.to_string_lossy();
         a == "--format"
             || a == "--output"
             || a.starts_with("--format=")
@@ -152,15 +140,18 @@ fn resolve_command_output(cli: &Cli, selected: OutputFormat) -> OutputFormat {
             | Command::ConfigSchema
             | Command::PluginSchema
             | Command::RulePackSchema
-            | Command::Ci { .. },
-        )
-        | Some(Command::RulePack {
-            subcommand: RulePackCli::Schema,
-        })
-        | Some(Command::Config { path: false })
-        | Some(Command::Coverage {
-            subcommand: CoverageCli::Setup { json: true, .. },
-        }) => OutputFormat::Json,
+            | Command::Ci { .. }
+            | Command::RulePack {
+                subcommand: RulePackCli::Schema,
+            }
+            | Command::Config { path: false }
+            | Command::Coverage {
+                subcommand:
+                    CoverageCli::Setup { json: true, .. }
+                    | CoverageCli::ReviewPacket { .. }
+                    | CoverageCli::DeploymentChanges { .. },
+            },
+        ) => OutputFormat::Json,
         _ => selected,
     }
 }
@@ -174,41 +165,41 @@ fn command_payload_is_json(cli: &Cli, selected: OutputFormat) -> bool {
             | Command::ConfigSchema
             | Command::PluginSchema
             | Command::RulePackSchema
-            | Command::Ci { .. },
-        )
-        | Some(Command::RulePack {
-            subcommand: RulePackCli::Schema,
-        }) => true,
+            | Command::Ci { .. }
+            | Command::RulePack {
+                subcommand: RulePackCli::Schema,
+            },
+        ) => true,
         Some(Command::Config { path }) => !path,
         Some(Command::Coverage {
             subcommand: CoverageCli::Setup { json, .. },
         }) => *json,
-        Some(Command::Coverage {
-            subcommand:
-                CoverageCli::UploadInventory { .. }
-                | CoverageCli::UploadSourceMaps { .. }
-                | CoverageCli::UploadStaticFindings { .. },
-        })
-        | Some(Command::Impact {
-            subcommand:
-                Some(
-                    ImpactCli::Enable
-                    | ImpactCli::Disable
-                    | ImpactCli::Default { .. }
-                    | ImpactCli::Reset { .. }
-                    | ImpactCli::Statusline,
-                ),
-            ..
-        })
-        | Some(
-            Command::Init { .. }
+        Some(
+            Command::Coverage {
+                subcommand:
+                    CoverageCli::UploadInventory { .. }
+                    | CoverageCli::UploadSourceMaps { .. }
+                    | CoverageCli::UploadStaticFindings { .. },
+            }
+            | Command::Impact {
+                subcommand:
+                    Some(
+                        ImpactCli::Enable
+                        | ImpactCli::Disable
+                        | ImpactCli::Default { .. }
+                        | ImpactCli::Reset { .. }
+                        | ImpactCli::Statusline,
+                    ),
+                ..
+            }
+            | Command::Init { .. }
             | Command::CiTemplate { .. }
             | Command::Migrate { .. }
-            | Command::SetupHooks { .. },
-        )
-        | Some(Command::Hooks {
-            subcommand: HooksCli::Install { .. } | HooksCli::Uninstall { .. },
-        }) => false,
+            | Command::SetupHooks { .. }
+            | Command::Hooks {
+                subcommand: HooksCli::Install { .. } | HooksCli::Uninstall { .. },
+            },
+        ) => false,
         _ => matches!(selected, OutputFormat::Json),
     }
 }

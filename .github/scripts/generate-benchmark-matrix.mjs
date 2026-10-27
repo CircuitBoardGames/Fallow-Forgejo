@@ -2,6 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 export const FAST_BENCHMARKS = [
   {
@@ -19,11 +20,29 @@ export const FAST_BENCHMARKS = [
     ],
   },
   {
+    label: "core entry point discovery",
+    cache_key: "core-entry-point-discovery",
+    package: "fallow-core",
+    bench: "entry_point_discovery",
+    paths: [
+      "crates/core/benches/entry_point_discovery.rs",
+      "crates/core/benches/helpers.rs",
+      "crates/core/src/discover/",
+    ],
+  },
+  {
     label: "engine dupes detect",
     cache_key: "engine-dupes-detect",
     package: "fallow-engine",
     bench: "dupes_detect",
     paths: ["crates/engine/", "crates/extract/", "crates/types/"],
+  },
+  {
+    label: "engine similar code",
+    cache_key: "engine-similar-code",
+    package: "fallow-engine",
+    bench: "similar_code",
+    paths: ["crates/engine/benches/similar_code.rs", "crates/engine/src/similar_code.rs"],
   },
   {
     label: "stable programmatic API",
@@ -33,12 +52,39 @@ export const FAST_BENCHMARKS = [
     paths: [
       "crates/api/",
       "crates/benchmarks/benches/programmatic_stable.rs",
+      "crates/cli/src/audit.rs",
+      "crates/cli/src/audit_brief.rs",
+      "crates/cli/src/audit_decision_surface.rs",
+      "crates/cli/src/audit_focus.rs",
+      "crates/cli/src/audit_output.rs",
+      "crates/cli/src/audit_review_deltas.rs",
+      "crates/cli/src/audit_routing.rs",
+      "crates/cli/src/audit_walkthrough.rs",
+      "crates/cli/src/audit_weakening.rs",
+      "crates/cli/src/check/",
+      "crates/cli/src/coverage/analyze.rs",
+      "crates/cli/src/coverage/mod.rs",
+      "crates/cli/src/fix/",
+      "crates/cli/src/health/coverage.rs",
+      "crates/cli/src/health/mod.rs",
+      "crates/cli/src/init.rs",
+      "crates/cli/src/inspect.rs",
+      "crates/cli/src/json_style.rs",
+      "crates/cli/src/lib.rs",
+      "crates/cli/src/list.rs",
+      "crates/cli/src/onboarding.rs",
+      "crates/cli/src/output_runtime.rs",
+      "crates/cli/src/rule_pack/",
+      "crates/cli/src/security.rs",
+      "crates/cli/src/viz/",
+      "crates/cli/src/watch.rs",
       "crates/config/",
       "crates/core/",
       "crates/engine/",
       "crates/extract/",
       "crates/graph/",
       "crates/output/",
+      "crates/security/",
       "crates/types/",
     ],
   },
@@ -74,8 +120,16 @@ export const FAST_BENCHMARKS = [
       "crates/engine/",
       "crates/extract/",
       "crates/graph/",
+      "crates/output/",
       "crates/types/",
     ],
+  },
+  {
+    label: "cache component",
+    cache_key: "component-cache",
+    package: "fallow-benchmarks",
+    bench: "component_cache",
+    paths: ["crates/benchmarks/benches/component_cache.rs", "crates/extract/", "crates/types/"],
   },
   {
     label: "graph component",
@@ -94,7 +148,30 @@ export const FAST_BENCHMARKS = [
     cache_key: "component-output",
     package: "fallow-benchmarks",
     bench: "component_output",
-    paths: ["crates/benchmarks/benches/component_output.rs", "crates/output/", "crates/types/"],
+    paths: [
+      "crates/benchmarks/benches/component_output.rs",
+      "crates/cli/src/cli_report.rs",
+      "crates/cli/src/report/",
+      "crates/output/",
+      "crates/types/",
+    ],
+  },
+  {
+    label: "LSP save-to-publish",
+    cache_key: "lsp-save-publish",
+    package: "fallow-benchmarks",
+    bench: "lsp_save_publish",
+    paths: [
+      "crates/api/src/editor.rs",
+      "crates/benchmarks/benches/lsp_save_publish.rs",
+      "crates/config/",
+      "crates/core/",
+      "crates/engine/",
+      "crates/extract/",
+      "crates/graph/",
+      "crates/lsp/",
+      "crates/types/",
+    ],
   },
 ];
 
@@ -106,6 +183,7 @@ export const GLOBAL_BENCHMARK_FILES = [
   "Cargo.lock",
   "Cargo.toml",
   "crates/benchmarks/Cargo.toml",
+  "crates/benchmarks/benches/support/",
   "scripts/check-benchmark-harness.py",
   "rust-toolchain.toml",
 ];
@@ -194,6 +272,6 @@ export const main = (argv = process.argv.slice(2), env = process.env) => {
   printMatrix(selectFastTargets(changedFiles));
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main();
 }

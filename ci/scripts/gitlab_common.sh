@@ -10,21 +10,20 @@ FALLOW_RENDER_ARGS=()
 
 prepare_fallow_render_args() {
   local format=$1
-  [ -f fallow-analysis-args.sh ] || return 1
-  # shellcheck disable=SC1091
-  source fallow-analysis-args.sh
-  FALLOW_RENDER_ARGS=("${FALLOW_ANALYSIS_ARGS[@]}")
-  local replaced=false
-  for i in "${!FALLOW_RENDER_ARGS[@]}"; do
-    if [ "${FALLOW_RENDER_ARGS[$i]}" = "--format" ] && [ $((i + 1)) -lt "${#FALLOW_RENDER_ARGS[@]}" ]; then
-      FALLOW_RENDER_ARGS[$((i + 1))]="$format"
-      replaced=true
-      break
-    fi
-  done
-  if [ "$replaced" != "true" ]; then
-    FALLOW_RENDER_ARGS+=(--format "$format")
-  fi
+  local results_file="${FALLOW_RESULTS_FILE:-fallow-results.json}"
+  local root="${FALLOW_ROOT:-${INPUT_ROOT:-.}}"
+  [ -s "$results_file" ] || return 1
+  FALLOW_RENDER_ARGS=(
+    report
+    --from "$results_file"
+    --root "$root"
+    --quiet
+    --format "$format"
+  )
+  [ -n "${FALLOW_CONFIG:-}" ] && FALLOW_RENDER_ARGS+=(--config "$FALLOW_CONFIG")
+  [ -n "${FALLOW_WORKSPACE:-}" ] && FALLOW_RENDER_ARGS+=(--workspace "$FALLOW_WORKSPACE")
+  [ "${FALLOW_RENDER_PATH_PREFIX_SET:-0}" = "1" ] \
+    && FALLOW_RENDER_ARGS+=(--report-path-prefix "${FALLOW_RENDER_PATH_PREFIX:-}")
   if [ -z "${FALLOW_DIFF_FILE:-}" ] && [ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" ]; then
     if git diff "${CI_MERGE_REQUEST_DIFF_BASE_SHA}..HEAD" > fallow-mr.diff 2>fallow-mr-diff-stderr.log; then
       export FALLOW_DIFF_FILE="$PWD/fallow-mr.diff"
@@ -36,13 +35,50 @@ prepare_fallow_render_args() {
   export FALLOW_DIFF_FILTER="${FALLOW_DIFF_FILTER:-added}"
 }
 
+saved_render_is_unsupported() {
+  local stderr_file=$1
+  [ -s "$stderr_file" ] || return 1
+  grep -Fq \
+    'fallow report supports --format github-annotations, github-summary, codeclimate, or sarif only' \
+    "$stderr_file" \
+    || grep -Eq "unrecognized subcommand ['\"]?report" "$stderr_file"
+}
+
+prepare_fallow_direct_render_args() {
+  local format=$1
+  local args_file="${FALLOW_ANALYSIS_ARGS_FILE:-fallow-analysis-args.bin}"
+  [ -s "$args_file" ] || return 1
+  FALLOW_RENDER_ARGS=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    FALLOW_RENDER_ARGS+=("$arg")
+  done < "$args_file"
+  [ "${#FALLOW_RENDER_ARGS[@]}" -gt 0 ] || return 1
+  local replaced=false
+  local i
+  for i in "${!FALLOW_RENDER_ARGS[@]}"; do
+    if [ "${FALLOW_RENDER_ARGS[$i]}" = "--format" ] \
+        && [ $((i + 1)) -lt "${#FALLOW_RENDER_ARGS[@]}" ]; then
+      FALLOW_RENDER_ARGS[i + 1]="$format"
+      replaced=true
+      break
+    fi
+  done
+  [ "$replaced" = "true" ] || FALLOW_RENDER_ARGS+=(--format "$format")
+  [ "${FALLOW_RENDER_PATH_PREFIX_SET:-0}" = "1" ] \
+    && FALLOW_RENDER_ARGS+=(--report-path-prefix "${FALLOW_RENDER_PATH_PREFIX:-}")
+  return 0
+}
+
 curl_retry() {
   local attempts="${FALLOW_API_RETRIES:-3}"
   local delay="${FALLOW_API_RETRY_DELAY:-2}"
   local attempt=1
   local err out
   err=$(mktemp)
+  _FALLOW_TMPS+=("$err")
   out=$(mktemp)
+  _FALLOW_TMPS+=("$out")
   while true; do
     if curl -sf "$@" >"$out" 2>"$err"; then
       cat "$out"
@@ -64,36 +100,4 @@ curl_retry() {
     sleep "$delay"
     attempt=$((attempt + 1))
   done
-}
-
-# Walk the GitLab REST API's Link-header pagination, concatenating every page
-# of a JSON array into a single combined array on stdout. Last positional arg
-# is the initial URL; preceding args are passed to curl_retry verbatim. Without
-# this, high-comment MRs can silently lose notes outside the first page and
-# re-post duplicates on every run.
-curl_paginate() {
-  local args=("$@")
-  local last=$(( ${#args[@]} - 1 ))
-  local url="${args[$last]}"
-  unset 'args[last]'
-  local headers body
-  headers=$(mktemp)
-  body=$(mktemp)
-  local combined='[]'
-  while [ -n "$url" ]; do
-    if ! curl_retry -D "$headers" "${args[@]}" "$url" > "$body"; then
-      rm -f "$headers" "$body"
-      return 1
-    fi
-    # Defensively skip non-array pages (e.g. an error envelope) so callers
-    # degrade to "no existing notes seen" instead of crashing on jq shape
-    # errors.
-    combined=$(jq -s 'map(arrays) | add // []' <(printf '%s' "$combined") "$body")
-    url=$(grep -i '^link:' "$headers" \
-      | tr ',' '\n' \
-      | sed -n 's/.*<\([^>]*\)>.*rel="next".*/\1/p' \
-      | head -1)
-  done
-  rm -f "$headers" "$body"
-  printf '%s' "$combined"
 }

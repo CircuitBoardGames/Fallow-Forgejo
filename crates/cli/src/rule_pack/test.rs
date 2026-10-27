@@ -13,23 +13,15 @@ pub fn run(args: &TestArgs, ctx: &RulePackContext<'_>) -> ExitCode {
         Err(code) => return code,
     };
 
-    let forced_severity = if config.rules.policy_violation == Severity::Off {
-        config.rules.policy_violation = Severity::Warn;
+    let forced_severity = enable_policy_violations(&mut config);
+    if forced_severity {
         eprintln!("note: rules.policy-violation is off; forcing warn for this test run");
-        true
-    } else {
-        false
-    };
+    }
 
-    let analysis =
-        match fallow_engine::session::AnalysisSession::from_resolved_config(config.clone())
-            .and_then(|session| session.analyze_dead_code())
-        {
-            Ok(analysis) => analysis,
-            Err(error) => return crate::error::emit_error(error.message(), 2, ctx.output),
-        };
-    let findings = analysis.results.policy_violations;
-    let summaries = build_rule_summaries(&config, &findings);
+    let (summaries, findings) = match analyze_rule_pack(&config, ctx.output) {
+        Ok(result) => result,
+        Err(code) => return code,
+    };
 
     if matches!(ctx.output, OutputFormat::Json) {
         return emit_json(
@@ -42,6 +34,31 @@ pub fn run(args: &TestArgs, ctx: &RulePackContext<'_>) -> ExitCode {
     }
 
     emit_human(&summaries, &findings, ctx.root, forced_severity)
+}
+
+fn enable_policy_violations(config: &mut ResolvedConfig) -> bool {
+    if config.rules.policy_violation != Severity::Off {
+        return false;
+    }
+    config.rules.policy_violation = Severity::Warn;
+    true
+}
+
+fn analyze_rule_pack(
+    config: &ResolvedConfig,
+    output: OutputFormat,
+) -> Result<(Vec<RuleSummary>, Vec<PolicyViolationFinding>), ExitCode> {
+    let analysis = fallow_engine::session::AnalysisSession::from_resolved_config(config.clone())
+        .and_then(|session| session.analyze_dead_code())
+        .map_err(|error| crate::error::emit_error(error.message(), 2, output))?;
+    let mut findings = analysis.results.policy_violations;
+    for finding in &mut findings {
+        if let Ok(relative) = finding.violation.path.strip_prefix(&config.root) {
+            finding.violation.path = relative.to_path_buf();
+        }
+    }
+    let summaries = build_rule_summaries(config, &findings);
+    Ok((summaries, findings))
 }
 
 fn load_test_config(
@@ -133,24 +150,64 @@ fn emit_json(
     json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
     super::emit_json(
-        &json!({
-            "kind": "rule-pack-test",
-            "packs": config.rule_packs.iter().map(|pack| pack.name.as_str()).collect::<Vec<_>>(),
-            "forced_severity": forced_severity,
-            "rules": summaries.iter().map(|summary| {
-                json!({
-                    "pack": summary.pack,
-                    "rule_id": summary.rule_id,
-                    "kind": summary.kind,
-                    "severity": summary.severity.to_string(),
-                    "findings": summary.findings,
-                })
-            }).collect::<Vec<_>>(),
-            "findings": findings,
-        }),
+        &build_json_output(config, forced_severity, summaries, findings),
         "rule-pack-test",
         json_style,
     )
+}
+
+fn build_json_output(
+    config: &ResolvedConfig,
+    forced_severity: bool,
+    summaries: &[RuleSummary],
+    findings: &[PolicyViolationFinding],
+) -> serde_json::Value {
+    json!({
+        "kind": "rule-pack-test",
+        "packs": config.rule_packs.iter().map(|pack| pack.name.as_str()).collect::<Vec<_>>(),
+        "forced_severity": forced_severity,
+        "rules": summaries.iter().map(|summary| {
+            json!({
+                "pack": summary.pack,
+                "rule_id": summary.rule_id,
+                "kind": summary.kind,
+                "severity": summary.severity.to_string(),
+                "findings": summary.findings,
+            })
+        }).collect::<Vec<_>>(),
+        "findings": findings,
+    })
+}
+
+/// Benchmark hook for the production rule-pack analysis and JSON rendering
+/// pipeline. This is not a supported API.
+pub fn benchmark_rule_pack_test_json(
+    root: &std::path::Path,
+    threads: usize,
+) -> Result<(usize, usize), ExitCode> {
+    let config_path = None;
+    let ctx = RulePackContext {
+        root,
+        config_path: &config_path,
+        output: OutputFormat::Json,
+        json_style: crate::json_style::JsonStyle::Compact,
+        quiet: true,
+        no_cache: true,
+        threads: Some(threads),
+        allow_remote_extends: false,
+    };
+    let mut config = load_test_config(&TestArgs { pack: None }, &ctx)?;
+    let forced_severity = enable_policy_violations(&mut config);
+    let (summaries, findings) = analyze_rule_pack(&config, ctx.output)?;
+    let output = build_json_output(&config, forced_severity, &summaries, &findings);
+    let rendered = ctx.json_style.serialize(&output).map_err(|error| {
+        crate::error::emit_error(
+            &format!("failed to serialize rule-pack-test output: {error}"),
+            2,
+            ctx.output,
+        )
+    })?;
+    Ok((findings.len(), rendered.len()))
 }
 
 fn emit_human(
@@ -177,7 +234,7 @@ fn emit_human(
         }) {
             println!(
                 "  {}:{}:{}  matched \"{}\"",
-                display_path(root, &finding.violation.path),
+                fallow_types::path_util::display_relative(root, &finding.violation.path),
                 finding.violation.line,
                 finding.violation.col,
                 finding.violation.matched
@@ -212,6 +269,7 @@ fn rule_kind(kind: RulePackRuleKind) -> &'static str {
         RulePackRuleKind::BannedImport => "banned-import",
         RulePackRuleKind::BannedEffect => "banned-effect",
         RulePackRuleKind::BannedExport => "banned-export",
+        RulePackRuleKind::GdpProofProducer => "gdp-proof-producer",
     }
 }
 
@@ -222,13 +280,6 @@ fn pack_arg_to_config_path(root: &std::path::Path, pack: &std::path::Path) -> St
         pack
     };
     path.to_string_lossy().replace('\\', "/")
-}
-
-fn display_path(root: &std::path::Path, path: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn default_threads() -> usize {

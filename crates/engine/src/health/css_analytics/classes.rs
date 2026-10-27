@@ -10,85 +10,6 @@ const MIN_DEFINED_CLASS_LEN: usize = 6;
 /// defined floor, since a one-edit pair differs in length by at most one.
 const MIN_TOKEN_LEN: usize = 5;
 
-/// Count plain-CSS vs preprocessor (`.scss`/`.sass`/`.less`) stylesheet files in
-/// the project (ignore-filtered). Used to abstain from class-typo detection when
-/// preprocessors dominate, because the parser cannot expand their loops/mixins,
-/// so the defined-class set is unreliable.
-fn count_stylesheet_kinds(
-    files: &[fallow_types::discover::DiscoveredFile],
-    config: &ResolvedConfig,
-    ignore_set: &globset::GlobSet,
-) -> (usize, usize) {
-    let mut css = 0usize;
-    let mut preprocessor = 0usize;
-    for file in files {
-        let path = &file.path;
-        let kind = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("css") => &mut css,
-            Some("scss" | "sass" | "less") => &mut preprocessor,
-            _ => continue,
-        };
-        let relative = path.strip_prefix(&config.root).unwrap_or(path);
-        if ignore_set.is_match(relative) {
-            continue;
-        }
-        *kind += 1;
-    }
-    (css, preprocessor)
-}
-
-/// Collect every authored CSS class name defined anywhere in the project (plain
-/// and module `.css`/`.scss`, plus Astro/SFC `<style>` blocks of any scoping). The set
-/// is the typo-suggestion target for [`scan_unresolved_class_references`], so it
-/// is NOT narrowed by `changed_files` / `ws_roots`: a class defined in an
-/// unchanged file must still count as defined, or a markup token referencing it
-/// would false-positive as unresolved. Only the ignore filter applies.
-fn collect_defined_css_classes(
-    files: &[fallow_types::discover::DiscoveredFile],
-    config: &ResolvedConfig,
-    ignore_set: &globset::GlobSet,
-) -> rustc_hash::FxHashSet<String> {
-    use fallow_types::extract::ExportName;
-    let mut defined: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-    for file in files {
-        let path = &file.path;
-        let extension = path.extension().and_then(|ext| ext.to_str());
-        let is_preprocessor = matches!(extension, Some("scss" | "sass" | "less"));
-        let is_css = extension == Some("css") || is_preprocessor;
-        let has_style_blocks = matches!(extension, Some("astro" | "vue" | "svelte"));
-        if !is_css && !has_style_blocks {
-            continue;
-        }
-        let relative = path.strip_prefix(&config.root).unwrap_or(path);
-        if ignore_set.is_match(relative) {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        if has_style_blocks {
-            for style in crate::css::extract_sfc_styles(&source) {
-                let is_style_scss = style
-                    .lang
-                    .as_deref()
-                    .is_some_and(|lang| matches!(lang, "scss" | "sass"));
-                for export in crate::css::extract_css_module_exports(&style.body, is_style_scss) {
-                    if let ExportName::Named(name) = export.name {
-                        defined.insert(name);
-                    }
-                }
-            }
-            continue;
-        }
-        for export in crate::css::extract_css_module_exports(&source, is_preprocessor) {
-            if let ExportName::Named(name) = export.name {
-                defined.insert(name);
-            }
-        }
-    }
-    defined
-}
-
 /// Find the best one-edit typo suggestion for a markup token among the defined
 /// classes, using a length-bucketed index so only classes of length `len-1`,
 /// `len`, `len+1` are compared. Returns the lexicographically smallest defined
@@ -140,13 +61,20 @@ fn build_typo_target_index(
     by_len
 }
 
+/// The project-wide inputs of the typo check, shared by every markup file.
+struct TypoTargets<'a> {
+    defined: &'a rustc_hash::FxHashSet<String>,
+    by_len: rustc_hash::FxHashMap<usize, Vec<&'a str>>,
+    /// The project loads Tailwind, so utility-shaped tokens are not checked.
+    uses_tailwind: bool,
+}
+
 /// Collect the likely-typo class references in one markup source into `out`,
 /// deduping by `(rel, line, value)` via `seen`.
-fn collect_unresolved_class_refs_in_file<'a>(
+fn collect_unresolved_class_refs_in_file(
     source: &str,
     rel: &str,
-    defined: &rustc_hash::FxHashSet<String>,
-    by_len: &'a rustc_hash::FxHashMap<usize, Vec<&'a str>>,
+    targets: &TypoTargets<'_>,
     seen: &mut rustc_hash::FxHashSet<(String, u32, String)>,
     out: &mut Vec<fallow_output::UnresolvedClassReference>,
 ) {
@@ -154,11 +82,12 @@ fn collect_unresolved_class_refs_in_file<'a>(
     for token in crate::css::scan_markup_class_tokens(source).static_tokens {
         if token.value.len() < MIN_TOKEN_LEN
             || is_tailwind_shaped(&token.value)
-            || defined.contains(&token.value)
+            || (targets.uses_tailwind && tailwind_utilities::is_tailwind_utility(&token.value))
+            || targets.defined.contains(&token.value)
         {
             continue;
         }
-        let Some(suggestion) = best_class_suggestion(&token.value, by_len) else {
+        let Some(suggestion) = best_class_suggestion(&token.value, &targets.by_len) else {
             continue;
         };
         let key = (rel.to_owned(), token.line, token.value.clone());
@@ -188,6 +117,7 @@ pub(super) fn scan_unresolved_class_references(
     files: &[fallow_types::discover::DiscoveredFile],
     ctx: HealthScanCtx<'_>,
     summary: &mut fallow_output::CssAnalyticsSummary,
+    class_inventory: Option<&CssClassInventory>,
 ) -> Vec<fallow_output::UnresolvedClassReference> {
     let HealthScanCtx {
         config, ignore_set, ..
@@ -202,18 +132,33 @@ pub(super) fn scan_unresolved_class_references(
     // (`bg-white`) look unresolved and false-positive as a typo of a parsed
     // sibling. When preprocessor stylesheets outnumber plain CSS, the defined set
     // is too incomplete to trust, so emit nothing (real-world smoke: Bootstrap).
-    let (css_files, preprocessor_files) = count_stylesheet_kinds(files, config, ignore_set);
+    let fallback_class_inventory;
+    let class_inventory = if let Some(inventory) = class_inventory {
+        inventory
+    } else {
+        fallback_class_inventory = css_class_inventory(files, config, ignore_set);
+        &fallback_class_inventory
+    };
+    let css_files = class_inventory.css_files;
+    let preprocessor_files = class_inventory.preprocessor_files;
     summary.preprocessor_stylesheets = saturate_len(preprocessor_files);
     if preprocessor_files > css_files {
         summary.preprocessor_reachability_abstained = true;
         return Vec::new();
     }
 
-    let defined = collect_defined_css_classes(files, config, ignore_set);
+    let defined = &class_inventory.typo_target_classes;
     if defined.is_empty() {
         return Vec::new();
     }
-    let by_len = build_typo_target_index(&defined);
+    let targets = TypoTargets {
+        defined,
+        by_len: build_typo_target_index(defined),
+        // A Tailwind utility (`w-full`) is generated, never authored, so it is
+        // not in the defined set. Skip utility-shaped tokens when the project
+        // loads Tailwind, else `w-full` reads as a typo of an authored `wl-full`.
+        uses_tailwind: class_inventory.loads_tailwind || project_uses_tailwind(&config.root),
+    };
 
     let mut out: Vec<UnresolvedClassReference> = Vec::new();
     let mut seen: rustc_hash::FxHashSet<(String, u32, String)> = rustc_hash::FxHashSet::default();
@@ -221,9 +166,7 @@ pub(super) fn scan_unresolved_class_references(
         let Some((rel, source)) = read_markup_scan_source(file, ctx) else {
             continue;
         };
-        collect_unresolved_class_refs_in_file(
-            &source, &rel, &defined, &by_len, &mut seen, &mut out,
-        );
+        collect_unresolved_class_refs_in_file(&source, &rel, &targets, &mut seen, &mut out);
     }
 
     out.sort_by(|a, b| {
@@ -416,28 +359,127 @@ pub(super) fn collect_quoted_class_tokens(
 /// always surface as a (false) unreferenced-class candidate. `:global` is the
 /// author's explicit "not locally scoped, applied elsewhere" marker, so excluding
 /// these from the candidate set is semantically correct, not a heuristic guess.
+///
+/// Three forms are recognized: the function form `:global(.x)`, the Svelte 5
+/// block form `:global { .x {} }`, and the selector form `div :global .x {}`,
+/// where the rest of the selector up to `{` or `,` is global.
 fn collect_global_scoped_classes(source: &str, out: &mut rustc_hash::FxHashSet<String>) {
+    const MARKER: &str = ":global";
+    // A `:global` word in a comment is prose, not a selector.
+    let blanked = blank_block_comments(source);
+    let source = blanked.as_str();
     let bytes = source.as_bytes();
     let mut i = 0;
-    while let Some(rel) = source[i..].find(":global(") {
-        let open = i + rel + ":global(".len();
-        // Balance parentheses so a `:global(:is(.a, .b))` still closes correctly.
-        let mut depth = 1usize;
-        let mut j = open;
-        while j < bytes.len() && depth > 0 {
-            match bytes[j] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
+    while let Some(rel) = source[i..].find(MARKER) {
+        let after = i + rel + MARKER.len();
+        i = match bytes.get(after) {
+            Some(b'(') => collect_global_function(source, after + 1, out),
+            Some(byte) if byte.is_ascii_whitespace() || *byte == b'{' => {
+                collect_global_unparenthesized(source, after, out)
             }
-            j += 1;
-        }
-        let inner_end = j.saturating_sub(1).max(open);
-        if let Some(inner) = source.get(open..inner_end) {
-            extract_dotted_class_names(inner, out);
-        }
-        i = j.max(open + 1);
+            _ => after,
+        };
     }
+}
+
+/// Replace each `/* ... */` comment with spaces of the same byte length, so
+/// byte offsets into the result match the source. An unclosed comment runs to
+/// the end of the source, as in CSS.
+fn blank_block_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        let comment_len = rest[start + 2..]
+            .find("*/")
+            .map_or(rest.len() - start, |end| end + 4);
+        out.extend(std::iter::repeat_n(' ', comment_len));
+        rest = &rest[start + comment_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Collect the classes of a `:global(...)` argument that starts at `open`.
+/// Returns the index after the closing parenthesis.
+fn collect_global_function(
+    source: &str,
+    open: usize,
+    out: &mut rustc_hash::FxHashSet<String>,
+) -> usize {
+    let bytes = source.as_bytes();
+    // Balance parentheses so a `:global(:is(.a, .b))` still closes correctly.
+    let mut depth = 1usize;
+    let mut j = open;
+    while j < bytes.len() && depth > 0 {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    let inner_end = j.saturating_sub(1).max(open);
+    if let Some(inner) = source.get(open..inner_end) {
+        extract_dotted_class_names(inner, out);
+    }
+    j.max(open)
+}
+
+/// Collect the classes of a `:global` marker without parentheses that ends at
+/// `start`: a block (`:global { .x {} }`) or the rest of a selector
+/// (`:global .x {}`). Returns the index where the scan continues.
+fn collect_global_unparenthesized(
+    source: &str,
+    start: usize,
+    out: &mut rustc_hash::FxHashSet<String>,
+) -> usize {
+    let rest = &source[start..];
+    let Some(end) = rest.find(['{', ',', ';', '}']) else {
+        return source.len();
+    };
+    let prelude = &rest[..end];
+    if !prelude.trim().is_empty() {
+        extract_dotted_class_names(prelude, out);
+        return start + end;
+    }
+    if rest.as_bytes()[end] != b'{' {
+        return start + end;
+    }
+    collect_global_block(source, start + end + 1, out)
+}
+
+/// Collect the classes in the rule selectors of a `:global { ... }` block whose
+/// body starts at `open`. Declarations are skipped, so a value such as
+/// `url(./a.png)` adds no class. Returns the index after the closing brace.
+fn collect_global_block(
+    source: &str,
+    open: usize,
+    out: &mut rustc_hash::FxHashSet<String>,
+) -> usize {
+    let bytes = source.as_bytes();
+    let mut depth = 1usize;
+    let mut segment_start = open;
+    let mut j = open;
+    while j < bytes.len() && depth > 0 {
+        match bytes[j] {
+            b'{' => {
+                if let Some(selector) = source.get(segment_start..j) {
+                    extract_dotted_class_names(selector, out);
+                }
+                depth += 1;
+                segment_start = j + 1;
+            }
+            b'}' => {
+                depth -= 1;
+                segment_start = j + 1;
+            }
+            b';' => segment_start = j + 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    j
 }
 
 /// Push every `.class` token in a CSS selector fragment (the bare name, no dot)
@@ -469,42 +511,86 @@ fn extract_dotted_class_names(selector: &str, out: &mut rustc_hash::FxHashSet<St
     }
 }
 
-/// Per-stylesheet located class definitions from STANDALONE `.css`/`.scss`/
-/// `.sass`/`.less` files (not SFC `<style>` blocks, which are component-scoped
-/// and covered by the scoped-unused check). Returns `(rel_path, [(class, 1-based
-/// line)])`, each class deduped to its first definition. The defined surface for
-/// the unreferenced-global-class candidate. Classes wrapped in `:global(...)`
-/// are dropped: they target externally-applied DOM and are never authored in
-/// markup.
-fn collect_defined_css_classes_located(
+/// Whole-project CSS class surfaces shared by the markup candidate passes.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CssClassInventory {
+    css_files: usize,
+    preprocessor_files: usize,
+    typo_target_classes: rustc_hash::FxHashSet<String>,
+    defined_classes: Vec<(String, Vec<(String, u32)>)>,
+    /// A stylesheet or style block loads Tailwind (`@import "tailwindcss"`).
+    loads_tailwind: bool,
+}
+
+/// Collect both class surfaces in one file pass. The typo-target set includes
+/// every authored class from standalone stylesheets and Astro/Vue/Svelte/HTML
+/// style blocks, `:global(...)` classes included. The located standalone set
+/// powers the unreferenced-global-class check and omits `:global(...)`
+/// selectors.
+///
+/// The typo-target surface is not narrowed by `changed_files` or workspace
+/// roots. A definition in an unchanged file must still suppress an unresolved
+/// reference. Only the health ignore filter applies.
+pub(super) fn css_class_inventory(
     files: &[fallow_types::discover::DiscoveredFile],
     config: &ResolvedConfig,
     ignore_set: &globset::GlobSet,
-) -> Vec<(String, Vec<(String, u32)>)> {
+) -> CssClassInventory {
     use fallow_types::extract::ExportName;
-    let mut out: Vec<(String, Vec<(String, u32)>)> = Vec::new();
+    let mut inventory = CssClassInventory::default();
     for file in files {
         let path = &file.path;
         let extension = path.extension().and_then(|ext| ext.to_str());
         let is_preprocessor = matches!(extension, Some("scss" | "sass" | "less"));
-        if extension != Some("css") && !is_preprocessor {
+        let is_css = extension == Some("css") || is_preprocessor;
+        let has_style_blocks = matches!(extension, Some("astro" | "vue" | "svelte" | "html"));
+        if !is_css && !has_style_blocks {
             continue;
         }
         let relative = path.strip_prefix(&config.root).unwrap_or(path);
         if ignore_set.is_match(relative) {
             continue;
         }
+        if extension == Some("css") {
+            inventory.css_files += 1;
+        } else if is_preprocessor {
+            inventory.preprocessor_files += 1;
+        }
         let Ok(source) = std::fs::read_to_string(path) else {
             continue;
         };
+        if has_style_blocks {
+            for style in crate::css::extract_sfc_styles(&source) {
+                inventory.loads_tailwind |=
+                    tailwind_utilities::stylesheet_loads_tailwind(&style.body);
+                // A component styles a class passed to a child component's root
+                // through `:global(.x)`. The class is authored, so it is defined.
+                collect_global_scoped_classes(&style.body, &mut inventory.typo_target_classes);
+                let is_style_scss = style
+                    .lang
+                    .as_deref()
+                    .is_some_and(|lang| matches!(lang, "scss" | "sass"));
+                for export in crate::css::extract_css_module_exports(&style.body, is_style_scss) {
+                    if let ExportName::Named(name) = export.name {
+                        inventory.typo_target_classes.insert(name);
+                    }
+                }
+            }
+            continue;
+        }
+        inventory.loads_tailwind |= tailwind_utilities::stylesheet_loads_tailwind(&source);
         let mut global_scoped: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         collect_global_scoped_classes(&source, &mut global_scoped);
+        inventory
+            .typo_target_classes
+            .extend(global_scoped.iter().cloned());
         let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         let mut classes: Vec<(String, u32)> = Vec::new();
         for export in crate::css::extract_css_module_exports(&source, is_preprocessor) {
             let ExportName::Named(name) = export.name else {
                 continue;
             };
+            inventory.typo_target_classes.insert(name.clone());
             // A `:global(.foo)` override targets DOM applied outside this module
             // (a third-party library's runtime markup), so it is never authored in
             // project markup and must not be an unreferenced-class candidate.
@@ -521,30 +607,12 @@ fn collect_defined_css_classes_located(
             classes.push((name, u32::try_from(line).unwrap_or(u32::MAX)));
         }
         if !classes.is_empty() {
-            out.push((relative.to_string_lossy().replace('\\', "/"), classes));
+            inventory
+                .defined_classes
+                .push((relative.to_string_lossy().replace('\\', "/"), classes));
         }
     }
-    out
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct CssClassInventory {
-    css_files: usize,
-    preprocessor_files: usize,
-    defined_classes: Vec<(String, Vec<(String, u32)>)>,
-}
-
-pub(super) fn css_class_inventory(
-    files: &[fallow_types::discover::DiscoveredFile],
-    config: &ResolvedConfig,
-    ignore_set: &globset::GlobSet,
-) -> CssClassInventory {
-    let (css_files, preprocessor_files) = count_stylesheet_kinds(files, config, ignore_set);
-    CssClassInventory {
-        css_files,
-        preprocessor_files,
-        defined_classes: collect_defined_css_classes_located(files, config, ignore_set),
-    }
+    inventory
 }
 
 /// Scan for global CSS classes referenced by NO in-project markup (the CSS
@@ -632,29 +700,100 @@ pub(super) fn scan_unreferenced_css_classes(
 #[derive(Clone, Debug)]
 pub(super) struct CssReferenceSurface {
     static_tokens: rustc_hash::FxHashSet<String>,
+    dynamic_class_names: rustc_hash::FxHashSet<String>,
+    dynamic_corpus: String,
+    css_module_dot_properties: SortedPrefixLookup,
+    css_module_bracket_properties: rustc_hash::FxHashSet<String>,
+    dynamic_prefixes_reversed: SortedPrefixLookup,
+    dynamic_literals: rustc_hash::FxHashSet<String>,
+    /// Extensions of the server-side template files the surface read, sorted.
+    template_extensions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SortedPrefixLookup {
+    values: Vec<String>,
+}
+
+impl SortedPrefixLookup {
+    fn new(mut values: Vec<String>) -> Self {
+        values.sort_unstable();
+        values.dedup();
+        Self { values }
+    }
+
+    fn contains_prefix(&self, prefix: &str) -> bool {
+        let index = self.values.partition_point(|value| value.as_str() < prefix);
+        self.values
+            .get(index)
+            .is_some_and(|value| value.starts_with(prefix))
+    }
+}
+
+#[derive(Debug, Default)]
+struct CssReferenceSurfaceBuilder {
+    static_tokens: rustc_hash::FxHashSet<String>,
     dynamic_corpus: String,
     source_corpus: String,
     dynamic_interpolants: rustc_hash::FxHashSet<String>,
+    template_extensions: std::collections::BTreeSet<String>,
+}
+
+impl CssReferenceSurfaceBuilder {
+    fn finish(self) -> CssReferenceSurface {
+        let dynamic_class_names = collect_class_name_tokens(&self.dynamic_corpus);
+        let mut css_module_dot_properties = Vec::new();
+        let mut css_module_bracket_properties = rustc_hash::FxHashSet::default();
+        collect_css_module_properties(
+            &self.source_corpus,
+            &mut css_module_dot_properties,
+            &mut css_module_bracket_properties,
+        );
+        let dynamic_prefixes_reversed = collect_dynamic_prefixes(&self.dynamic_corpus);
+        let dynamic_literals =
+            collect_dynamic_literals(&self.source_corpus, &self.dynamic_interpolants);
+
+        CssReferenceSurface {
+            static_tokens: self.static_tokens,
+            dynamic_class_names,
+            dynamic_corpus: self.dynamic_corpus,
+            css_module_dot_properties: SortedPrefixLookup::new(css_module_dot_properties),
+            css_module_bracket_properties,
+            dynamic_prefixes_reversed: SortedPrefixLookup::new(dynamic_prefixes_reversed),
+            dynamic_literals,
+            template_extensions: self.template_extensions.into_iter().collect(),
+        }
+    }
 }
 
 impl CssReferenceSurface {
+    pub(super) fn template_extensions(&self) -> &[String] {
+        &self.template_extensions
+    }
+
     fn references(&self, class: &str) -> bool {
         self.static_tokens.contains(class)
-            || class_name_occurrences(&self.dynamic_corpus, class)
-                .next()
-                .is_some()
+            || self.dynamic_class_referenced(class)
             || self.css_module_property_referenced(class)
             || self.dynamic_prefix_referenced(class)
             || self.dynamic_literal_referenced(class)
+    }
+
+    fn dynamic_class_referenced(&self, class: &str) -> bool {
+        if class.bytes().all(is_class_name_byte) {
+            return self.dynamic_class_names.contains(class);
+        }
+        class_name_occurrences(&self.dynamic_corpus, class)
+            .next()
+            .is_some()
     }
 
     fn css_module_property_referenced(&self, class: &str) -> bool {
         let Some(alias) = css_module_property_alias(class) else {
             return false;
         };
-        self.source_corpus.contains(&format!(".{alias}"))
-            || self.source_corpus.contains(&format!("['{alias}']"))
-            || self.source_corpus.contains(&format!("[\"{alias}\"]"))
+        self.css_module_dot_properties.contains_prefix(&alias)
+            || self.css_module_bracket_properties.contains(&alias)
     }
 
     fn dynamic_prefix_referenced(&self, class: &str) -> bool {
@@ -662,29 +801,24 @@ impl CssReferenceSurface {
             return false;
         };
         let head = &class[..=dash];
-        const INTERP_MARKERS: [&str; 6] = ["${", "' +", "'+", "\" +", "\"+", "` +"];
+        if head.bytes().all(is_class_name_byte) {
+            let reversed: String = head.bytes().rev().map(char::from).collect();
+            return self.dynamic_prefixes_reversed.contains_prefix(&reversed);
+        }
         INTERP_MARKERS
             .iter()
             .any(|marker| self.dynamic_corpus.contains(&format!("{head}{marker}")))
     }
 
     fn dynamic_literal_referenced(&self, class: &str) -> bool {
-        if !is_plain_dynamic_class_value(class) || self.dynamic_interpolants.is_empty() {
-            return false;
-        }
-        class_literal_occurrences(&self.source_corpus, class).any(|offset| {
-            let start = offset.saturating_sub(120);
-            let end = self.source_corpus.len().min(offset + class.len() + 120);
-            let Some(window) = self.source_corpus.get(start..end) else {
-                return false;
-            };
-            let window = window.to_ascii_lowercase();
-            self.dynamic_interpolants
-                .iter()
-                .any(|name| window.contains(&name.to_ascii_lowercase()))
-        })
+        is_plain_dynamic_class_value(class) && self.dynamic_literals.contains(class)
     }
 }
+
+/// Text that follows a class prefix when the rest of the class is computed:
+/// JavaScript template literals and concatenation, plus the `{{` echo of
+/// template languages (`grid--{{ columns }}` in Liquid, Nunjucks, Blade).
+const INTERP_MARKERS: [&str; 7] = ["${", "' +", "'+", "\" +", "\"+", "` +", "{{"];
 
 fn css_module_property_alias(class: &str) -> Option<String> {
     if !class.contains('-') {
@@ -723,22 +857,6 @@ fn is_plain_dynamic_class_value(class: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-fn class_literal_occurrences<'a>(
-    source: &'a str,
-    class: &'a str,
-) -> impl Iterator<Item = usize> + 'a {
-    source.match_indices(class).filter_map(move |(offset, _)| {
-        let before = source.as_bytes().get(offset.wrapping_sub(1)).copied();
-        let after = source.as_bytes().get(offset + class.len()).copied();
-        match (before, after) {
-            (Some(b'\''), Some(b'\'' | b',' | b';' | b')' | b']' | b'}'))
-            | (Some(b'"'), Some(b'"' | b',' | b';' | b')' | b']' | b'}'))
-            | (Some(b'`'), Some(b'`' | b',' | b';' | b')' | b']' | b'}')) => Some(offset),
-            _ => None,
-        }
-    })
-}
-
 fn class_name_occurrences<'a>(source: &'a str, class: &'a str) -> impl Iterator<Item = usize> + 'a {
     source.match_indices(class).filter_map(move |(offset, _)| {
         let before = source.as_bytes().get(offset.wrapping_sub(1)).copied();
@@ -753,6 +871,140 @@ fn class_name_occurrences<'a>(source: &'a str, class: &'a str) -> impl Iterator<
 
 fn is_class_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+fn collect_class_name_tokens(source: &str) -> rustc_hash::FxHashSet<String> {
+    let bytes = source.as_bytes();
+    let mut out = rustc_hash::FxHashSet::default();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        if !is_class_name_byte(bytes[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while bytes.get(end).is_some_and(|byte| is_class_name_byte(*byte)) {
+            end += 1;
+        }
+        out.insert(source[start..end].to_owned());
+        start = end;
+    }
+    out
+}
+
+fn collect_css_module_properties(
+    source: &str,
+    dot_properties: &mut Vec<String>,
+    bracket_properties: &mut rustc_hash::FxHashSet<String>,
+) {
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'.'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|byte| is_js_identifier_start(*byte))
+        {
+            let start = i + 1;
+            let mut end = start + 1;
+            while bytes
+                .get(end)
+                .is_some_and(|byte| is_js_identifier_continue(*byte))
+            {
+                end += 1;
+            }
+            dot_properties.push(source[start..end].to_owned());
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'[' && matches!(bytes.get(i + 1), Some(b'\'' | b'"')) {
+            let quote = bytes[i + 1];
+            let start = i + 2;
+            let mut end = start;
+            while bytes.get(end).is_some_and(|byte| *byte != quote) {
+                end += 1;
+            }
+            if bytes.get(end) == Some(&quote)
+                && bytes.get(end + 1) == Some(&b']')
+                && source
+                    .get(start..end)
+                    .is_some_and(is_valid_js_property_ident)
+            {
+                bracket_properties.insert(source[start..end].to_owned());
+            }
+        }
+        i += 1;
+    }
+}
+
+fn collect_dynamic_prefixes(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    for marker in INTERP_MARKERS {
+        for (end, _) in source.match_indices(marker) {
+            let mut start = end;
+            while start > 0 && is_class_name_byte(bytes[start - 1]) {
+                start -= 1;
+            }
+            if start < end {
+                out.push(source[start..end].bytes().rev().map(char::from).collect());
+            }
+        }
+    }
+    out
+}
+
+fn collect_dynamic_literals(
+    source: &str,
+    interpolants: &rustc_hash::FxHashSet<String>,
+) -> rustc_hash::FxHashSet<String> {
+    if interpolants.is_empty() {
+        return rustc_hash::FxHashSet::default();
+    }
+    let bytes = source.as_bytes();
+    let mut out = rustc_hash::FxHashSet::default();
+    for (quote_offset, quote) in bytes.iter().copied().enumerate() {
+        if !matches!(quote, b'\'' | b'"' | b'`') {
+            continue;
+        }
+        let offset = quote_offset + 1;
+        let mut end = offset;
+        while bytes.get(end).is_some_and(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_')
+        }) {
+            end += 1;
+        }
+        let Some(class) = source.get(offset..end) else {
+            continue;
+        };
+        if !is_plain_dynamic_class_value(class)
+            || !matches!(
+                bytes.get(end),
+                Some(b'\'' | b'"' | b'`' | b',' | b';' | b')' | b']' | b'}')
+            )
+        {
+            continue;
+        }
+        let window_start = offset.saturating_sub(120);
+        let window_end = source.len().min(end + 120);
+        let Some(window) = source.get(window_start..window_end) else {
+            continue;
+        };
+        if interpolants
+            .iter()
+            .any(|name| contains_ignore_ascii_case(window, name))
+        {
+            out.insert(class.to_owned());
+        }
+    }
+    out
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn collect_dynamic_class_interpolants(source: &str, out: &mut rustc_hash::FxHashSet<String>) {
@@ -805,21 +1057,16 @@ pub(super) fn css_reference_surface(
     config: &ResolvedConfig,
     ignore_set: &globset::GlobSet,
 ) -> CssReferenceSurface {
-    let mut surface = CssReferenceSurface {
-        static_tokens: rustc_hash::FxHashSet::default(),
-        dynamic_corpus: String::new(),
-        source_corpus: String::new(),
-        dynamic_interpolants: rustc_hash::FxHashSet::default(),
-    };
+    let mut surface = CssReferenceSurfaceBuilder::default();
     for file in files {
         collect_css_reference_surface_file(&mut surface, file, config, ignore_set);
     }
     collect_markdown_reference_surface_files(&mut surface, config, ignore_set);
-    surface
+    surface.finish()
 }
 
 fn collect_css_reference_surface_file(
-    surface: &mut CssReferenceSurface,
+    surface: &mut CssReferenceSurfaceBuilder,
     file: &fallow_types::discover::DiscoveredFile,
     config: &ResolvedConfig,
     ignore_set: &globset::GlobSet,
@@ -849,6 +1096,11 @@ fn collect_css_reference_surface_file(
         surface.static_tokens.insert(token.value);
     }
     collect_quoted_class_tokens(&source, &mut surface.static_tokens, true);
+    if extension == Some("vue") {
+        surface
+            .static_tokens
+            .extend(crate::css::vue_transition_classes(&source));
+    }
     if scan.has_dynamic {
         collect_dynamic_class_interpolants(&source, &mut surface.dynamic_interpolants);
         surface.dynamic_corpus.push_str(&source);
@@ -856,56 +1108,98 @@ fn collect_css_reference_surface_file(
     }
 }
 
+/// Walks the project for Markdown and template files. The walk uses the
+/// ignore-file rules of source discovery (`.gitignore`, `.ignore`, the global
+/// gitignore), skips `ignorePatterns`, `health.ignore` and the build and
+/// dependency directories, reads only regular files, and skips a file over
+/// the `--max-file-size` limit.
+#[expect(
+    clippy::filetype_is_file,
+    reason = "only regular files are read: a FIFO or a device file can block the read"
+)]
 fn collect_markdown_reference_surface_files(
-    surface: &mut CssReferenceSurface,
+    surface: &mut CssReferenceSurfaceBuilder,
     config: &ResolvedConfig,
     ignore_set: &globset::GlobSet,
 ) {
-    collect_markdown_reference_surface_dir(surface, &config.root, config, ignore_set);
-}
-
-fn collect_markdown_reference_surface_dir(
-    surface: &mut CssReferenceSurface,
-    dir: &std::path::Path,
-    config: &ResolvedConfig,
-    ignore_set: &globset::GlobSet,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let relative = path.strip_prefix(&config.root).unwrap_or(&path);
-        if ignore_set.is_match(relative) || is_skipped_markdown_reference_path(relative) {
+    let root = config.root.clone();
+    let mut builder = fallow_config::source_walk_builder(&config.root);
+    builder.filter_entry(move |entry| {
+        let relative = entry
+            .path()
+            .strip_prefix(&root)
+            .unwrap_or_else(|_| entry.path());
+        !is_skipped_markdown_reference_path(relative)
+    });
+    for entry in builder.build().flatten() {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        let Ok(file_type) = entry.file_type() else {
+        let path = entry.path();
+        let relative = path.strip_prefix(&config.root).unwrap_or(path);
+        if ignore_set.is_match(relative) || config.ignore_patterns.is_match(relative) {
             continue;
-        };
-        if file_type.is_dir() {
-            collect_markdown_reference_surface_dir(surface, &path, config, ignore_set);
+        }
+        if let Some(limit) = config.max_file_size_bytes
+            && entry
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > limit)
+        {
             continue;
         }
         let extension = path.extension().and_then(|ext| ext.to_str());
-        if !matches!(extension, Some("md" | "mdx")) {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        surface.source_corpus.push_str(&source);
-        surface.source_corpus.push('\n');
-        let scan = crate::css::scan_markup_class_tokens(&source);
-        for token in scan.static_tokens {
-            surface.static_tokens.insert(token.value);
-        }
-        collect_quoted_class_tokens(&source, &mut surface.static_tokens, true);
-        if scan.has_dynamic {
-            collect_dynamic_class_interpolants(&source, &mut surface.dynamic_interpolants);
-            surface.dynamic_corpus.push_str(&source);
-            surface.dynamic_corpus.push('\n');
+        if matches!(extension, Some("md" | "mdx")) {
+            collect_markdown_reference_surface_file(surface, path);
+        } else {
+            collect_template_reference_surface_file(surface, path, config);
         }
     }
+}
+
+fn collect_markdown_reference_surface_file(
+    surface: &mut CssReferenceSurfaceBuilder,
+    path: &std::path::Path,
+) {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return;
+    };
+    surface.source_corpus.push_str(&source);
+    surface.source_corpus.push('\n');
+    let scan = crate::css::scan_markup_class_tokens(&source);
+    for token in scan.static_tokens {
+        surface.static_tokens.insert(token.value);
+    }
+    collect_quoted_class_tokens(&source, &mut surface.static_tokens, true);
+    if scan.has_dynamic {
+        collect_dynamic_class_interpolants(&source, &mut surface.dynamic_interpolants);
+        surface.dynamic_corpus.push_str(&source);
+        surface.dynamic_corpus.push('\n');
+    }
+}
+
+/// A server-side template file (Liquid, Nunjucks, Blade, and the extensions in
+/// `markupExtensions`) applies classes through syntax that no scanner here
+/// models (`{% if %}`, `@class([...])`, `class="{{ x }}"`). Its whole text
+/// therefore joins the dynamic corpus, so any class-like word in it counts as
+/// referenced (issue #3917).
+fn collect_template_reference_surface_file(
+    surface: &mut CssReferenceSurfaceBuilder,
+    path: &std::path::Path,
+    config: &ResolvedConfig,
+) {
+    let Some(extension) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| fallow_config::template_markup_extension(name, &config.markup_extensions))
+    else {
+        return;
+    };
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return;
+    };
+    surface.template_extensions.insert(extension.to_owned());
+    surface.dynamic_corpus.push_str(&source);
+    surface.dynamic_corpus.push('\n');
 }
 
 fn is_skipped_markdown_reference_path(relative: &std::path::Path) -> bool {
@@ -924,9 +1218,14 @@ fn is_skipped_markdown_reference_path(relative: &std::path::Path) -> bool {
                     | "dist"
                     | "build"
                     | "target"
+                    | "vendor"
                     | "coverage"
                     | ".turbo"
                     | ".cache"
+                    | ".output"
+                    | "out"
+                    | ".venv"
+                    | "storage"
             )
         )
     })
@@ -962,11 +1261,163 @@ fn push_unreferenced_css_class_candidates(
             && !class_matches_dependency_prefix(&class, dependency_prefixes)
         {
             out.push(UnreferencedCssClass {
-                actions: vec![CssCandidateAction::verify_unreferenced_class(&class)],
+                actions: vec![CssCandidateAction::verify_unreferenced_class(
+                    &class,
+                    reference_surface.template_extensions(),
+                )],
                 class,
                 path: rel.to_string(),
                 line,
             });
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests use unwrap to keep reference-surface fixtures concise"
+)]
+mod tests {
+    use super::*;
+    use fallow_config::{FallowConfig, OutputFormat};
+    use fallow_types::discover::{DiscoveredFile, FileId};
+
+    fn global_classes(source: &str) -> Vec<String> {
+        let mut out = rustc_hash::FxHashSet::default();
+        collect_global_scoped_classes(source, &mut out);
+        let mut classes: Vec<String> = out.into_iter().collect();
+        classes.sort();
+        classes
+    }
+
+    #[test]
+    fn global_marker_inside_a_comment_marks_no_class() {
+        assert!(global_classes("/* use :global here */\n.foo { color: red; }\n.bar {}").is_empty());
+        assert_eq!(
+            global_classes("/* :global */ .a {} :global(.b) {}"),
+            vec!["b".to_string()]
+        );
+    }
+
+    #[test]
+    fn global_scoped_classes_cover_every_global_form() {
+        assert_eq!(
+            global_classes("nav :global(.fn-a:is(.fn-b)) { color: red; }"),
+            ["fn-a", "fn-b"]
+        );
+        assert_eq!(
+            global_classes("div :global .sel-a .sel-b, .local { color: red; }"),
+            ["sel-a", "sel-b"]
+        );
+        assert_eq!(
+            global_classes(
+                ":global {\n  .blk-a { background: url(./img.png); }\n  \
+                 .blk-b { margin: 0 } .blk-c:hover { .blk-d { color: red; } }\n}\n\
+                 .local { color: blue; }"
+            ),
+            ["blk-a", "blk-b", "blk-c", "blk-d"]
+        );
+        assert!(global_classes(".local { color: red; }").is_empty());
+    }
+
+    fn reference_surface(sources: &[(&str, &str)]) -> CssReferenceSurface {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<DiscoveredFile> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (relative, source))| {
+                let path = dir.path().join(relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(&path, source).unwrap();
+                DiscoveredFile {
+                    id: FileId(u32::try_from(index).unwrap()),
+                    path,
+                    size_bytes: u64::try_from(source.len()).unwrap(),
+                }
+            })
+            .collect();
+        let config = FallowConfig::default().resolve(
+            dir.path().to_path_buf(),
+            OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        css_reference_surface(&files, &config, &globset::GlobSet::empty())
+    }
+
+    #[test]
+    fn dynamic_reference_index_preserves_tokens_prefixes_and_boundaries() {
+        let surface = reference_surface(&[
+            ("src/state.ts", "export const state = 'selected';"),
+            (
+                "src/Card.tsx",
+                r"
+                    const className = ready ? 'reactive' : fallback;
+                    const tone = 'danger';
+                    export const Card = () => (
+                        <div className={`${className} notice-${tone}`} />
+                    );
+                ",
+            ),
+        ]);
+
+        assert!(surface.references("reactive"));
+        assert!(surface.references("notice-danger"));
+        assert!(surface.references("selected"));
+        assert!(!surface.references("active"));
+        assert!(!surface.references("other-danger"));
+        assert!(!surface.references("selecting"));
+    }
+
+    #[test]
+    fn template_files_are_dynamic_references_with_echo_prefixes() {
+        let surface = reference_surface(&[
+            (
+                "sections/banner.liquid",
+                "<div class=\"banner__content--{{ position }}\">{% render 'card-icon' %}</div>",
+            ),
+            (
+                "resources/views/card.blade.php",
+                "<div @class(['card-wrapper', 'card-wrapper--open' => $open])></div>",
+            ),
+            (
+                "vendor/theme/menu.liquid",
+                "<div class=\"vendor-menu\"></div>",
+            ),
+            ("notes/ignored.tpl", "<div class=\"custom-tpl\"></div>"),
+            (".ignore", "drafts/\n"),
+            ("drafts/menu.liquid", "<div class=\"draft-menu\"></div>"),
+        ]);
+
+        assert!(surface.references("banner__content--top"));
+        assert!(surface.references("card-icon"));
+        assert!(surface.references("card-wrapper"));
+        assert!(surface.references("card-wrapper--open"));
+        assert!(!surface.references("vendor-menu"));
+        assert!(!surface.references("custom-tpl"));
+        assert!(!surface.references("draft-menu"));
+        assert!(!surface.references("banner__media"));
+        assert_eq!(surface.template_extensions(), ["blade.php", "liquid"]);
+    }
+
+    #[test]
+    fn css_module_property_index_preserves_conservative_prefix_matching() {
+        let surface = reference_surface(&[(
+            "src/styles.ts",
+            r"
+                export const primary = styles.buttonPrimaryExtra;
+                export const navigation = styles['navigationItem'];
+            ",
+        )]);
+
+        assert!(surface.references("button-primary"));
+        assert!(surface.references("navigation-item"));
+        assert!(!surface.references("button-secondary"));
+        assert!(!surface.references("navigation-link"));
     }
 }

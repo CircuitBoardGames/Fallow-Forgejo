@@ -22,7 +22,9 @@ function currentPlatformPackage() {
   return getPlatformPackage(process.platform, process.arch, libcFamily);
 }
 
-function runLauncher(t, launcher, args) {
+// Install a fake platform package whose `fallow` binary is the given Node
+// script. Returns the scratch directory and the environment for the launcher.
+function installFakeBinary(t, script) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "fallow-launcher-"));
   t.after(() => fs.rmSync(work, { recursive: true, force: true }));
 
@@ -36,25 +38,82 @@ function runLauncher(t, launcher, args) {
   );
 
   const binary = path.join(pkgDir, "fallow");
-  fs.writeFileSync(
-    binary,
-    "#!/usr/bin/env node\n" +
-      'require("node:fs").writeFileSync(process.env.FALLOW_TEST_ARGS, JSON.stringify(process.argv.slice(2)));\n',
-  );
+  fs.writeFileSync(binary, `#!/usr/bin/env node\n${script}`);
   fs.chmodSync(binary, 0o755);
 
+  const env = {
+    ...process.env,
+    NODE_PATH: path.join(work, "node_modules"),
+    FALLOW_SKIP_BINARY_VERIFY: "1",
+  };
+  return { work, env };
+}
+
+function runLauncher(t, launcher, args) {
+  const { work, env } = installFakeBinary(
+    t,
+    'require("node:fs").writeFileSync(process.env.FALLOW_TEST_ARGS, JSON.stringify(process.argv.slice(2)));\n',
+  );
   const argsFile = path.join(work, "args.json");
   const result = spawnSync(process.execPath, [path.join(BIN_DIR, launcher), ...args], {
     encoding: "utf8",
-    env: {
-      ...process.env,
-      NODE_PATH: path.join(work, "node_modules"),
-      FALLOW_SKIP_BINARY_VERIFY: "1",
-      FALLOW_TEST_ARGS: argsFile,
-    },
+    env: { ...env, FALLOW_TEST_ARGS: argsFile },
   });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(fs.readFileSync(argsFile, "utf8"));
+}
+
+// The fake binary writes a large payload the way the Rust binary does: plain
+// write calls on fd 1, and it stops at the first write error but exits 0.
+// A non-blocking inherited pipe makes a write fail with EAGAIN, so the reader
+// gets a short payload (issue #3276).
+const LARGE_OUTPUT_BYTES = 4 * 1024 * 1024;
+const LARGE_OUTPUT_BINARY =
+  'const fs = require("node:fs");\n' +
+  `const total = ${LARGE_OUTPUT_BYTES};\n` +
+  'const chunk = Buffer.alloc(64 * 1024, "x");\n' +
+  "let written = 0;\n" +
+  "try {\n" +
+  "  while (written < total) written += fs.writeSync(1, chunk, 0, Math.min(chunk.length, total - written));\n" +
+  "} catch {}\n";
+
+function bunAvailable() {
+  const probe = spawnSync("bun", ["--version"], { encoding: "utf8" });
+  return probe.status === 0;
+}
+
+function runLargeOutput(t, runtime, { mergeStderr = false } = {}) {
+  const { env } = installFakeBinary(t, LARGE_OUTPUT_BINARY);
+  const launcher = path.join(BIN_DIR, "fallow");
+  const [command, args] = mergeStderr
+    ? ["/bin/sh", ["-c", 'exec "$0" "$@" 2>&1', runtime, launcher, "check"]]
+    : [runtime, [launcher, "check"]];
+  return spawnSync(command, args, { env, maxBuffer: 2 * LARGE_OUTPUT_BYTES });
+}
+
+// Count only the payload bytes. In the merged case, stdout also holds the
+// FALLOW_SKIP_BINARY_VERIFY warning line.
+function payloadBytes(stdout) {
+  let count = 0;
+  for (const byte of stdout) if (byte === 0x78) count += 1;
+  return count;
+}
+
+for (const runtime of ["node", "bun"]) {
+  for (const mergeStderr of [false, true]) {
+    const name = mergeStderr ? "stdout and stderr on one pipe" : "stdout on its own pipe";
+    test(
+      `launcher under ${runtime} passes the complete binary output (${name})`,
+      { skip: process.platform === "win32" || (runtime === "bun" && !bunAvailable()) },
+      (t) => {
+        const result = runLargeOutput(t, runtime === "node" ? process.execPath : "bun", {
+          mergeStderr,
+        });
+        assert.equal(result.status, 0, String(result.stderr));
+        assert.equal(payloadBytes(result.stdout), LARGE_OUTPUT_BYTES);
+      },
+    );
+  }
 }
 
 // Run a child that installs guardBrokenStdout, then emits a synthetic stdout
@@ -162,15 +221,31 @@ test("resolveTypeAwareCompanion accepts only an exact matching package", (t) => 
 test("childEnvironment marks launcher-wired companions as npm-wrapper", (t) => {
   const { childEnvironment } = require(RUN_BINARY);
   const previousBin = process.env.FALLOW_TYPE_AWARE_BIN;
+  const previousScript = process.env.FALLOW_TYPE_AWARE_SCRIPT;
   delete process.env.FALLOW_TYPE_AWARE_BIN;
+  delete process.env.FALLOW_TYPE_AWARE_SCRIPT;
   t.after(() => {
     if (previousBin === undefined) delete process.env.FALLOW_TYPE_AWARE_BIN;
     else process.env.FALLOW_TYPE_AWARE_BIN = previousBin;
+    if (previousScript === undefined) delete process.env.FALLOW_TYPE_AWARE_SCRIPT;
+    else process.env.FALLOW_TYPE_AWARE_SCRIPT = previousScript;
   });
 
-  const env = childEnvironment("3.8.0", () => "/tmp/fallow-type-aware.mjs");
+  const env = childEnvironment("3.8.0", () => "/tmp/fallow-type-aware.mjs", {
+    platform: "linux",
+    execPath: "/usr/bin/node",
+  });
   assert.equal(env.FALLOW_TYPE_AWARE_BIN, "/tmp/fallow-type-aware.mjs");
+  assert.equal(env.FALLOW_TYPE_AWARE_SCRIPT, undefined);
   assert.equal(env.FALLOW_TYPE_AWARE_BIN_SOURCE, "npm-wrapper");
+
+  const windowsEnv = childEnvironment("3.8.0", () => "C:\\pkg\\fallow-type-aware.mjs", {
+    platform: "win32",
+    execPath: "C:\\Program Files\\nodejs\\node.exe",
+  });
+  assert.equal(windowsEnv.FALLOW_TYPE_AWARE_BIN, "C:\\Program Files\\nodejs\\node.exe");
+  assert.equal(windowsEnv.FALLOW_TYPE_AWARE_SCRIPT, "C:\\pkg\\fallow-type-aware.mjs");
+  assert.equal(windowsEnv.FALLOW_TYPE_AWARE_BIN_SOURCE, "npm-wrapper");
 
   // No resolvable companion: the environment passes through untouched.
   const untouched = childEnvironment("3.8.0", () => undefined);
@@ -181,14 +256,19 @@ test("childEnvironment marks launcher-wired companions as npm-wrapper", (t) => {
 test("childEnvironment leaves a user-set override unmarked", (t) => {
   const { childEnvironment } = require(RUN_BINARY);
   const previousBin = process.env.FALLOW_TYPE_AWARE_BIN;
+  const previousScript = process.env.FALLOW_TYPE_AWARE_SCRIPT;
   process.env.FALLOW_TYPE_AWARE_BIN = "/opt/custom-sidecar";
+  process.env.FALLOW_TYPE_AWARE_SCRIPT = "/opt/custom-sidecar.mjs";
   t.after(() => {
     if (previousBin === undefined) delete process.env.FALLOW_TYPE_AWARE_BIN;
     else process.env.FALLOW_TYPE_AWARE_BIN = previousBin;
+    if (previousScript === undefined) delete process.env.FALLOW_TYPE_AWARE_SCRIPT;
+    else process.env.FALLOW_TYPE_AWARE_SCRIPT = previousScript;
   });
 
   const env = childEnvironment("3.8.0", () => "/tmp/fallow-type-aware.mjs");
   assert.equal(env, process.env);
+  assert.equal(env.FALLOW_TYPE_AWARE_SCRIPT, "/opt/custom-sidecar.mjs");
   assert.equal(env.FALLOW_TYPE_AWARE_BIN_SOURCE, undefined);
 });
 

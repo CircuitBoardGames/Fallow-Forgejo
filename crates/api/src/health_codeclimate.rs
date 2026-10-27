@@ -5,16 +5,18 @@ use std::path::Path;
 use fallow_output::{
     CodeClimateIssue, CodeClimateIssueInput, CodeClimateSeverity, ComplexityViolation,
     CoverageIntelligenceFinding, CoverageIntelligenceRecommendation, CoverageIntelligenceVerdict,
-    ExceededThreshold, FindingSeverity, HealthReport, RuntimeCoverageFinding,
+    ExceededThreshold, FindingSeverity, HealthReport, HealthSummary, RuntimeCoverageFinding,
     RuntimeCoverageVerdict, StylingFinding, StylingFindingSeverity, UntestedExportFinding,
     UntestedFileFinding, build_codeclimate_issue, codeclimate_fingerprint_hash, normalize_uri,
 };
+use fallow_types::output_dead_code::EffectiveSeverity;
 
 struct HealthCodeClimateContext<'a> {
     root: &'a Path,
-    cyc_t: u16,
-    cog_t: u16,
-    crap_t: f64,
+    /// Held instead of the three run-global ceilings so every description
+    /// resolves per finding: an override-affected finding must never be
+    /// described against a ceiling it was not measured with (issue #2163).
+    summary: &'a HealthSummary,
 }
 
 impl HealthCodeClimateContext<'_> {
@@ -26,7 +28,7 @@ impl HealthCodeClimateContext<'_> {
         build_codeclimate_issue(CodeClimateIssueInput {
             check_name,
             description: &self.complexity_description(finding),
-            severity: health_finding_severity(finding.severity),
+            severity: complexity_codeclimate_severity(finding),
             category: "Complexity",
             path: &path,
             begin_line: Some(finding.line),
@@ -58,18 +60,23 @@ impl HealthCodeClimateContext<'_> {
     }
 
     fn complexity_description(&self, finding: &ComplexityViolation) -> String {
+        let thresholds = finding.resolved_thresholds(self.summary);
         match finding.exceeded {
             ExceededThreshold::Both => format!(
                 "'{}' has cyclomatic complexity {} (threshold: {}) and cognitive complexity {} (threshold: {})",
-                finding.name, finding.cyclomatic, self.cyc_t, finding.cognitive, self.cog_t
+                finding.name,
+                finding.cyclomatic,
+                thresholds.max_cyclomatic,
+                finding.cognitive,
+                thresholds.max_cognitive
             ),
             ExceededThreshold::Cyclomatic => format!(
                 "'{}' has cyclomatic complexity {} (threshold: {})",
-                finding.name, finding.cyclomatic, self.cyc_t
+                finding.name, finding.cyclomatic, thresholds.max_cyclomatic
             ),
             ExceededThreshold::Cognitive => format!(
                 "'{}' has cognitive complexity {} (threshold: {})",
-                finding.name, finding.cognitive, self.cog_t
+                finding.name, finding.cognitive, thresholds.max_cognitive
             ),
             ExceededThreshold::Crap
             | ExceededThreshold::CyclomaticCrap
@@ -82,7 +89,7 @@ impl HealthCodeClimateContext<'_> {
                     .unwrap_or_default();
                 format!(
                     "'{}' has CRAP score {crap:.1} (threshold: {:.1}, cyclomatic {}{coverage})",
-                    finding.name, self.crap_t, finding.cyclomatic,
+                    finding.name, thresholds.max_crap, finding.cyclomatic,
                 )
             }
         }
@@ -202,13 +209,31 @@ pub fn build_health_codeclimate(report: &HealthReport, root: &Path) -> Vec<CodeC
     let mut issues = Vec::new();
     let ctx = HealthCodeClimateContext {
         root,
-        cyc_t: report.summary.max_cyclomatic_threshold,
-        cog_t: report.summary.max_cognitive_threshold,
-        crap_t: report.summary.max_crap_threshold,
+        summary: &report.summary,
     };
 
     for finding in &report.findings {
-        issues.push(ctx.complexity_issue(finding));
+        let mut issue = ctx.complexity_issue(finding);
+        // Audit only: name the measured values that grew against the base
+        // finding. The fingerprint does not read the description.
+        if !finding.worsened_metrics.is_empty() {
+            let class =
+                if finding.attribution == Some(fallow_output::AuditFindingAttribution::Worsened) {
+                    "worsened"
+                } else {
+                    "introduced"
+                };
+            issue.description = format!(
+                "{} ({class} against the base: {})",
+                issue.description,
+                fallow_output::describe_worsened_metrics(&finding.worsened_metrics)
+            );
+        }
+        if finding.gate_exemption == Some(fallow_output::AuditGateExemption::TestFile) {
+            issue.description =
+                format!("{} (test file: audit does not gate it)", issue.description);
+        }
+        issues.push(issue);
     }
     for finding in &report.styling_findings {
         issues.push(ctx.styling_issue(finding));
@@ -279,6 +304,20 @@ const fn complexity_check_name(finding: &ComplexityViolation) -> &'static str {
         | ExceededThreshold::CyclomaticCrap
         | ExceededThreshold::CognitiveCrap
         | ExceededThreshold::All => "fallow/high-crap-score",
+    }
+}
+
+/// The CodeClimate severity of a complexity finding.
+///
+/// The gate severity from the `complexity-*` rules sets it: `error` gives
+/// `major` and `warn` gives `minor`, as for dead-code and styling findings.
+/// A finding without a gate severity (a saved report from an older version)
+/// keeps the band mapping.
+const fn complexity_codeclimate_severity(finding: &ComplexityViolation) -> CodeClimateSeverity {
+    match finding.effective_severity {
+        Some(EffectiveSeverity::Error) => CodeClimateSeverity::Major,
+        Some(EffectiveSeverity::Warn) => CodeClimateSeverity::Minor,
+        None => health_finding_severity(finding.severity),
     }
 }
 
@@ -356,6 +395,7 @@ mod tests {
                     line: 7,
                     col: 0,
                     cyclomatic: 12,
+                    standard_cyclomatic: None,
                     cognitive: 9,
                     line_count: 20,
                     param_count: 1,
@@ -364,7 +404,9 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Both,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
+                    mutation: None,
                     coverage_pct: None,
                     crap: None,
                     coverage_tier: None,
@@ -418,5 +460,281 @@ mod tests {
         assert_eq!(issue.location.path, "src/styles.css");
         assert_eq!(issue.location.lines.begin, 4);
         assert_eq!(issue.severity, CodeClimateSeverity::Major);
+    }
+
+    fn crap_violation(
+        effective_thresholds: Option<fallow_output::HealthEffectiveThresholds>,
+    ) -> ComplexityViolation {
+        ComplexityViolation {
+            path: PathBuf::from("/root/src/Board.astro"),
+            name: "<template>".to_string(),
+            line: 6,
+            col: 3,
+            cyclomatic: 11,
+            standard_cyclomatic: None,
+            cognitive: 4,
+            line_count: 20,
+            param_count: 0,
+            react_hook_count: 0,
+            react_jsx_max_depth: 0,
+            react_prop_count: 0,
+            react_hook_profile: None,
+            exceeded: ExceededThreshold::Crap,
+            effective_severity: None,
+            severity: FindingSeverity::Critical,
+            mutation: None,
+            coverage_pct: None,
+            crap: Some(132.0),
+            coverage_tier: None,
+            coverage_source: None,
+            inherited_from: None,
+            component_rollup: None,
+            contributions: Vec::new(),
+            threshold_source: effective_thresholds
+                .map(|_| fallow_output::ThresholdSource::Override),
+            effective_thresholds,
+        }
+    }
+
+    fn crap_report(
+        effective_thresholds: Option<fallow_output::HealthEffectiveThresholds>,
+    ) -> HealthReport {
+        HealthReport {
+            summary: HealthSummary {
+                max_crap_threshold: 30.0,
+                ..HealthSummary::default()
+            },
+            findings: vec![crap_violation(effective_thresholds).into()],
+            ..HealthReport::default()
+        }
+    }
+
+    /// The CodeClimate description feeds `pr-comment-*` and `review-*` too, so
+    /// it must quote the ceiling the finding was measured with, matching SARIF
+    /// (issue #2163).
+    #[test]
+    fn codeclimate_description_uses_the_override_ceiling_not_the_global_one() {
+        let report = crap_report(Some(fallow_output::HealthEffectiveThresholds {
+            max_cyclomatic: 20,
+            max_cognitive: 15,
+            max_crap: 100.0,
+            max_unit_size: 60,
+        }));
+
+        let issues = build_health_codeclimate(&report, Path::new("/root"));
+
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].description.contains("threshold: 100.0"),
+            "{}",
+            issues[0].description
+        );
+        assert!(
+            !issues[0].description.contains("threshold: 30.0"),
+            "{}",
+            issues[0].description
+        );
+    }
+
+    #[test]
+    fn codeclimate_description_falls_back_to_the_global_ceiling() {
+        let issues = build_health_codeclimate(&crap_report(None), Path::new("/root"));
+
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].description.contains("threshold: 30.0"),
+            "{}",
+            issues[0].description
+        );
+    }
+
+    #[test]
+    fn health_severities_reach_serialized_codeclimate_issues() {
+        for (severity, expected) in [
+            (FindingSeverity::Critical, "critical"),
+            (FindingSeverity::High, "major"),
+            (FindingSeverity::Moderate, "minor"),
+        ] {
+            let mut violation = crap_violation(None);
+            violation.severity = severity;
+            let report = HealthReport {
+                findings: vec![violation.into()],
+                ..HealthReport::default()
+            };
+            let issues = fallow_output::codeclimate_issues_to_value(&build_health_codeclimate(
+                &report,
+                Path::new("/root"),
+            ));
+            let issues = issues
+                .as_array()
+                .expect("CodeClimate output must be an array");
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0]["severity"], expected);
+            assert_eq!(issues[0]["check_name"], "fallow/high-crap-score");
+        }
+    }
+
+    #[test]
+    fn runtime_verdicts_reach_serialized_codeclimate_issues() {
+        use fallow_output::{
+            RuntimeCoverageConfidence, RuntimeCoverageEvidence, RuntimeCoverageReport,
+        };
+
+        for (verdict, check_name, severity) in [
+            (
+                RuntimeCoverageVerdict::SafeToDelete,
+                "fallow/runtime-safe-to-delete",
+                "critical",
+            ),
+            (
+                RuntimeCoverageVerdict::ReviewRequired,
+                "fallow/runtime-review-required",
+                "major",
+            ),
+            (
+                RuntimeCoverageVerdict::LowTraffic,
+                "fallow/runtime-low-traffic",
+                "minor",
+            ),
+            (
+                RuntimeCoverageVerdict::CoverageUnavailable,
+                "fallow/runtime-coverage-unavailable",
+                "minor",
+            ),
+            (
+                RuntimeCoverageVerdict::Active,
+                "fallow/runtime-coverage",
+                "minor",
+            ),
+            (
+                RuntimeCoverageVerdict::Unknown,
+                "fallow/runtime-coverage",
+                "minor",
+            ),
+        ] {
+            let report = HealthReport {
+                runtime_coverage: Some(RuntimeCoverageReport {
+                    findings: vec![RuntimeCoverageFinding {
+                        id: "runtime-fixture".to_string(),
+                        stable_id: None,
+                        source_hash: None,
+                        path: PathBuf::from("/root/src/legacy.ts"),
+                        function: "legacyHelper".to_string(),
+                        line: 12,
+                        verdict,
+                        invocations: Some(0),
+                        confidence: RuntimeCoverageConfidence::High,
+                        evidence: RuntimeCoverageEvidence {
+                            static_status: "unused".to_string(),
+                            test_coverage: "not_covered".to_string(),
+                            test_only_reference: None,
+                            v8_tracking: "tracked".to_string(),
+                            untracked_reason: None,
+                            observation_days: 30,
+                            deployments_observed: 3,
+                        },
+                        actions: Vec::new(),
+                        discriminators: None,
+                    }],
+                    ..RuntimeCoverageReport::default()
+                }),
+                ..HealthReport::default()
+            };
+            let issues = fallow_output::codeclimate_issues_to_value(&build_health_codeclimate(
+                &report,
+                Path::new("/root"),
+            ));
+            let issues = issues
+                .as_array()
+                .expect("CodeClimate output must be an array");
+            assert_eq!(issues.len(), 1, "{verdict:?}");
+            assert_eq!(issues[0]["check_name"], check_name);
+            assert_eq!(issues[0]["severity"], severity);
+            assert_eq!(issues[0]["location"]["path"], "src/legacy.ts");
+            assert_eq!(issues[0]["location"]["lines"]["begin"], 12);
+        }
+    }
+
+    #[test]
+    fn coverage_intelligence_verdicts_and_recommendations_reach_serialized_issues() {
+        use fallow_output::{
+            CoverageIntelligenceConfidence, CoverageIntelligenceEvidence,
+            CoverageIntelligenceReport,
+        };
+
+        let recommendations = [
+            (
+                CoverageIntelligenceRecommendation::AddTestOrSplitBeforeMerge,
+                "fallow/coverage-intelligence-risky-change",
+            ),
+            (
+                CoverageIntelligenceRecommendation::DeleteAfterConfirmingOwner,
+                "fallow/coverage-intelligence-delete",
+            ),
+            (
+                CoverageIntelligenceRecommendation::ReviewBeforeChanging,
+                "fallow/coverage-intelligence-review",
+            ),
+            (
+                CoverageIntelligenceRecommendation::RefactorCarefullyKeepBehavior,
+                "fallow/coverage-intelligence-refactor",
+            ),
+        ];
+        for (verdict, severity) in [
+            (
+                CoverageIntelligenceVerdict::RiskyChangeDetected,
+                Some("major"),
+            ),
+            (
+                CoverageIntelligenceVerdict::HighConfidenceDelete,
+                Some("major"),
+            ),
+            (CoverageIntelligenceVerdict::ReviewRequired, Some("minor")),
+            (
+                CoverageIntelligenceVerdict::RefactorCarefully,
+                Some("minor"),
+            ),
+            (CoverageIntelligenceVerdict::Clean, None),
+            (CoverageIntelligenceVerdict::Unknown, None),
+        ] {
+            for (recommendation, check_name) in recommendations {
+                let report = HealthReport {
+                    coverage_intelligence: Some(CoverageIntelligenceReport {
+                        schema_version: fallow_output::CoverageIntelligenceSchemaVersion::default(),
+                        verdict,
+                        summary: fallow_output::CoverageIntelligenceSummary::default(),
+                        findings: vec![CoverageIntelligenceFinding {
+                            id: "coverage-fixture".to_string(),
+                            path: PathBuf::from("/root/src/legacy.ts"),
+                            identity: Some("legacyHelper".to_string()),
+                            line: 12,
+                            verdict,
+                            signals: Vec::new(),
+                            recommendation,
+                            confidence: CoverageIntelligenceConfidence::High,
+                            related_ids: Vec::new(),
+                            evidence: CoverageIntelligenceEvidence::default(),
+                            actions: Vec::new(),
+                        }],
+                    }),
+                    ..HealthReport::default()
+                };
+                let issues = fallow_output::codeclimate_issues_to_value(&build_health_codeclimate(
+                    &report,
+                    Path::new("/root"),
+                ));
+                let issues = issues
+                    .as_array()
+                    .expect("CodeClimate output must be an array");
+                if let Some(severity) = severity {
+                    assert_eq!(issues.len(), 1, "{verdict:?}");
+                    assert_eq!(issues[0]["check_name"], check_name);
+                    assert_eq!(issues[0]["severity"], severity);
+                    assert_eq!(issues[0]["location"]["path"], "src/legacy.ts");
+                } else {
+                    assert!(issues.is_empty(), "{verdict:?}");
+                }
+            }
+        }
     }
 }

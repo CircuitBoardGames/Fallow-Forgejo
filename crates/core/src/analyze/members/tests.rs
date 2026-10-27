@@ -8,10 +8,10 @@ use crate::graph::ModuleGraph;
 use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport};
 use fallow_config::{ScopedUsedClassMemberRule, UsedClassMemberRule};
 use fallow_types::extract::{
-    ClassHeritageInfo, FactoryCallMemberAccessFact, FluentChainMemberAccessFact,
-    FluentChainNewMemberAccessFact, InstanceExportBindingFact, PlaywrightFixtureAliasFact,
-    PlaywrightFixtureDefinitionFact, PlaywrightFixtureTypeFact, PlaywrightFixtureUseFact,
-    SemanticFact,
+    ClassHeritageInfo, ExportedObjectInstancePropertyFact, FactoryCallMemberAccessFact,
+    FluentChainMemberAccessFact, FluentChainNewMemberAccessFact, InstanceExportBindingFact,
+    PlaywrightFixtureAliasFact, PlaywrightFixtureDefinitionFact, PlaywrightFixtureTypeFact,
+    PlaywrightFixtureUseFact, SemanticFact,
 };
 use oxc_span::Span;
 use std::cell::OnceCell;
@@ -160,6 +160,7 @@ fn make_member(name: &str, kind: MemberKind) -> MemberInfo {
         decorator_names: Vec::new(),
         is_instance_returning_static: false,
         is_self_returning: false,
+        override_base: None,
     }
 }
 
@@ -184,6 +185,7 @@ fn make_resolved_import(source: &str, imported: &str, local: &str, target: u32) 
             imported_name: ImportedName::Named(imported.to_string()),
             local_name: local.to_string(),
             is_type_only: false,
+            is_type_only_star: false,
             from_style: false,
             span: Span::new(0, 10),
             source_span: Span::default(),
@@ -221,8 +223,57 @@ fn make_export_with_members(
             span: Span::new(0, 10),
             members,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         },
     }
+}
+
+#[test]
+fn shadowed_computed_enum_key_does_not_credit_class_member() {
+    let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/classes.ts", false)]);
+    set_exports(
+        &mut graph,
+        1,
+        &[make_export_with_members(
+            "Protocol",
+            vec![make_member("__shadowed", MemberKind::ClassProperty)],
+            Some(0),
+        )],
+    );
+    let module = fallow_extract::parse_source_to_module(
+        FileId(0),
+        std::path::Path::new("/src/entry.ts"),
+        r"
+        enum ProtocolKey { Protocol = '__shadowed' }
+        export function read(
+            target: Record<string, unknown>,
+            ProtocolKey: { Protocol: string },
+        ): unknown {
+            return target[ProtocolKey.Protocol]
+        }
+        ",
+        0,
+        false,
+    );
+    graph.resolved_modules[0].semantic_facts = std::sync::Arc::clone(&module.semantic_facts);
+
+    let (_, class_members) = find_unused_members(
+        &graph,
+        &graph.resolved_modules,
+        &[module],
+        &SuppressionContext::empty(),
+        &FxHashMap::default(),
+        &[],
+        &[],
+    );
+
+    assert!(
+        class_members.iter().any(|member| {
+            member.parent_name == "Protocol" && member.member_name == "__shadowed"
+        }),
+        "a parameter-shadowed enum key must not credit the matching class member: {class_members:?}"
+    );
 }
 
 /// Add canonical resolver inputs before the fixture builds its graph.
@@ -242,6 +293,41 @@ fn set_exports(graph: &mut TestGraphFixture, target: usize, exports: &[TestExpor
                 ));
         }
     }
+}
+
+const EXPORTED_OBJECT_INSTANCE_TEST_TARGETS: usize = 4096;
+
+fn build_exported_object_instance_cap_fixture() -> TestGraphFixture {
+    let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/container.ts", false)]);
+    let mut exports = Vec::with_capacity(EXPORTED_OBJECT_INSTANCE_TEST_TARGETS + 1);
+    let mut holder = make_export_with_members("holder", Vec::new(), Some(0));
+    holder.info.local_name = Some("holder".to_string());
+    exports.push(holder);
+    for index in 0..EXPORTED_OBJECT_INSTANCE_TEST_TARGETS {
+        let class_name = format!("Service{index}");
+        let mut class = make_export_with_members(
+            &class_name,
+            ["runA", "runB", "runC", "unused"]
+                .into_iter()
+                .map(|member| make_member(member, MemberKind::ClassMethod))
+                .collect(),
+            Some(0),
+        );
+        class.info.local_name = Some(class_name);
+        exports.push(class);
+    }
+    set_exports(&mut graph, 1, &exports);
+    graph.resolved_modules[1].semantic_facts = (0..EXPORTED_OBJECT_INSTANCE_TEST_TARGETS)
+        .map(|index| {
+            SemanticFact::ExportedObjectInstanceProperty(ExportedObjectInstancePropertyFact {
+                export_name: "holder".to_string(),
+                property_path: "service".to_string(),
+                class_local_name: format!("Service{index}"),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into();
+    graph
 }
 
 /// Run the Playwright fixture pass over `resolved_modules` (no `ModuleInfo`
@@ -296,6 +382,7 @@ fn typed_playwright_fixture_use_fact_credits_fixture_member() {
                     imported_name: ImportedName::Named("test".to_string()),
                     local_name: "test".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 10),
                     source_span: Span::default(),
@@ -308,6 +395,7 @@ fn typed_playwright_fixture_use_fact_credits_fixture_member() {
                     imported_name: ImportedName::Named("AdminPage".to_string()),
                     local_name: "AdminPage".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(11, 20),
                     source_span: Span::default(),
@@ -605,6 +693,8 @@ fn typed_factory_call_fact_credits_class_member() {
             make_member("getData", MemberKind::ClassMethod),
         ],
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     };
     let resolved_modules = vec![
         ResolvedModule {
@@ -616,6 +706,7 @@ fn typed_factory_call_fact_credits_class_member() {
                     imported_name: ImportedName::Named("MyClass".to_string()),
                     local_name: "MyClass".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 10),
                     source_span: Span::default(),
@@ -662,7 +753,7 @@ fn typed_fluent_chain_fact_credits_class_member() {
             vec![
                 make_factory_member("create"),
                 make_self_member("setProcessId"),
-                make_self_member("setSubject"),
+                make_member("setSubject", MemberKind::ClassMethod),
                 make_member("build", MemberKind::ClassMethod),
             ],
             Some(0),
@@ -680,10 +771,12 @@ fn typed_fluent_chain_fact_credits_class_member() {
         members: vec![
             make_factory_member("create"),
             make_self_member("setProcessId"),
-            make_self_member("setSubject"),
+            make_member("setSubject", MemberKind::ClassMethod),
             make_member("build", MemberKind::ClassMethod),
         ],
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     };
     let resolved_modules = vec![
         ResolvedModule {
@@ -695,6 +788,7 @@ fn typed_fluent_chain_fact_credits_class_member() {
                     imported_name: ImportedName::Named("EventBuilder".to_string()),
                     local_name: "EventBuilder".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 10),
                     source_span: Span::default(),
@@ -705,8 +799,7 @@ fn typed_fluent_chain_fact_credits_class_member() {
                 FluentChainMemberAccessFact {
                     root_object: "EventBuilder".to_string(),
                     root_method: "create".to_string(),
-                    chain: vec!["setProcessId".to_string(), "setSubject".to_string()],
-                    member: "build".to_string(),
+                    steps: vec!["setProcessId".into(), "setSubject".into(), "build".into()],
                 },
             )]
             .into(),
@@ -724,10 +817,10 @@ fn typed_fluent_chain_fact_credits_class_member() {
     let indexes = MemberPassIndexes::build(&resolved_modules);
     propagate_fluent_chain_accesses(&graph, &resolved_modules, &indexes, &mut accessed_members);
 
-    let credited = accessed_members
-        .get(&ExportKey::new(FileId(1), "EventBuilder"))
-        .expect("fluent target class should be credited");
-    assert!(credited.contains("build"));
+    let credited = &accessed_members[&ExportKey::new(FileId(1), "EventBuilder")];
+    // No step after `setSubject`, which does not return `this`.
+    let expected = ["setProcessId", "setSubject"].map(String::from);
+    assert_eq!(*credited, FxHashSet::from_iter(expected));
 }
 
 #[test]
@@ -762,6 +855,8 @@ fn typed_fluent_chain_new_fact_credits_class_member() {
             make_member("build", MemberKind::ClassMethod),
         ],
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     };
     let resolved_modules = vec![
         ResolvedModule {
@@ -773,6 +868,7 @@ fn typed_fluent_chain_new_fact_credits_class_member() {
                     imported_name: ImportedName::Named("OptionBuilder".to_string()),
                     local_name: "OptionBuilder".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 10),
                     source_span: Span::default(),
@@ -782,8 +878,8 @@ fn typed_fluent_chain_new_fact_credits_class_member() {
             semantic_facts: vec![SemanticFact::FluentChainNewMemberAccess(
                 FluentChainNewMemberAccessFact {
                     class_name: "OptionBuilder".to_string(),
-                    chain: vec!["addDefault".to_string(), "addFromCli".to_string()],
-                    member: "build".to_string(),
+                    first_method: "addDefault".to_string(),
+                    steps: ["addFromCli", "build"].map(String::from).to_vec(),
                 },
             )]
             .into(),
@@ -906,6 +1002,7 @@ fn accessed_enum_member_not_flagged() {
                 imported_name: ImportedName::Named("Status".to_string()),
                 local_name: "Status".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -943,15 +1040,9 @@ fn accessed_enum_member_via_re_export_not_flagged() {
     graph.set_reachable(1);
     graph.set_reachable(2);
 
-    set_exports(
-        &mut graph,
-        1,
-        &[make_export_with_members(
-            "Status",
-            vec![],
-            Some(0), // referenced from consumer
-        )],
-    );
+    graph.resolved_modules[0]
+        .resolved_imports
+        .push(make_resolved_import("./index", "Status", "Status", 1));
     graph.set_re_exports(
         1,
         vec![crate::graph::ReExportEdge {
@@ -986,6 +1077,7 @@ fn accessed_enum_member_via_re_export_not_flagged() {
                 imported_name: ImportedName::Named("Status".to_string()),
                 local_name: "Status".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -1031,11 +1123,14 @@ fn accessed_class_static_member_via_re_export_not_flagged() {
     graph.set_reachable(1);
     graph.set_reachable(2);
 
-    set_exports(
-        &mut graph,
-        1,
-        &[make_export_with_members("StringUtils", vec![], Some(0))],
-    );
+    graph.resolved_modules[0]
+        .resolved_imports
+        .push(make_resolved_import(
+            "./index",
+            "StringUtils",
+            "StringUtils",
+            1,
+        ));
     graph.set_re_exports(
         1,
         vec![crate::graph::ReExportEdge {
@@ -1069,6 +1164,7 @@ fn accessed_class_static_member_via_re_export_not_flagged() {
                 imported_name: ImportedName::Named("StringUtils".to_string()),
                 local_name: "StringUtils".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -1107,11 +1203,9 @@ fn accessed_member_via_renamed_re_export_not_flagged() {
     graph.set_reachable(1);
     graph.set_reachable(2);
 
-    set_exports(
-        &mut graph,
-        1,
-        &[make_export_with_members("Renamed", vec![], Some(0))],
-    );
+    graph.resolved_modules[0]
+        .resolved_imports
+        .push(make_resolved_import("./index", "Renamed", "Renamed", 1));
     graph.set_re_exports(
         1,
         vec![crate::graph::ReExportEdge {
@@ -1145,6 +1239,7 @@ fn accessed_member_via_renamed_re_export_not_flagged() {
                 imported_name: ImportedName::Named("Renamed".to_string()),
                 local_name: "Renamed".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -1217,6 +1312,7 @@ fn accessed_member_via_star_re_export_not_flagged() {
                 imported_name: ImportedName::Named("Status".to_string()),
                 local_name: "Status".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -1271,6 +1367,7 @@ fn whole_object_use_skips_all_members() {
                 imported_name: ImportedName::Named("Status".to_string()),
                 local_name: "Status".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -1311,6 +1408,7 @@ fn decorated_class_member_not_flagged() {
                 decorator_names: vec!["Column".to_string()],
                 is_instance_returning_static: false,
                 is_self_returning: false,
+                override_base: None,
             }],
             Some(0),
         )],
@@ -1721,6 +1819,8 @@ fn make_export_info(name: &str, super_class: Option<&str>) -> ExportInfo {
         span: Span::new(0, 10),
         members: vec![],
         super_class: super_class.map(str::to_string),
+        deprecated: false,
+        deprecated_reason: None,
     }
 }
 
@@ -2092,6 +2192,7 @@ fn instance_member_access_not_flagged() {
                 imported_name: ImportedName::Named("MyService".to_string()),
                 local_name: "MyService".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -2221,6 +2322,7 @@ fn local_name_mapped_to_imported_name() {
                 imported_name: ImportedName::Named("Status".to_string()),
                 local_name: "S".to_string(), // aliased
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -2274,6 +2376,7 @@ fn default_import_maps_to_default_export() {
                 imported_name: ImportedName::Default,
                 local_name: "MyEnum".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -2399,6 +2502,7 @@ fn whole_object_use_via_aliased_import() {
                 imported_name: ImportedName::Named("Status".to_string()),
                 local_name: "S".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -2421,6 +2525,112 @@ fn whole_object_use_via_aliased_import() {
     assert!(
         enum_members.is_empty(),
         "whole object use via alias should suppress all members"
+    );
+}
+
+#[test]
+fn whole_object_use_via_namespace_qualified_export() {
+    let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/service.ts", false)]);
+    graph.set_reachable(1);
+    set_exports(
+        &mut graph,
+        1,
+        &[make_export_with_members(
+            "Service",
+            vec![make_member("run", MemberKind::ClassMethod)],
+            Some(0),
+        )],
+    );
+
+    let resolved_modules = vec![ResolvedModule {
+        file_id: FileId(0),
+        path: PathBuf::from("/src/entry.ts"),
+        resolved_imports: vec![ResolvedImport {
+            info: ImportInfo {
+                source: "./service".to_string(),
+                imported_name: ImportedName::Namespace,
+                local_name: "NS".to_string(),
+                is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
+                span: Span::new(0, 30),
+                source_span: Span::default(),
+            },
+            target: ResolveResult::InternalModule(FileId(1)),
+        }],
+        whole_object_uses: vec!["NS.Service".to_string()].into(),
+        ..Default::default()
+    }];
+
+    let (_, class_members) = find_unused_members(
+        &graph,
+        &resolved_modules,
+        &[],
+        &SuppressionContext::empty(),
+        &FxHashMap::default(),
+        &[],
+        &[],
+    );
+    assert!(
+        class_members.is_empty(),
+        "a qualified whole-object use should suppress all members of that export"
+    );
+}
+
+#[test]
+fn exported_object_instance_join_deduplicates_and_abstains_at_cap() {
+    let mut repeated_graph = build_exported_object_instance_cap_fixture();
+    repeated_graph.resolved_modules[0].member_accesses = std::iter::repeat_with(|| MemberAccess {
+        object: "holder.service".to_string(),
+        member: "runA".to_string(),
+    })
+    .take(100)
+    .collect::<Vec<_>>()
+    .into();
+    let (_, repeated_findings) = find_unused_members(
+        &repeated_graph,
+        &repeated_graph.resolved_modules,
+        &[],
+        &SuppressionContext::empty(),
+        &FxHashMap::default(),
+        &[],
+        &[],
+    );
+    let service_zero_findings = repeated_findings
+        .iter()
+        .filter(|finding| finding.parent_name == "Service0")
+        .map(|finding| finding.member_name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        service_zero_findings.contains(&"unused"),
+        "repeated identical accesses must not consume the association budget, found: {service_zero_findings:?}"
+    );
+    assert!(
+        !service_zero_findings.contains(&"runA"),
+        "the repeated accessed member must still be credited, found: {service_zero_findings:?}"
+    );
+
+    let mut overflowing_graph = build_exported_object_instance_cap_fixture();
+    overflowing_graph.resolved_modules[0].member_accesses = ["runA", "runB", "runC"]
+        .into_iter()
+        .map(|member| MemberAccess {
+            object: "holder.service".to_string(),
+            member: member.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let (_, overflowing_findings) = find_unused_members(
+        &overflowing_graph,
+        &overflowing_graph.resolved_modules,
+        &[],
+        &SuppressionContext::empty(),
+        &FxHashMap::default(),
+        &[],
+        &[],
+    );
+    assert!(
+        overflowing_findings.is_empty(),
+        "association overflow must conservatively credit every target class as a whole object"
     );
 }
 
@@ -2450,6 +2660,7 @@ fn this_field_chained_access_not_flagged() {
                 imported_name: ImportedName::Named("MyService".to_string()),
                 local_name: "MyService".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: Span::new(0, 30),
                 source_span: Span::default(),
@@ -2533,6 +2744,7 @@ fn interface_member_usage_propagates_to_implementers() {
                     imported_name: ImportedName::Named("VirtualScrollStrategy".to_string()),
                     local_name: "VirtualScrollStrategy".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 30),
                     source_span: Span::default(),
@@ -2550,6 +2762,7 @@ fn interface_member_usage_propagates_to_implementers() {
                     imported_name: ImportedName::Named("VirtualScrollStrategy".to_string()),
                     local_name: "VirtualScrollStrategy".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 30),
                     source_span: Span::default(),
@@ -2671,6 +2884,7 @@ fn same_named_interfaces_do_not_share_member_usage() {
                     imported_name: ImportedName::Named("Strategy".to_string()),
                     local_name: "Strategy".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 30),
                     source_span: Span::default(),
@@ -2688,6 +2902,7 @@ fn same_named_interfaces_do_not_share_member_usage() {
                     imported_name: ImportedName::Named("Strategy".to_string()),
                     local_name: "Strategy".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 30),
                     source_span: Span::default(),
@@ -2705,6 +2920,7 @@ fn same_named_interfaces_do_not_share_member_usage() {
                     imported_name: ImportedName::Named("Strategy".to_string()),
                     local_name: "Strategy".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 30),
                     source_span: Span::default(),
@@ -2789,6 +3005,7 @@ fn same_named_exports_do_not_share_member_usage() {
                     imported_name: ImportedName::Named("Widget".to_string()),
                     local_name: "FirstWidget".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(0, 30),
                     source_span: Span::default(),
@@ -2801,6 +3018,7 @@ fn same_named_exports_do_not_share_member_usage() {
                     imported_name: ImportedName::Named("Widget".to_string()),
                     local_name: "SecondWidget".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: Span::new(31, 62),
                     source_span: Span::default(),
@@ -2851,6 +3069,198 @@ fn same_named_exports_do_not_share_member_usage() {
 }
 
 #[test]
+fn ambiguous_star_re_exports_suppress_only_participating_member_exports() {
+    let mut graph = build_graph(&[
+        ("/src/barrel.ts", true),
+        ("/src/left.ts", false),
+        ("/src/right.ts", false),
+    ]);
+    set_exports(
+        &mut graph,
+        1,
+        &[make_export_with_members(
+            "Widget",
+            vec![make_member("left", MemberKind::ClassMethod)],
+            Some(0),
+        )],
+    );
+    set_exports(
+        &mut graph,
+        2,
+        &[
+            make_export_with_members(
+                "Widget",
+                vec![make_member("right", MemberKind::ClassMethod)],
+                Some(0),
+            ),
+            make_export_with_members(
+                "Other",
+                vec![make_member("unused", MemberKind::ClassMethod)],
+                Some(0),
+            ),
+        ],
+    );
+    graph.set_re_exports(
+        0,
+        vec![
+            crate::graph::ReExportEdge {
+                source_file: FileId(1),
+                imported_name: "*".to_string(),
+                exported_name: "*".to_string(),
+                is_type_only: false,
+                span: Span::default(),
+            },
+            crate::graph::ReExportEdge {
+                source_file: FileId(2),
+                imported_name: "*".to_string(),
+                exported_name: "*".to_string(),
+                is_type_only: false,
+                span: Span::default(),
+            },
+        ],
+    );
+
+    assert!(walk_re_export_origins(&graph, FileId(0), "Widget").is_empty());
+
+    let (_, class_members) = find_unused_members(
+        &graph,
+        &graph.resolved_modules,
+        &[],
+        &SuppressionContext::empty(),
+        &FxHashMap::default(),
+        &[],
+        &[],
+    );
+
+    assert!(
+        class_members
+            .iter()
+            .all(|member| member.parent_name != "Widget"),
+        "members behind the colliding export must abstain: {class_members:?}"
+    );
+    assert!(
+        class_members
+            .iter()
+            .any(|member| member.parent_name == "Other" && member.member_name == "unused"),
+        "an unrelated export in a contributor file must still report: {class_members:?}"
+    );
+}
+
+#[test]
+fn shadowed_star_class_is_not_a_public_api_export() {
+    let mut graph = build_graph(&[
+        ("/src/index.ts", true),
+        ("/src/hidden.ts", false),
+        ("/src/public.ts", false),
+    ]);
+    set_exports(
+        &mut graph,
+        1,
+        &[make_export_with_members(
+            "Widget",
+            vec![make_member("hidden", MemberKind::ClassMethod)],
+            None,
+        )],
+    );
+    set_exports(
+        &mut graph,
+        2,
+        &[make_export_with_members("Widget", vec![], None)],
+    );
+    graph.set_re_exports(
+        0,
+        vec![
+            crate::graph::ReExportEdge {
+                source_file: FileId(1),
+                imported_name: "*".to_string(),
+                exported_name: "*".to_string(),
+                is_type_only: false,
+                span: Span::default(),
+            },
+            crate::graph::ReExportEdge {
+                source_file: FileId(2),
+                imported_name: "Widget".to_string(),
+                exported_name: "Widget".to_string(),
+                is_type_only: false,
+                span: Span::default(),
+            },
+        ],
+    );
+    let public_entries = FxHashSet::from_iter([FileId(0)]);
+    let public_class_exports = public_class_export_origin_keys(&graph, &public_entries);
+
+    assert!(!is_entry_point_public_class_export(
+        &graph.modules[1],
+        &graph.modules[1].exports[0],
+        &public_class_exports,
+    ));
+}
+
+#[test]
+fn class_exposed_through_public_namespace_is_public_api() {
+    let mut graph = build_graph(&[("/src/index.ts", true), ("/src/sdk.ts", false)]);
+    set_exports(
+        &mut graph,
+        1,
+        &[make_export_with_members(
+            "Client",
+            vec![make_member("request", MemberKind::ClassMethod)],
+            None,
+        )],
+    );
+    graph.set_re_exports(
+        0,
+        vec![crate::graph::ReExportEdge {
+            source_file: FileId(1),
+            imported_name: "*".to_string(),
+            exported_name: "SDK".to_string(),
+            is_type_only: false,
+            span: Span::default(),
+        }],
+    );
+    let public_entries = FxHashSet::from_iter([FileId(0)]);
+    let public_class_exports = public_class_export_origin_keys(&graph, &public_entries);
+
+    assert!(is_entry_point_public_class_export(
+        &graph.modules[1],
+        &graph.modules[1].exports[0],
+        &public_class_exports,
+    ));
+}
+
+#[test]
+fn class_exposed_through_type_only_public_re_export_is_public_api() {
+    let mut graph = build_graph(&[("/src/index.ts", true), ("/src/context.ts", false)]);
+    set_exports(
+        &mut graph,
+        1,
+        &[make_export_with_members(
+            "Context",
+            vec![make_member("field", MemberKind::ClassProperty)],
+            None,
+        )],
+    );
+    graph.set_re_exports(
+        0,
+        vec![crate::graph::ReExportEdge {
+            source_file: FileId(1),
+            imported_name: "Context".to_string(),
+            exported_name: "Context".to_string(),
+            is_type_only: true,
+            span: Span::default(),
+        }],
+    );
+    let public_entries = FxHashSet::from_iter([FileId(0)]);
+    let public_class_exports = public_class_export_origin_keys(&graph, &public_entries);
+
+    assert!(is_entry_point_public_class_export(
+        &graph.modules[1],
+        &graph.modules[1].exports[0],
+        &public_class_exports,
+    ));
+}
+
+#[test]
 fn export_with_no_members_skipped() {
     let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/utils.ts", false)]);
     graph.set_reachable(1);
@@ -2875,4 +3285,102 @@ fn export_with_no_members_skipped() {
     );
     assert!(enum_members.is_empty());
     assert!(class_members.is_empty());
+}
+
+#[test]
+fn inheritance_propagates_member_access_up_a_long_extends_chain() {
+    const DEPTH: u32 = 8;
+    let key = |level: u32| ExportKey::new(FileId(level), "Class");
+    let mut parent_to_children: FxHashMap<ExportKey, Vec<ExportKey>> = FxHashMap::default();
+    for level in 0..DEPTH {
+        parent_to_children
+            .entry(key(level))
+            .or_default()
+            .push(key(level + 1));
+    }
+    let mut accessed: FxHashMap<ExportKey, FxHashSet<String>> = FxHashMap::default();
+    accessed
+        .entry(key(DEPTH))
+        .or_default()
+        .insert("start".to_string());
+    let mut self_accessed: FxHashMap<FileId, FxHashSet<String>> = FxHashMap::default();
+
+    heritage::propagate_class_inheritance(&parent_to_children, &mut accessed, &mut self_accessed);
+
+    for level in 0..=DEPTH {
+        assert!(
+            accessed
+                .get(&key(level))
+                .is_some_and(|members| members.contains("start")),
+            "level {level} of the chain must see the member that the leaf accesses"
+        );
+    }
+}
+
+#[test]
+fn inheritance_propagates_self_access_down_a_long_extends_chain() {
+    const DEPTH: u32 = 8;
+    let key = |level: u32| ExportKey::new(FileId(level), "Class");
+    let mut parent_to_children: FxHashMap<ExportKey, Vec<ExportKey>> = FxHashMap::default();
+    for level in 0..DEPTH {
+        parent_to_children
+            .entry(key(level))
+            .or_default()
+            .push(key(level + 1));
+    }
+    let mut accessed: FxHashMap<ExportKey, FxHashSet<String>> = FxHashMap::default();
+    let mut self_accessed: FxHashMap<FileId, FxHashSet<String>> = FxHashMap::default();
+    self_accessed
+        .entry(FileId(0))
+        .or_default()
+        .insert("work".to_string());
+
+    heritage::propagate_class_inheritance(&parent_to_children, &mut accessed, &mut self_accessed);
+
+    for level in 0..=DEPTH {
+        assert!(
+            self_accessed
+                .get(&FileId(level))
+                .is_some_and(|members| members.contains("work")),
+            "level {level} of the chain must see the member that the root calls on `this`"
+        );
+    }
+}
+
+#[test]
+fn inheritance_does_not_leak_an_access_to_a_sibling_class() {
+    let key = |file: u32| ExportKey::new(FileId(file), "Class");
+    let (parent, first, second) = (key(0), key(1), key(2));
+    let mut parent_to_children: FxHashMap<ExportKey, Vec<ExportKey>> = FxHashMap::default();
+    parent_to_children.insert(parent.clone(), vec![first.clone(), second.clone()]);
+    let mut accessed: FxHashMap<ExportKey, FxHashSet<String>> = FxHashMap::default();
+    accessed.entry(first).or_default().insert("foo".to_string());
+    let mut self_accessed: FxHashMap<FileId, FxHashSet<String>> = FxHashMap::default();
+    self_accessed
+        .entry(FileId(1))
+        .or_default()
+        .insert("helper".to_string());
+
+    heritage::propagate_class_inheritance(&parent_to_children, &mut accessed, &mut self_accessed);
+
+    assert!(
+        accessed.get(&parent).is_some_and(|set| set.contains("foo")),
+        "the access reaches the parent"
+    );
+    assert!(
+        accessed.get(&second).is_none_or(|set| !set.contains("foo")),
+        "the access must not reach a sibling"
+    );
+    assert!(
+        self_accessed
+            .get(&FileId(0))
+            .is_some_and(|set| set.contains("helper")),
+        "a `this` access of a child reaches the parent"
+    );
+    assert!(
+        self_accessed
+            .get(&FileId(2))
+            .is_none_or(|set| !set.contains("helper")),
+        "a `this` access must not reach a sibling"
+    );
 }

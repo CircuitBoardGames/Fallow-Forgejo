@@ -26,6 +26,7 @@ use fallow_config::WorkspaceDiagnostic;
 use fallow_output::GroupByMode;
 
 pub(super) struct PrintJsonInput<'a> {
+    pub(super) package_baselines: &'a [fallow_api::PackageBaselineStatus],
     pub(super) results: &'a AnalysisResults,
     pub(super) root: &'a Path,
     pub(super) elapsed: Duration,
@@ -34,26 +35,22 @@ pub(super) struct PrintJsonInput<'a> {
     pub(super) regression: Option<&'a crate::regression::RegressionOutcome>,
     pub(super) baseline_matched: Option<(usize, usize)>,
     pub(super) config_fixable: bool,
+    pub(super) baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    pub(super) finding_id_query: Option<fallow_output::FindingIdQuery>,
+    pub(super) gate_outcomes: Option<fallow_output::GateOutcomes>,
+    pub(super) workspace_diagnostics: &'a [WorkspaceDiagnostic],
     pub(super) json_style: crate::json_style::JsonStyle,
+    /// The command that ran: sets the root `kind`, `schema_version`,
+    /// `_meta` and the command that `next_steps` names.
+    pub(super) envelope: fallow_output::CheckEnvelope,
 }
 
 pub(super) fn print_json(input: &PrintJsonInput<'_>) -> ExitCode {
-    let results = input.results;
-    let root = input.root;
-    let elapsed = input.elapsed;
-    let explain = input.explain;
-    let regression = input.regression;
-    let baseline_matched = input.baseline_matched;
-    let config_fixable = input.config_fixable;
-    match api_check_json_document_with_config_fixable_meta_and_extras(
-        results,
-        root,
-        elapsed,
-        config_fixable,
-        check_output_meta(explain, input.type_aware),
-        check_json_extras(regression, None, baseline_matched),
-    ) {
-        Ok(output) => emit_report_json(&output, "JSON", input.json_style),
+    match render_json(input) {
+        Ok(output) => {
+            outln!("{output}");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("Error: failed to serialize results: {e}");
             ExitCode::from(2)
@@ -61,8 +58,35 @@ pub(super) fn print_json(input: &PrintJsonInput<'_>) -> ExitCode {
     }
 }
 
+pub(super) fn render_json(input: &PrintJsonInput<'_>) -> Result<String, serde_json::Error> {
+    let extras = CheckJsonExtraOutputs {
+        package_baselines: input.package_baselines.to_vec(),
+        finding_id_query: input.finding_id_query.clone(),
+        ..check_json_extras_with_verdicts(
+            input.regression,
+            None,
+            input.baseline_matched,
+            input.baseline_staleness,
+            input.gate_outcomes.clone(),
+            crate::requests::request_outcomes(),
+        )
+    };
+    let output = api_check_json_document_with_config_fixable_meta_and_extras(
+        input.results,
+        input.root,
+        input.elapsed,
+        input.config_fixable,
+        check_output_meta(input.explain, input.type_aware, input.envelope),
+        extras,
+        input.workspace_diagnostics,
+        input.envelope,
+    )?;
+    input.json_style.serialize(&output)
+}
+
 #[must_use]
 pub(super) struct PrintGroupedJsonInput<'a> {
+    pub(super) package_baselines: &'a [fallow_api::PackageBaselineStatus],
     pub(super) groups: &'a [ResultGroup],
     pub(super) original: &'a AnalysisResults,
     pub(super) root: &'a Path,
@@ -71,26 +95,39 @@ pub(super) struct PrintGroupedJsonInput<'a> {
     pub(super) type_aware: Option<&'a fallow_types::envelope::TypeAwareMeta>,
     pub(super) resolver: &'a OwnershipResolver,
     pub(super) config_fixable: bool,
+    pub(super) baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    pub(super) finding_id_query: Option<fallow_output::FindingIdQuery>,
+    pub(super) gate_outcomes: Option<fallow_output::GateOutcomes>,
+    pub(super) workspace_diagnostics: &'a [WorkspaceDiagnostic],
     pub(super) json_style: crate::json_style::JsonStyle,
+    /// The command that ran: sets the root `kind`, `schema_version`,
+    /// `_meta` and the command that `next_steps` names.
+    pub(super) envelope: fallow_output::CheckEnvelope,
 }
 
 pub(super) fn print_grouped_json(input: &PrintGroupedJsonInput<'_>) -> ExitCode {
     let output = match fallow_api::serialize_grouped_check_json(GroupedCheckJsonOutputInput {
+        envelope: input.envelope,
+        package_baselines: input.package_baselines.to_vec(),
+        gate_outcomes: input.gate_outcomes.clone(),
+        request_outcomes: crate::requests::request_outcomes(),
+        finding_id_query: input.finding_id_query.clone(),
         groups: input.groups,
         original: input.original,
         root: input.root,
         elapsed: input.elapsed,
         grouped_by: group_by_mode_from_label(input.resolver.mode_label()),
         config_fixable: input.config_fixable,
-        meta: check_output_meta(input.explain, input.type_aware),
-        workspace_diagnostics: workspace_diagnostics_for_output(input.root),
-        next_steps: crate::report::suggestions::build_dead_code_next_steps(
+        baseline_staleness: input.baseline_staleness,
+        meta: check_output_meta(input.explain, input.type_aware, input.envelope),
+        workspace_diagnostics: input.workspace_diagnostics.to_vec(),
+        next_steps: crate::report::suggestions::build_check_next_steps(
             input.original,
             input.root,
             crate::report::suggestions::setup_pointer_applicable(input.root),
             crate::report::suggestions::due_impact_digest(input.root),
+            input.envelope.command(),
         ),
-        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
         telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     }) {
         Ok(value) => value,
@@ -106,13 +143,17 @@ pub(super) fn print_grouped_json(input: &PrintGroupedJsonInput<'_>) -> ExitCode 
 fn check_output_meta(
     explain: bool,
     type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    envelope: fallow_output::CheckEnvelope,
 ) -> Option<fallow_types::envelope::Meta> {
     if !explain && type_aware.is_none() {
         return None;
     }
 
     let mut meta = if explain {
-        fallow_output::check_meta()
+        match envelope {
+            fallow_output::CheckEnvelope::DeadCode => fallow_output::check_meta(),
+            fallow_output::CheckEnvelope::Architecture => fallow_output::architecture_meta(),
+        }
     } else {
         fallow_types::envelope::Meta::default()
     };
@@ -423,6 +464,15 @@ fn add_type_aware_abstention_metric_definitions(meta: &mut fallow_types::envelop
             ),
         ),
         (
+            "type_aware.abstention_reasons.svelte_virtual_module_exports".to_owned(),
+            type_aware_metric(
+                "Svelte Virtual-module Export Abstention Count",
+                "Candidates retained because TypeScript-Go could not resolve named Svelte virtual-module exports.",
+                "[0, type_aware.unresolved_count]",
+                "zero means no candidate depended on unavailable Svelte virtual-module exports",
+            ),
+        ),
+        (
             "type_aware.abstention_reasons.unknown_symbol".to_owned(),
             type_aware_metric(
                 "Unknown-symbol Abstention Count",
@@ -511,9 +561,15 @@ fn api_check_json_document_with_config_fixable_and_meta(
         config_fixable,
         meta,
         CheckJsonExtraOutputs::default(),
+        &[],
+        fallow_output::CheckEnvelope::DeadCode,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "check output keeps envelope metadata and run-owned diagnostics explicit"
+)]
 pub(super) fn api_check_json_document_with_config_fixable_meta_and_extras(
     results: &AnalysisResults,
     root: &Path,
@@ -521,71 +577,94 @@ pub(super) fn api_check_json_document_with_config_fixable_meta_and_extras(
     config_fixable: bool,
     meta: Option<fallow_types::envelope::Meta>,
     extras: CheckJsonExtraOutputs,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+    envelope: fallow_output::CheckEnvelope,
 ) -> Result<serde_json::Value, serde_json::Error> {
     fallow_api::serialize_check_json(CheckJsonOutputInput {
+        envelope,
         results,
         root,
         elapsed,
         config_fixable,
         meta,
         extras,
-        workspace_diagnostics: workspace_diagnostics_for_output(root),
-        next_steps: crate::report::suggestions::build_dead_code_next_steps(
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
+        next_steps: crate::report::suggestions::build_check_next_steps(
             results,
             root,
             crate::report::suggestions::setup_pointer_applicable(root),
             crate::report::suggestions::due_impact_digest(root),
+            envelope.command(),
         ),
-        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
         telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     })
 }
 
+/// Build the `CheckOutput` body the audit family embeds as its `dead_code`
+/// section.
+///
+/// `analysis_diagnostics` is the dead-code analysis's own by-value diagnostic
+/// list. Rendering must not import process history from another analysis run.
 pub fn api_check_json_payload_with_config_fixable(
     results: &AnalysisResults,
     root: &Path,
     elapsed: Duration,
     config_fixable: bool,
-) -> Result<serde_json::Value, serde_json::Error> {
-    api_check_json_payload_with_config_fixable_and_extras(
-        results,
-        root,
-        elapsed,
-        config_fixable,
-        CheckJsonExtraOutputs::default(),
-    )
-}
-
-pub fn api_check_json_payload_with_config_fixable_and_extras(
-    results: &AnalysisResults,
-    root: &Path,
-    elapsed: Duration,
-    config_fixable: bool,
-    extras: CheckJsonExtraOutputs,
+    analysis_diagnostics: &[WorkspaceDiagnostic],
+    baseline_staleness: Option<fallow_output::BaselineStaleness>,
 ) -> Result<serde_json::Value, serde_json::Error> {
     fallow_api::serialize_check_json_payload(CheckJsonPayloadInput {
         results,
         root,
         elapsed,
         config_fixable,
-        extras,
-        workspace_diagnostics: workspace_diagnostics_for_output(root),
+        extras: check_json_extras(None, None, None, baseline_staleness),
+        workspace_diagnostics: analysis_diagnostics.to_vec(),
     })
 }
 
-fn workspace_diagnostics_for_output(root: &Path) -> Vec<WorkspaceDiagnostic> {
-    crate::runtime_support::workspace_diagnostics_for(root)
-}
-
+/// The baseline and regression sections for a dead-code SECTION of a larger
+/// envelope, which publishes neither the run's gates nor its requests.
+///
+/// The combined envelope carries both at its root and nowhere else, the same
+/// rule `workspace_diagnostics` follows there (issue #2366): a run that skips
+/// the dead-code section must still report what it was asked to do.
 pub fn check_json_extras(
     regression: Option<&crate::regression::RegressionOutcome>,
     baseline_deltas: Option<BaselineDeltas>,
     baseline_matched: Option<(usize, usize)>,
+    baseline_staleness: Option<fallow_output::BaselineStaleness>,
+) -> CheckJsonExtraOutputs {
+    check_json_extras_with_verdicts(
+        regression,
+        baseline_deltas,
+        baseline_matched,
+        baseline_staleness,
+        None,
+        None,
+    )
+}
+
+/// [`check_json_extras`] plus the run's gate outcomes and request outcomes,
+/// for the standalone envelope that owns both. Kept separate so the section
+/// callers do not each have to pass `None` twice.
+pub fn check_json_extras_with_verdicts(
+    regression: Option<&crate::regression::RegressionOutcome>,
+    baseline_deltas: Option<BaselineDeltas>,
+    baseline_matched: Option<(usize, usize)>,
+    baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    gate_outcomes: Option<fallow_output::GateOutcomes>,
+    request_outcomes: Option<fallow_output::RequestOutcomes>,
 ) -> CheckJsonExtraOutputs {
     CheckJsonExtraOutputs {
+        package_baselines: Vec::new(),
+        gate_outcomes,
+        request_outcomes,
         regression: regression.map(regression_output),
         baseline_deltas,
         baseline: baseline_matched.map(|(entries, matched)| BaselineMatch { entries, matched }),
+        baseline_staleness,
+        finding_id_query: None,
     }
 }
 
@@ -596,8 +675,8 @@ pub fn regression_output(outcome: &crate::regression::RegressionOutcome) -> Regr
             baseline_total,
             current_total,
         } => {
-            let baseline_total = *baseline_total as i64;
-            let current_total = *current_total as i64;
+            let baseline_total = crate::count_delta::count_to_i64(*baseline_total);
+            let current_total = crate::count_delta::count_to_i64(*current_total);
             RegressionResult {
                 status: RegressionStatus::Pass,
                 baseline_total: Some(baseline_total),
@@ -615,8 +694,8 @@ pub fn regression_output(outcome: &crate::regression::RegressionOutcome) -> Regr
             tolerance,
             ..
         } => {
-            let baseline_total = *baseline_total as i64;
-            let current_total = *current_total as i64;
+            let baseline_total = crate::count_delta::count_to_i64(*baseline_total);
+            let current_total = crate::count_delta::count_to_i64(*current_total);
             let (tolerance, tolerance_kind) = match tolerance {
                 crate::regression::Tolerance::Percentage(percent) => {
                     (*percent, RegressionToleranceKind::Percentage)
@@ -670,30 +749,23 @@ pub fn build_baseline_deltas_output<'a>(
     }
 }
 
-/// Insert a `_meta` key into a JSON object value.
-#[cfg(test)]
-fn insert_meta(output: &mut serde_json::Value, meta: serde_json::Value) {
-    if let serde_json::Value::Object(map) = output {
-        let telemetry = map
-            .get("_meta")
-            .and_then(|existing| existing.get("telemetry"))
-            .cloned();
-        let mut meta = meta;
-        if let (Some(telemetry), Some(meta_map)) = (telemetry, meta.as_object_mut()) {
-            meta_map.insert("telemetry".to_string(), telemetry);
-        }
-        map.insert("_meta".to_string(), meta);
-    }
-}
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "health output keeps render options, diagnostics and gate verdicts explicit"
+)]
 pub(super) fn api_health_json_document(
     report: &fallow_output::HealthReport,
     root: &Path,
     elapsed: Duration,
     explain: bool,
     type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+    gate_outcomes: Option<fallow_output::GateOutcomes>,
 ) -> Result<serde_json::Value, serde_json::Error> {
+    let loaded_baseline = crate::report::suggestions::loaded_health_baseline();
     let output = fallow_api::serialize_health_report_json(fallow_api::HealthJsonReportInput {
+        gate_outcomes,
+        request_outcomes: crate::requests::request_outcomes(),
         report: report.clone(),
         root,
         elapsed,
@@ -701,30 +773,40 @@ pub(super) fn api_health_json_document(
         type_aware: type_aware.cloned(),
         grouped_by: None,
         groups: None,
-        workspace_diagnostics: workspace_diagnostics_for_output(root),
+        group_filter: None,
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
         next_steps: fallow_output::build_health_next_steps(
             crate::report::suggestions::health_next_steps_input(
                 report,
                 root,
                 crate::report::suggestions::setup_pointer_applicable(root),
                 crate::report::suggestions::due_impact_digest(root),
+                loaded_baseline.as_ref(),
             ),
         ),
-        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
         telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     })?;
     Ok(output)
 }
 
-fn api_grouped_health_json_document(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouped health output keeps render options and run-owned diagnostics explicit"
+)]
+pub(super) fn api_grouped_health_json_document(
     report: &fallow_output::HealthReport,
     grouping: &fallow_output::HealthGrouping,
     root: &Path,
     elapsed: Duration,
     explain: bool,
     type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+    gate_outcomes: Option<fallow_output::GateOutcomes>,
 ) -> Result<serde_json::Value, serde_json::Error> {
+    let loaded_baseline = crate::report::suggestions::loaded_health_baseline();
     fallow_api::serialize_health_report_json(fallow_api::HealthJsonReportInput {
+        gate_outcomes,
+        request_outcomes: crate::requests::request_outcomes(),
         report: report.clone(),
         root,
         elapsed,
@@ -732,29 +814,44 @@ fn api_grouped_health_json_document(
         type_aware: type_aware.cloned(),
         grouped_by: Some(group_by_mode_from_label(grouping.mode)),
         groups: Some(grouping.groups.clone()),
-        workspace_diagnostics: workspace_diagnostics_for_output(root),
+        group_filter: grouping.filter.clone(),
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
         next_steps: fallow_output::build_health_next_steps(
             crate::report::suggestions::health_next_steps_input(
                 report,
                 root,
                 crate::report::suggestions::setup_pointer_applicable(root),
                 crate::report::suggestions::due_impact_digest(root),
+                loaded_baseline.as_ref(),
             ),
         ),
-        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
         telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "health output keeps render options and run-owned diagnostics explicit"
+)]
 pub(super) fn print_health_json(
     report: &fallow_output::HealthReport,
     root: &Path,
     elapsed: Duration,
     explain: bool,
     type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
     json_style: crate::json_style::JsonStyle,
+    gate_outcomes: Option<fallow_output::GateOutcomes>,
 ) -> ExitCode {
-    match api_health_json_document(report, root, elapsed, explain, type_aware) {
+    match api_health_json_document(
+        report,
+        root,
+        elapsed,
+        explain,
+        type_aware,
+        workspace_diagnostics,
+        gate_outcomes,
+    ) {
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize health report: {e}");
@@ -774,9 +871,20 @@ pub(super) fn print_grouped_health_json(
     elapsed: Duration,
     explain: bool,
     type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
     json_style: crate::json_style::JsonStyle,
+    gate_outcomes: Option<fallow_output::GateOutcomes>,
 ) -> ExitCode {
-    match api_grouped_health_json_document(report, grouping, root, elapsed, explain, type_aware) {
+    match api_grouped_health_json_document(
+        report,
+        grouping,
+        root,
+        elapsed,
+        explain,
+        type_aware,
+        workspace_diagnostics,
+        gate_outcomes,
+    ) {
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize grouped health report: {e}");
@@ -785,11 +893,27 @@ pub(super) fn print_grouped_health_json(
     }
 }
 
+/// The two presentation switches the duplication JSON path carries, paired so
+/// they travel as one argument through the render chain.
+#[derive(Debug, Clone)]
+pub(super) struct DuplicationJsonRender<'a> {
+    pub(super) package_baselines: &'a [fallow_api::PackageBaselineStatus],
+    /// This run's view of the loaded duplication baseline, for baseline runs.
+    pub(super) baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    /// Every gate this run evaluated, for the envelope's `gate_outcomes`.
+    pub(super) gate_outcomes: Option<fallow_output::GateOutcomes>,
+    /// Attach the `_meta` explain block.
+    pub(super) explain: bool,
+    /// Serialize `instances[].fragment`. Off for a location-only payload.
+    pub(super) include_fragments: bool,
+}
+
 pub(super) fn api_duplication_json_document(
     report: &DuplicationReport,
     root: &Path,
     elapsed: Duration,
-    explain: bool,
+    render: &DuplicationJsonRender<'_>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
 ) -> Result<serde_json::Value, serde_json::Error> {
     let payload = DupesReportPayload::from_report(report);
     let next_steps = crate::report::suggestions::build_dupes_next_steps(
@@ -799,13 +923,17 @@ pub(super) fn api_duplication_json_document(
         crate::report::suggestions::due_impact_digest(root),
     );
     fallow_api::serialize_duplication_json(DuplicationJsonOutputInput {
+        package_baselines: render.package_baselines.to_vec(),
+        gate_outcomes: render.gate_outcomes.clone(),
+        request_outcomes: crate::requests::request_outcomes(),
         report,
         root,
         elapsed,
-        meta: explain.then(fallow_output::dupes_meta),
-        workspace_diagnostics: workspace_diagnostics_for_output(root),
+        include_fragments: render.include_fragments,
+        meta: render.explain.then(fallow_output::dupes_meta),
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
         next_steps,
-        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        baseline_staleness: render.baseline_staleness,
         telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     })
 }
@@ -814,10 +942,11 @@ pub(super) fn print_duplication_json(
     report: &DuplicationReport,
     root: &Path,
     elapsed: Duration,
-    explain: bool,
+    render: &DuplicationJsonRender<'_>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
     json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
-    match api_duplication_json_document(report, root, elapsed, explain) {
+    match api_duplication_json_document(report, root, elapsed, render, workspace_diagnostics) {
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize duplication report: {e}");
@@ -831,7 +960,8 @@ fn api_grouped_duplication_json_document(
     grouping: &DuplicationGrouping,
     root: &Path,
     elapsed: Duration,
-    explain: bool,
+    render: &DuplicationJsonRender<'_>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
 ) -> Result<serde_json::Value, serde_json::Error> {
     let payload = DupesReportPayload::from_report(report);
     let next_steps = crate::report::suggestions::build_dupes_next_steps(
@@ -841,14 +971,18 @@ fn api_grouped_duplication_json_document(
         crate::report::suggestions::due_impact_digest(root),
     );
     fallow_api::serialize_grouped_duplication_json(GroupedDuplicationJsonOutputInput {
+        package_baselines: render.package_baselines.to_vec(),
+        gate_outcomes: render.gate_outcomes.clone(),
+        request_outcomes: crate::requests::request_outcomes(),
         report,
         grouping,
         root,
         elapsed,
-        meta: explain.then(fallow_output::dupes_meta),
-        workspace_diagnostics: workspace_diagnostics_for_output(root),
+        include_fragments: render.include_fragments,
+        meta: render.explain.then(fallow_output::dupes_meta),
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
         next_steps,
-        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        baseline_staleness: render.baseline_staleness,
         telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     })
 }
@@ -862,15 +996,27 @@ fn group_by_mode_from_label(label: &str) -> GroupByMode {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouped duplication output keeps render options and run-owned diagnostics explicit"
+)]
 pub(super) fn print_grouped_duplication_json(
     report: &DuplicationReport,
     grouping: &DuplicationGrouping,
     root: &Path,
     elapsed: Duration,
-    explain: bool,
+    render: &DuplicationJsonRender<'_>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
     json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
-    match api_grouped_duplication_json_document(report, grouping, root, elapsed, explain) {
+    match api_grouped_duplication_json_document(
+        report,
+        grouping,
+        root,
+        elapsed,
+        render,
+        workspace_diagnostics,
+    ) {
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize grouped duplication report: {e}");
@@ -885,7 +1031,6 @@ pub(super) fn print_trace_json<T: serde::Serialize>(
 ) {
     let value = match fallow_output::serialize_trace_json_output(
         value,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     ) {
         Ok(value) => value,
@@ -918,7 +1063,6 @@ pub(super) fn print_semantic_trace_json<T: serde::Serialize>(
 ) {
     let mut value = match fallow_output::serialize_trace_json_output(
         value,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     ) {
         Ok(value) => value,
@@ -950,11 +1094,7 @@ pub(super) fn print_semantic_impact_json<T: serde::Serialize>(
     explain: bool,
     json_style: crate::json_style::JsonStyle,
 ) {
-    let mut value = match fallow_output::serialize_named_json_output(
-        value,
-        "impact",
-        crate::output_runtime::current_root_envelope_mode(),
-    ) {
+    let mut value = match fallow_output::serialize_named_json_output(value, "impact") {
         Ok(value) => value,
         Err(e) => {
             eprintln!("Error: failed to build impact output: {e}");
@@ -993,11 +1133,11 @@ fn attach_semantic_explain_meta(value: &mut serde_json::Value, explain: bool) {
         return;
     };
     meta.entry("docs").or_insert_with(|| {
-        serde_json::Value::String("https://docs.fallow.tools/features/type-aware".to_string())
+        serde_json::Value::String("https://fallow.tools/docs/analysis/type-aware/".to_string())
     });
     meta.entry("field_definitions").or_insert_with(|| {
         serde_json::json!({
-            "semantic": "Authoritative checker-backed evidence. When present, trust semantic.identity, semantic.status, and semantic.references over the syntactic root trace fields.",
+            "semantic": "Authoritative checker-backed evidence. When present, trust semantic.identity, semantic.status, and semantic.references over the syntactic root trace fields. The proof covers only the lane named by semantic.target.namespace, so when the root trace lists a reference the proof does not, the root evidence is wider rather than stale.",
             "semantic.identity": "Compatibility identity for the selected effective TypeScript projects and semantic capabilities.",
             "semantic.status": "Whether checker-backed evidence is complete, partial, or unavailable.",
             "semantic.references": "Bounded exact TypeScript checker references for the requested module export or class member.",
@@ -1056,18 +1196,89 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn typed_regression_output_matches_legacy_json_shape() {
-        let outcome = crate::regression::RegressionOutcome::Exceeded {
-            baseline_total: 10,
-            current_total: 13,
-            tolerance: crate::regression::Tolerance::Absolute(2),
-            type_deltas: Vec::new(),
-        };
+    fn regression_output_serializes_each_outcome() {
+        use crate::regression::{RegressionOutcome, Tolerance};
 
-        assert_eq!(
-            serde_json::to_value(regression_output(&outcome)).expect("regression serializes"),
-            outcome.to_json()
-        );
+        let cases = [
+            (
+                RegressionOutcome::Pass {
+                    baseline_total: 10,
+                    current_total: 10,
+                },
+                serde_json::json!({
+                    "status": "pass",
+                    "baseline_total": 10,
+                    "current_total": 10,
+                    "delta": 0,
+                    "exceeded": false,
+                }),
+            ),
+            (
+                RegressionOutcome::Pass {
+                    baseline_total: 10,
+                    current_total: 5,
+                },
+                serde_json::json!({
+                    "status": "pass",
+                    "baseline_total": 10,
+                    "current_total": 5,
+                    "delta": -5,
+                    "exceeded": false,
+                }),
+            ),
+            (
+                RegressionOutcome::Exceeded {
+                    baseline_total: 10,
+                    current_total: 15,
+                    tolerance: Tolerance::Percentage(2.0),
+                    type_deltas: vec![("unused_files", 5)],
+                },
+                serde_json::json!({
+                    "status": "exceeded",
+                    "baseline_total": 10,
+                    "current_total": 15,
+                    "delta": 5,
+                    "tolerance": 2.0,
+                    "tolerance_kind": "percentage",
+                    "exceeded": true,
+                }),
+            ),
+            (
+                RegressionOutcome::Exceeded {
+                    baseline_total: 10,
+                    current_total: 13,
+                    tolerance: Tolerance::Absolute(2),
+                    type_deltas: Vec::new(),
+                },
+                serde_json::json!({
+                    "status": "exceeded",
+                    "baseline_total": 10,
+                    "current_total": 13,
+                    "delta": 3,
+                    "tolerance": 2.0,
+                    "tolerance_kind": "absolute",
+                    "exceeded": true,
+                }),
+            ),
+            (
+                RegressionOutcome::Skipped {
+                    reason: "test reason",
+                },
+                serde_json::json!({
+                    "status": "skipped",
+                    "exceeded": false,
+                    "reason": "test reason",
+                }),
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(regression_output(&outcome)).expect("regression serializes"),
+                expected,
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -1100,37 +1311,41 @@ mod tests {
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["kind"], "dead-code");
-        assert_eq!(output["schema_version"], 8);
+        assert_eq!(output["schema_version"], 10);
         assert!(output["version"].is_string());
         assert_eq!(output["elapsed_ms"], 123);
         assert_eq!(output["total_issues"], 0);
     }
 
     #[test]
-    fn json_output_includes_issue_arrays() {
+    fn architecture_document_has_architecture_kind_and_version() {
         let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let elapsed = Duration::from_millis(50);
-        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
+        let results = AnalysisResults::default();
+        let envelope = fallow_output::CheckEnvelope::Architecture;
+        let output = api_check_json_document_with_config_fixable_meta_and_extras(
+            &results,
+            &root,
+            Duration::from_millis(1),
+            false,
+            check_output_meta(true, None, envelope),
+            CheckJsonExtraOutputs::default(),
+            &[],
+            envelope,
+        )
+        .expect("should serialize");
 
-        assert_eq!(output["unused_files"].as_array().unwrap().len(), 1);
-        assert_eq!(output["unused_exports"].as_array().unwrap().len(), 1);
-        assert_eq!(output["unused_types"].as_array().unwrap().len(), 1);
-        assert_eq!(output["unused_dependencies"].as_array().unwrap().len(), 1);
+        assert_eq!(output["kind"], "architecture");
         assert_eq!(
-            output["unused_dev_dependencies"].as_array().unwrap().len(),
-            1
+            output["schema_version"],
+            fallow_output::ARCHITECTURE_SCHEMA_VERSION
         );
-        assert_eq!(output["unused_enum_members"].as_array().unwrap().len(), 1);
-        assert_eq!(output["unused_class_members"].as_array().unwrap().len(), 1);
-        assert_eq!(output["unresolved_imports"].as_array().unwrap().len(), 1);
-        assert_eq!(output["unlisted_dependencies"].as_array().unwrap().len(), 1);
-        assert_eq!(output["duplicate_exports"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            output["type_only_dependencies"].as_array().unwrap().len(),
-            1
+        assert_eq!(output["_meta"]["docs"], fallow_output::ARCHITECTURE_DOCS);
+        assert!(output["_meta"]["rules"].get("unused-file").is_none());
+        assert!(
+            output["_meta"]["rules"]
+                .get("circular-dependency")
+                .is_some()
         );
-        assert_eq!(output["circular_dependencies"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1175,6 +1390,7 @@ mod tests {
                     evidence: RuntimeCoverageEvidence {
                         static_status: "used".to_owned(),
                         test_coverage: "not_covered".to_owned(),
+                        test_only_reference: None,
                         v8_tracking: "tracked".to_owned(),
                         untracked_reason: None,
                         observation_days: 30,
@@ -1199,6 +1415,7 @@ mod tests {
                     invocations: 250,
                     percentile: 99,
                     actions: vec![],
+                    optimization_target: None,
                 }],
                 blast_radius: vec![],
                 importance: vec![],
@@ -1219,12 +1436,15 @@ mod tests {
             fallow_output::HealthReport,
             fallow_output::HealthGroup,
         > = fallow_output::HealthOutput {
+            gate_outcomes: None,
+            request_outcomes: None,
             schema_version: SchemaVersion(fallow_output::HEALTH_SCHEMA_VERSION),
             version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
             elapsed_ms: ElapsedMs(7),
             report,
             grouped_by: None,
             groups: None,
+            group_filter: None,
             meta: None,
             workspace_diagnostics: Vec::new(),
             next_steps: Vec::new(),
@@ -1277,9 +1497,15 @@ mod tests {
                 owners: None,
                 files_analyzed: 1,
                 functions_above_threshold: 0,
+                severity_critical_count: 0,
+                severity_high_count: 0,
+                severity_moderate_count: 0,
+                hotspot_count: 0,
                 coverage_source_consistency: None,
                 vital_signs: None,
                 health_score: None,
+                trend: None,
+                trend_status: None,
                 findings: Vec::new(),
                 file_scores: Vec::new(),
                 hotspots: Vec::new(),
@@ -1292,6 +1518,8 @@ mod tests {
                 targets: Vec::new(),
                 actions_meta: None,
             }],
+            filter: None,
+            unmatched_filters: Vec::new(),
         };
 
         let output = api_grouped_health_json_document(
@@ -1300,6 +1528,8 @@ mod tests {
             &root,
             Duration::ZERO,
             false,
+            None,
+            &[],
             None,
         )
         .expect("grouped health JSON should serialize");
@@ -1351,6 +1581,8 @@ mod tests {
                 col: 4,
                 span_start: 120,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let elapsed = Duration::from_millis(0);
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
@@ -1362,60 +1594,6 @@ mod tests {
         assert_eq!(export["is_type_only"], false);
         assert_eq!(export["span_start"], 120);
         assert_eq!(export["is_re_export"], false);
-    }
-
-    #[test]
-    fn json_serializes_to_valid_json() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let elapsed = Duration::from_millis(42);
-        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
-
-        let json_str = serde_json::to_string_pretty(&output).expect("should stringify");
-        let reparsed: serde_json::Value =
-            serde_json::from_str(&json_str).expect("JSON output should be valid JSON");
-        assert_eq!(reparsed, output);
-    }
-
-    #[test]
-    fn json_empty_results_produce_valid_structure() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let elapsed = Duration::from_millis(0);
-        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
-
-        assert_eq!(output["total_issues"], 0);
-        assert_eq!(output["unused_files"].as_array().unwrap().len(), 0);
-        assert_eq!(output["unused_exports"].as_array().unwrap().len(), 0);
-        assert_eq!(output["unused_types"].as_array().unwrap().len(), 0);
-        assert_eq!(output["unused_dependencies"].as_array().unwrap().len(), 0);
-        assert_eq!(
-            output["unused_dev_dependencies"].as_array().unwrap().len(),
-            0
-        );
-        assert_eq!(output["unused_enum_members"].as_array().unwrap().len(), 0);
-        assert_eq!(output["unused_class_members"].as_array().unwrap().len(), 0);
-        assert_eq!(output["unresolved_imports"].as_array().unwrap().len(), 0);
-        assert_eq!(output["unlisted_dependencies"].as_array().unwrap().len(), 0);
-        assert_eq!(output["duplicate_exports"].as_array().unwrap().len(), 0);
-        assert_eq!(
-            output["type_only_dependencies"].as_array().unwrap().len(),
-            0
-        );
-        assert_eq!(output["circular_dependencies"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn json_empty_results_round_trips_through_string() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let elapsed = Duration::from_millis(0);
-        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
-
-        let json_str = serde_json::to_string(&output).expect("should stringify");
-        let reparsed: serde_json::Value =
-            serde_json::from_str(&json_str).expect("should parse back");
-        assert_eq!(reparsed["total_issues"], 0);
     }
 
     #[test]
@@ -1566,6 +1744,8 @@ mod tests {
                 col: 0,
                 span_start: 300,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let elapsed = Duration::from_millis(0);
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
@@ -1589,6 +1769,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 10,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let elapsed = Duration::from_millis(0);
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
@@ -1611,6 +1792,7 @@ mod tests {
                 path: root.join("packages/shared/package.json"),
                 line: 6,
                 used_in_workspaces: vec![root.join("packages/consumer")],
+                declared_and_imported_in: Vec::new(),
             }));
         let elapsed = Duration::from_millis(0);
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
@@ -1634,6 +1816,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 15,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let elapsed = Duration::from_millis(0);
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
@@ -1655,6 +1838,7 @@ mod tests {
                     path: root.join("package.json"),
                     line: 12,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         let elapsed = Duration::from_millis(0);
@@ -1966,35 +2150,13 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: true,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let elapsed = Duration::from_millis(0);
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["unused_exports"][0]["is_re_export"], true);
-    }
-
-    #[test]
-    fn json_schema_version_is_pinned() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let elapsed = Duration::from_millis(0);
-        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
-
-        assert_eq!(
-            output["schema_version"],
-            fallow_output::CHECK_SCHEMA_VERSION
-        );
-        assert_eq!(output["schema_version"], 8);
-    }
-
-    #[test]
-    fn json_version_matches_cargo_pkg_version() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let elapsed = Duration::from_millis(0);
-        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
-
-        assert_eq!(output["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -2054,91 +2216,10 @@ mod tests {
     }
 
     #[test]
-    fn strip_root_prefix_on_string_value() {
-        let mut value = serde_json::json!("/project/src/file.ts");
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value, "src/file.ts");
-    }
-
-    #[test]
-    fn strip_root_prefix_leaves_non_matching_string() {
-        let mut value = serde_json::json!("/other/src/file.ts");
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value, "/other/src/file.ts");
-    }
-
-    #[test]
-    fn strip_root_prefix_recurses_into_arrays() {
-        let mut value = serde_json::json!(["/project/a.ts", "/project/b.ts", "/other/c.ts"]);
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value[0], "a.ts");
-        assert_eq!(value[1], "b.ts");
-        assert_eq!(value[2], "/other/c.ts");
-    }
-
-    #[test]
-    fn strip_root_prefix_recurses_into_nested_objects() {
-        let mut value = serde_json::json!({
-            "outer": {
-                "path": "/project/src/nested.ts"
-            }
-        });
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value["outer"]["path"], "src/nested.ts");
-    }
-
-    #[test]
-    fn strip_root_prefix_leaves_numbers_and_booleans() {
-        let mut value = serde_json::json!({
-            "line": 42,
-            "is_type_only": false,
-            "path": "/project/src/file.ts"
-        });
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value["line"], 42);
-        assert_eq!(value["is_type_only"], false);
-        assert_eq!(value["path"], "src/file.ts");
-    }
-
-    #[test]
-    fn strip_root_prefix_normalizes_windows_separators() {
-        let mut value = serde_json::json!(r"/project\src\file.ts");
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value, "src/file.ts");
-    }
-
-    #[test]
-    fn strip_root_prefix_rewrites_embedded_path_strings() {
-        let mut value =
-            serde_json::json!("Add \"/project/src/file.ts\" to boundaries.coverage.allowUnmatched");
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(
-            value,
-            "Add \"src/file.ts\" to boundaries.coverage.allowUnmatched"
-        );
-    }
-
-    #[test]
     fn strip_root_prefix_handles_empty_string_after_strip() {
         let mut value = serde_json::json!("/project/");
         strip_root_prefix(&mut value, "/project/");
         assert_eq!(value, "");
-    }
-
-    #[test]
-    fn strip_root_prefix_deeply_nested_array_of_objects() {
-        let mut value = serde_json::json!({
-            "groups": [{
-                "instances": [{
-                    "file": "/project/src/a.ts"
-                }, {
-                    "file": "/project/src/b.ts"
-                }]
-            }]
-        });
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value["groups"][0]["instances"][0]["file"], "src/a.ts");
-        assert_eq!(value["groups"][0]["instances"][1]["file"], "src/b.ts");
     }
 
     #[test]
@@ -2164,18 +2245,6 @@ mod tests {
     }
 
     #[test]
-    fn json_output_is_deterministic() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let elapsed = Duration::from_millis(50);
-
-        let output1 = api_check_json_document(&results, &root, elapsed).expect("first build");
-        let output2 = api_check_json_document(&results, &root, elapsed).expect("second build");
-
-        assert_eq!(output1, output2);
-    }
-
-    #[test]
     fn json_results_fields_do_not_shadow_metadata() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
@@ -2183,7 +2252,7 @@ mod tests {
         let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["kind"], "dead-code");
-        assert_eq!(output["schema_version"], 8);
+        assert_eq!(output["schema_version"], 10);
         assert_eq!(output["elapsed_ms"], 99);
     }
 
@@ -2225,8 +2294,14 @@ mod tests {
             &root,
             Duration::default(),
             false,
-            check_output_meta(false, Some(&type_aware)),
+            check_output_meta(
+                false,
+                Some(&type_aware),
+                fallow_output::CheckEnvelope::DeadCode,
+            ),
             CheckJsonExtraOutputs::default(),
+            &[],
+            fallow_output::CheckEnvelope::DeadCode,
         )
         .expect("type-aware metadata should serialize");
 
@@ -2241,7 +2316,12 @@ mod tests {
     #[test]
     fn type_aware_explain_defines_semantic_metrics() {
         let type_aware = fallow_types::envelope::TypeAwareMeta::default();
-        let meta = check_output_meta(true, Some(&type_aware)).expect("metadata");
+        let meta = check_output_meta(
+            true,
+            Some(&type_aware),
+            fallow_output::CheckEnvelope::DeadCode,
+        )
+        .expect("metadata");
 
         assert!(
             meta.field_definitions
@@ -2266,6 +2346,7 @@ mod tests {
             "type_aware.abstention_reasons.no_project",
             "type_aware.abstention_reasons.ambiguous_project",
             "type_aware.abstention_reasons.blocking_diagnostics",
+            "type_aware.abstention_reasons.svelte_virtual_module_exports",
             "type_aware.abstention_reasons.unknown_symbol",
             "type_aware.abstention_reasons.unsupported_syntax",
             "type_aware.abstention_reasons.capacity",
@@ -2305,106 +2386,19 @@ mod tests {
         attach_semantic_explain_meta(&mut output, true);
 
         assert_eq!(output["_meta"]["telemetry"]["analysis_run_id"], "run-1");
+        let semantic_definition = output["_meta"]["field_definitions"]["semantic"]
+            .as_str()
+            .expect("semantic field definition");
+        assert!(semantic_definition.contains("trust semantic.identity"));
+        // Issue #2371: the in-band definition is the only guidance an agent
+        // always sees, so it must carry the same lane carve-out as the agent
+        // rules; without it an agent discards a corrected root trace.
         assert!(
-            output["_meta"]["field_definitions"]["semantic"]
-                .as_str()
-                .is_some_and(|definition| definition.contains("trust semantic.identity"))
+            semantic_definition.contains("semantic.target.namespace")
+                && semantic_definition.contains("wider"),
+            "the definition scopes the proof to its lane: {semantic_definition}"
         );
         assert!(output["_meta"]["metrics"]["semantic.total_reference_count"].is_object());
-    }
-
-    #[test]
-    fn json_all_issue_type_arrays_present_in_empty_results() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let elapsed = Duration::from_millis(0);
-        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
-
-        let expected_arrays = [
-            "unused_files",
-            "unused_exports",
-            "unused_types",
-            "unused_dependencies",
-            "unused_dev_dependencies",
-            "unused_optional_dependencies",
-            "unused_enum_members",
-            "unused_class_members",
-            "unresolved_imports",
-            "unlisted_dependencies",
-            "duplicate_exports",
-            "type_only_dependencies",
-            "test_only_dependencies",
-            "dev_dependencies_in_production",
-            "circular_dependencies",
-        ];
-        for key in &expected_arrays {
-            assert!(
-                output[key].is_array(),
-                "expected '{key}' to be an array in JSON output"
-            );
-        }
-    }
-
-    #[test]
-    fn insert_meta_adds_key_to_object() {
-        let mut output = serde_json::json!({ "foo": 1 });
-        let meta = serde_json::json!({ "docs": "https://example.com" });
-        insert_meta(&mut output, meta.clone());
-        assert_eq!(output["_meta"], meta);
-    }
-
-    #[test]
-    fn insert_meta_noop_on_non_object() {
-        let mut output = serde_json::json!([1, 2, 3]);
-        let meta = serde_json::json!({ "docs": "https://example.com" });
-        insert_meta(&mut output, meta);
-        assert!(output.is_array());
-    }
-
-    #[test]
-    fn insert_meta_overwrites_existing_meta() {
-        let mut output = serde_json::json!({ "_meta": "old" });
-        let meta = serde_json::json!({ "new": true });
-        insert_meta(&mut output, meta.clone());
-        assert_eq!(output["_meta"], meta);
-    }
-
-    #[test]
-    fn insert_meta_preserves_existing_telemetry_meta() {
-        let mut output = serde_json::json!({
-            "_meta": {
-                "telemetry": {
-                    "analysis_run_id": "run_test123"
-                }
-            }
-        });
-        insert_meta(
-            &mut output,
-            serde_json::json!({ "docs": "https://example.com" }),
-        );
-
-        assert_eq!(
-            output["_meta"]["docs"].as_str(),
-            Some("https://example.com")
-        );
-        assert_eq!(
-            output["_meta"]["telemetry"]["analysis_run_id"].as_str(),
-            Some("run_test123")
-        );
-    }
-
-    #[test]
-    fn strip_root_prefix_null_unchanged() {
-        let mut value = serde_json::Value::Null;
-        strip_root_prefix(&mut value, "/project/");
-        assert!(value.is_null());
-    }
-
-    #[test]
-    fn strip_root_prefix_empty_string() {
-        let mut value = serde_json::json!("");
-        strip_root_prefix(&mut value, "/project/");
-        assert_eq!(value, "");
     }
 
     #[test]
@@ -2434,12 +2428,14 @@ mod tests {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let mut output =
-            api_check_json_document(&results, &root, elapsed).expect("should serialize");
-        insert_meta(
-            &mut output,
-            serde_json::to_value(fallow_output::check_meta()).unwrap(),
-        );
+        let output = api_check_json_document_with_config_fixable_and_meta(
+            &results,
+            &root,
+            elapsed,
+            false,
+            Some(fallow_output::check_meta()),
+        )
+        .expect("should serialize");
 
         assert!(output["_meta"]["docs"].is_string());
         assert!(output["_meta"]["rules"].is_object());
@@ -2493,6 +2489,8 @@ mod tests {
                 col: 4,
                 span_start: 120,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
@@ -2552,6 +2550,8 @@ mod tests {
                 col: 4,
                 span_start: 120,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_types
@@ -2563,6 +2563,8 @@ mod tests {
                 col: 0,
                 span_start: 60,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
@@ -2609,6 +2611,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
@@ -2635,6 +2638,7 @@ mod tests {
                 path: root.join("packages/shared/package.json"),
                 line: 5,
                 used_in_workspaces: vec![root.join("packages/consumer")],
+                declared_and_imported_in: Vec::new(),
             }));
         let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
@@ -2814,8 +2818,10 @@ mod tests {
                 }
             }),
             exceeded,
+            effective_severity: None,
             severity,
             crap: value.get("crap").and_then(|v| v.as_f64()),
+            mutation: None,
             coverage_pct: value.get("coverage_pct").and_then(|v| v.as_f64()),
             coverage_tier,
             coverage_source,
@@ -2837,9 +2843,7 @@ mod tests {
                         .ok()?,
                 })
             }),
-            contributions: Vec::new(),
-            effective_thresholds: None,
-            threshold_source: None,
+            ..Default::default()
         }
     }
 
@@ -3063,16 +3067,13 @@ mod tests {
             react_prop_count: 0,
             react_hook_profile: None,
             exceeded: fallow_output::ExceededThreshold::Crap,
+            effective_severity: None,
             severity: fallow_output::FindingSeverity::Moderate,
             crap: Some(35.5),
+            mutation: None,
             coverage_pct: None,
             coverage_tier: tier,
-            coverage_source: None,
-            inherited_from: None,
-            component_rollup: None,
-            contributions: Vec::new(),
-            effective_thresholds: None,
-            threshold_source: None,
+            ..Default::default()
         };
         let ctx = fallow_output::HealthActionContext {
             opts: action_opts,
@@ -3239,16 +3240,13 @@ mod tests {
             react_prop_count: 0,
             react_hook_profile: None,
             exceeded: fallow_output::ExceededThreshold::Crap,
+            effective_severity: None,
             severity: fallow_output::FindingSeverity::Moderate,
             crap: Some(35.5),
+            mutation: None,
             coverage_pct: None,
             coverage_tier: Some(fallow_output::CoverageTier::None),
-            coverage_source: None,
-            inherited_from: None,
-            component_rollup: None,
-            contributions: Vec::new(),
-            effective_thresholds: None,
-            threshold_source: None,
+            ..Default::default()
         };
         let narrow_ctx = fallow_output::HealthActionContext {
             opts: fallow_output::HealthActionOptions::default(),
@@ -3423,11 +3421,13 @@ mod tests {
             }
         }
 
-        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("docs")
-            .join("output-schema.json");
+        let schema_path = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("output-schema.json");
         let raw = std::fs::read_to_string(&schema_path)
             .expect("docs/output-schema.json must be readable for the drift-guard test");
         let schema: serde_json::Value = serde_json::from_str(&raw).expect("schema parses");
@@ -3487,10 +3487,12 @@ mod tests {
     #[test]
     fn no_new_post_pass_helpers_in_json_rs() {
         const POST_PASS_ALLOW_LIST: &[(&str, &str)] = &[];
-        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("report")
-            .join("json.rs");
+        let source_path = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("src")
+        .join("report")
+        .join("json.rs");
         let source = std::fs::read_to_string(&source_path).expect(
             "crates/cli/src/report/json.rs must be readable for the post-pass drift-guard test",
         );

@@ -1,33 +1,11 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
-import { API, SignatureKind, SymbolFlags } from "typescript/unstable/sync";
-import {
-  isCallExpression,
-  isClassDeclaration,
-  isClassExpression,
-  isDecorator,
-  isElementAccessExpression,
-  isExportDeclaration,
-  isExportSpecifier,
-  isFunctionBody,
-  isGetAccessorDeclaration,
-  isIdentifier,
-  isImportDeclaration,
-  isImportClause,
-  isImportSpecifier,
-  isImportTypeNode,
-  isNamespaceImport,
-  isPropertyAccessExpression,
-  isPrivateIdentifier,
-  isSetAccessorDeclaration,
-  isStringLiteralLikeNode,
-  isTypeNode,
-  isTypeQueryNode,
-} from "typescript/unstable/ast/is";
+import { ast, createApi as createBackendApi, heritageTypeName, sync } from "./backend.mjs";
 
 import { canonicalFileIdentity } from "./file-identity.mjs";
+import { packagePathTargets, projectPackage } from "./project-package.mjs";
 import { projectResult, projectState } from "./project-state.mjs";
 import {
   declarationName,
@@ -35,6 +13,7 @@ import {
   declarationsForSymbol,
   findDeclaration,
   isDeclaration,
+  isExportAnchor,
   isProjectSource,
   nodeText,
   ownerDeclaration,
@@ -49,7 +28,55 @@ import {
   symbolForDeclaration,
 } from "./semantic-identity.mjs";
 import { analyzeSymbolImpact } from "./symbol-impact.mjs";
+import { isJavaScriptFile, referenceNames } from "./reference-names.mjs";
+import { recordComputedMemberAccess } from "./computed-member-access.mjs";
+import {
+  namespaceSourceIdentity,
+  recordDynamicImportUncertainty,
+  recordNamespaceUse,
+} from "./namespace-uses.mjs";
+import {
+  isLiteralMemberName,
+  qualifierExpression,
+  referenceValueSymbol,
+  shorthandReferenceSymbols,
+} from "./shorthand-references.mjs";
+import {
+  matchingAliasEntries,
+  matchingSymbolEntries,
+  recordSymbolUncertainty,
+  targetName,
+} from "./symbol-targets.mjs";
 import { analyzeTypeCoupling } from "./type-coupling.mjs";
+import {
+  MODULE_SOURCE_EXTENSIONS,
+  isSupportedSemanticQuery,
+  semanticOpenFiles,
+  semanticOpenProjects,
+} from "./semantic-input.mjs";
+
+const { SignatureKind, SymbolFlags } = sync;
+const {
+  isCallExpression,
+  isClassDeclaration,
+  isClassExpression,
+  isDecorator,
+  isExportDeclaration,
+  isExportSpecifier,
+  isFunctionBody,
+  isGetAccessorDeclaration,
+  isIdentifier,
+  isImportDeclaration,
+  isImportSpecifier,
+  isImportTypeNode,
+  isNamespaceImport,
+  isPropertyAccessExpression,
+  isPrivateIdentifier,
+  isSetAccessorDeclaration,
+  isStringLiteralLikeNode,
+  isTypeNode,
+  isTypeQueryNode,
+} = ast;
 
 const ATTACHED_COMMENT_PATTERN = /\/\/|\/\*/u;
 const MAX_SYMBOL_USE_EVIDENCE = 1;
@@ -157,6 +184,10 @@ const REASON_ACTIONS = new Map([
     "Repair structural TypeScript diagnostics in every selected project and retry.",
   ],
   [
+    "svelte-virtual-module-exports",
+    "Run svelte-check for framework diagnostics. See https://fallow.tools/docs/analysis/type-aware/#svelte-virtual-module-exports for supported Svelte project setup.",
+  ],
+  [
     "unknown-entry-point",
     "Refresh the package entry points or pass project-relative source entry points.",
   ],
@@ -165,21 +196,22 @@ const DEFAULT_REASON_ACTION =
   "Narrow the query to a specific symbol, entry point, or healthy TypeScript project and retry.";
 const REASON_PRIORITY = new Map([
   ["blocking-diagnostics", 0],
-  ["incomplete-project-coverage", 1],
-  ["framework-contract-provenance", 2],
-  ["ambiguous-project", 3],
-  ["unknown-symbol", 4],
-  ["unknown-entry-point", 5],
-  ["decorated-declaration", 6],
-  ["optional-contract", 7],
-  ["accessor-pair", 8],
-  ["overload-set", 9],
-  ["attached-comment", 10],
-  ["abstract-declaration", 11],
-  ["dynamic-member-access", 12],
-  ["virtual-dispatch", 13],
-  ["dynamic-behavior", 14],
-  ["evidence-limit", 15],
+  ["svelte-virtual-module-exports", 1],
+  ["incomplete-project-coverage", 2],
+  ["framework-contract-provenance", 3],
+  ["ambiguous-project", 4],
+  ["unknown-symbol", 5],
+  ["unknown-entry-point", 6],
+  ["decorated-declaration", 7],
+  ["optional-contract", 8],
+  ["accessor-pair", 9],
+  ["overload-set", 10],
+  ["attached-comment", 11],
+  ["abstract-declaration", 12],
+  ["dynamic-member-access", 13],
+  ["virtual-dispatch", 14],
+  ["dynamic-behavior", 15],
+  ["evidence-limit", 16],
 ]);
 
 const actionForReason = (reasonCode) => REASON_ACTIONS.get(reasonCode) ?? DEFAULT_REASON_ACTION;
@@ -198,6 +230,22 @@ const combineOmissions = (omissions) => {
     counts.set(omission.reason_code, (counts.get(omission.reason_code) ?? 0) + omission.count);
   }
   return [...counts].map(([reason_code, count]) => ({ reason_code, count }));
+};
+
+const projectStateReason = (state) => state.reason_code ?? "blocking-diagnostics";
+
+const unavailableProjectOmissions = (states) =>
+  combineOmissions(
+    states
+      .filter((state) => state.status !== "complete")
+      .map((state) => ({ reason_code: projectStateReason(state), count: 1 })),
+  );
+
+const unavailableProjectReason = (states) => {
+  if (states.length === 0) return "no-project";
+  return (
+    unavailableProjectOmissions(states).toSorted(compareOmissions)[0]?.reason_code ?? "no-project"
+  );
 };
 
 const resultStatus = (partial) => (partial ? "partial" : "complete");
@@ -329,23 +377,15 @@ const semanticUse = (root, node, namespace) => {
   };
 };
 
-const isDefaultImportReference = (node) => isImportClause(node.parent) && node.parent.name === node;
-
 const candidateNameMatches = (candidateNames, name) => !candidateNames || candidateNames.has(name);
 
-const isIdentifierReference = (node, candidateNames, includeDefaultImports) => {
-  if (!isIdentifier(node)) return false;
-  if (candidateNameMatches(candidateNames, node.text)) return true;
-  return includeDefaultImports && isDefaultImportReference(node);
-};
-
-const isElementNameNode = (node) =>
-  isStringLiteralLikeNode(node) &&
-  isElementAccessExpression(node.parent) &&
-  node.parent.argumentExpression === node;
+const isIdentifierReference = (node, names) =>
+  isIdentifier(node) && candidateNameMatches(names, node.text);
 
 const isElementReference = (node, candidateNames) =>
-  isElementNameNode(node) && candidateNameMatches(candidateNames, node.text);
+  isStringLiteralLikeNode(node) &&
+  candidateNameMatches(candidateNames, node.text) &&
+  isLiteralMemberName(node);
 
 const entriesByName = (entries) => {
   const byName = new Map();
@@ -373,8 +413,11 @@ const symbolUseBatchState = (resolvedQueries, evidenceLimit) => {
     uncertaintiesByQuery: new Map(resolvedQueries.map(({ query }) => [query.id, new Set()])),
     declarationLocationsByQuery: new Map(resolvedQueries.map(({ query }) => [query.id, new Set()])),
     targetsByKey: new Map(),
+    targetNames: new Set(),
+    aliasEntriesByProject: new Map(),
     exportEntriesByModule: new Map(),
     exportEntriesByProject: new Map(),
+    exportedNames: new Set(),
     candidateNames: new Set(),
     classMemberEntries,
     classMemberEntriesByName: entriesByName(classMemberEntries),
@@ -389,6 +432,7 @@ const addSymbolTarget = (root, state, entry, declaration, namespace) => {
   state.declarationLocationsByQuery
     .get(entry.query.id)
     .add(locationKey(location(root, declaration.name ?? declaration)));
+  state.targetNames.add(targetName(declaration));
   const key = stableDeclarationKey(declaration, namespace);
   const targets = state.targetsByKey.get(key) ?? [];
   targets.push(entry);
@@ -399,6 +443,7 @@ const registerSymbolTargets = (root, state, entry) => {
   state.candidateNames.add(entry.query.symbol.localName);
   state.candidateNames.add(entry.query.symbol.exportedName);
   if (entry.query.symbol.declarationKind === "export") {
+    state.exportedNames.add(entry.query.symbol.exportedName);
     const moduleIdentity = canonicalFileIdentity(entry.query.symbol.absolutePath);
     const entries = state.exportEntriesByModule.get(moduleIdentity) ?? new Set();
     entries.add(entry);
@@ -409,28 +454,19 @@ const registerSymbolTargets = (root, state, entry) => {
       state.exportEntriesByProject.set(project, projectEntries);
     });
   }
-  entry.resolved.ownerContexts.forEach(({ project, declaration }) => {
-    const symbol = resolveAlias(project.checker, symbolForDeclaration(project, declaration));
-    declarationsForSymbol(project, symbol).forEach((target) => {
-      const namespaces =
-        entry.query.symbol.declarationKind === "export"
-          ? declarationNamespaces(target)
-          : new Set([entry.query.symbol.namespace]);
-      namespaces.forEach((namespace) => addSymbolTarget(root, state, entry, target, namespace));
-    });
+  entry.resolved.ownerContexts.forEach(({ declaration, anchor }) => {
+    const namespaces =
+      entry.query.symbol.declarationKind === "export"
+        ? declarationNamespaces(declaration)
+        : new Set([entry.query.symbol.namespace]);
+    namespaces.forEach((namespace) => addSymbolTarget(root, state, entry, declaration, namespace));
+    if (entry.query.symbol.declarationKind === "export" && anchor) {
+      declarationNamespaces(anchor).forEach((namespace) =>
+        addSymbolTarget(root, state, entry, anchor, namespace),
+      );
+    }
   });
   state.contractRelationsByQuery.set(entry.query.id, entry.resolved.contractRelations);
-};
-
-const matchingSymbolEntries = (project, symbol, namespace, targetsByKey) => {
-  return new Set(
-    declarationsForSymbol(project, symbol)
-      .filter((declaration) => declarationNamespaces(declaration).has(namespace))
-      .flatMap((declaration) => {
-        const key = stableDeclarationKey(declaration, namespace);
-        return targetsByKey.get(key) ?? [];
-      }),
-  );
 };
 
 const isDeclarationReference = (root, state, entry, node) => {
@@ -463,40 +499,69 @@ const importTypeSpecifier = (node) => {
   return literal && isStringLiteralLikeNode(literal) ? literal : undefined;
 };
 
-const isDynamicImportCall = (node) =>
-  isCallExpression(node) && node.expression.getText(node.getSourceFile()) === "import";
+const lexicalModuleIdentityForText = (project, sourceFile, specifierText) => {
+  if (!specifierText?.startsWith(".")) return undefined;
+  const resolved = path.resolve(path.dirname(sourceFile.fileName), specifierText);
+  const extension = path.extname(resolved);
+  const stem = extension ? resolved.slice(0, -extension.length) : resolved;
+  const candidates = [
+    resolved,
+    ...MODULE_SOURCE_EXTENSIONS.map((candidate) => `${stem}${candidate}`),
+    ...MODULE_SOURCE_EXTENSIONS.map((candidate) => path.join(resolved, `index${candidate}`)),
+  ];
+  for (const candidate of candidates) {
+    const matched = project.program.getSourceFile(candidate);
+    if (matched) return sourceFileIdentity(matched);
+    if (existsSync(candidate)) return canonicalFileIdentity(candidate);
+  }
+  return undefined;
+};
+
+const lexicalModuleIdentity = (project, specifier) =>
+  specifier
+    ? lexicalModuleIdentityForText(project, specifier.getSourceFile(), specifier.text)
+    : undefined;
 
 const moduleIdentityForSpecifier = (project, specifier) => {
   if (!specifier) return undefined;
+  const lexicalIdentity = lexicalModuleIdentity(project, specifier);
+  if (lexicalIdentity) return lexicalIdentity;
   const moduleSymbol = project.checker.getSymbolAtLocation(specifier);
-  const moduleDeclaration = declarationsForSymbol(
-    project,
-    resolveAlias(project.checker, moduleSymbol),
-  )[0];
+  const moduleDeclaration = declarationsForSymbol(project, moduleSymbol)[0];
   return moduleDeclaration ? sourceFileIdentity(moduleDeclaration.getSourceFile()) : undefined;
 };
 
 const namespaceImportDeclaration = (project, node) => {
-  const parent = node.parent;
-  if (!parent) return undefined;
-  const namespace = isPropertyAccessExpression(parent)
-    ? parent.name === node
-      ? parent.expression
-      : undefined
-    : isElementAccessExpression(parent) && parent.argumentExpression === node
-      ? parent.expression
-      : undefined;
-  if (!namespace) return undefined;
-  if (!isIdentifier(namespace)) return undefined;
+  const namespace = qualifierExpression(node);
+  if (!namespace || !isIdentifier(namespace)) return undefined;
   const symbol = project.checker.getSymbolAtLocation(namespace);
   return symbol?.declarations
     ?.map((declaration) => declaration.resolve(project))
     .find(isNamespaceImport);
 };
 
+const localAliasModuleEdgeDeclaration = (project, node) => {
+  const symbol = referenceValueSymbol(project, node);
+  return symbol?.declarations
+    ?.map((declaration) => moduleEdgeDeclaration(declaration.resolve(project)))
+    .find(Boolean);
+};
+
 const referencedModuleIdentity = (project, node) => {
+  const importType = ancestorImportType(node);
+  const lexicalImportType = importType
+    ?.getText(importType.getSourceFile())
+    .match(/import\s*\(\s*["']([^"']+)["']/u)?.[1];
+  const lexicalIdentity = lexicalModuleIdentityForText(
+    project,
+    node.getSourceFile(),
+    lexicalImportType,
+  );
+  if (lexicalIdentity) return lexicalIdentity;
   const declaration =
-    moduleEdgeDeclaration(node) ?? moduleEdgeDeclaration(namespaceImportDeclaration(project, node));
+    moduleEdgeDeclaration(node) ??
+    moduleEdgeDeclaration(namespaceImportDeclaration(project, node)) ??
+    localAliasModuleEdgeDeclaration(project, node);
   const declarationSpecifier = declaration?.moduleSpecifier;
   const specifier =
     declarationSpecifier && isStringLiteralLikeNode(declarationSpecifier)
@@ -505,13 +570,23 @@ const referencedModuleIdentity = (project, node) => {
   return moduleIdentityForSpecifier(project, specifier);
 };
 
-const isExactExportReference = (project, entry, node) =>
-  entry.query.symbol.declarationKind !== "export" ||
-  referencedModuleIdentity(project, node) ===
-    canonicalFileIdentity(entry.query.symbol.absolutePath);
+const isExactExportReference = (project, entry, node) => {
+  if (entry.query.symbol.declarationKind !== "export") return true;
+  const referencedModule =
+    referencedModuleIdentity(project, node) ?? namespaceSourceIdentity(project, node);
+  if (!referencedModule) return false;
+  const queryModule = canonicalFileIdentity(entry.query.symbol.absolutePath);
+  return (
+    referencedModule === queryModule ||
+    sourceFileIdentity(entry.resolved.declaration.getSourceFile()) === queryModule
+  );
+};
 
 const recordSymbolUse = (root, state, project, entry, node, namespace) => {
   if (isDeclarationReference(root, state, entry, node)) return;
+  if (isDeclaration(node.parent) && node.parent.name === node) return;
+  const moduleEdge = moduleEdgeDeclaration(node);
+  if (moduleEdge) return;
   if (!isExactExportReference(project, entry, node)) return;
   const evidence = state.evidenceByQuery.get(entry.query.id);
   state.totalByQuery.set(entry.query.id, state.totalByQuery.get(entry.query.id) + 1);
@@ -543,102 +618,89 @@ const classMemberEntrySetForProject = (state, project) => {
   return entries;
 };
 
-const recordSymbolUncertainty = (state, entry, reasonCode) => {
-  state.uncertaintiesByQuery.get(entry.query.id).add(reasonCode);
-};
+const isExactElementReference = (node) =>
+  isLiteralMemberName(node) && typeof node.text === "string";
 
-const isExactElementReference = (node) => isElementNameNode(node) && typeof node.text === "string";
-
-const recordStringDispatchedMemberAccess = (state, projectEntries, node) => {
-  if (!isStringLiteralLikeNode(node) || isExactElementReference(node)) return;
+const recordNameUncertainty = (state, projectEntries, node) =>
   (state.classMemberEntriesByName.get(node.text) ?? [])
     .filter((entry) => projectEntries.has(entry))
     .forEach((entry) => recordSymbolUncertainty(state, entry, "dynamic-member-access"));
+
+const recordStringDispatchedMemberAccess = (state, projectEntries, node) => {
+  if (!isStringLiteralLikeNode(node) || isExactElementReference(node)) return;
+  recordNameUncertainty(state, projectEntries, node);
 };
 
-const recordComputedMemberAccess = (state, project, entries, node) => {
-  if (
-    entries.size === 0 ||
-    state.projectsWithUnknownDynamicAccess.has(project) ||
-    !isElementAccessExpression(node) ||
-    node.argumentExpression === undefined ||
-    isStringLiteralLikeNode(node.argumentExpression)
-  ) {
-    return;
-  }
-  const receiverType = project.checker.getTypeAtLocation(node.expression);
-  const receiverProperties = project.checker.getPropertiesOfType(receiverType);
-  if (receiverProperties.length === 0) {
-    entries.forEach((entry) => recordSymbolUncertainty(state, entry, "dynamic-member-access"));
-    state.projectsWithUnknownDynamicAccess.add(project);
-    return;
-  }
-  const matched = new Set(
-    receiverProperties
-      .filter((property) => state.candidateNames.has(property.name))
-      .flatMap((property) => [
-        ...matchingSymbolEntries(project, property, "value", state.targetsByKey),
-      ]),
-  );
-  matched.forEach((entry) => recordSymbolUncertainty(state, entry, "dynamic-member-access"));
-};
-
-const recordDynamicImportUncertainty = (state, project, node) => {
-  if (!isDynamicImportCall(node)) return;
-  const specifier = node.arguments[0];
-  if (!specifier || !isStringLiteralLikeNode(specifier)) {
-    (state.exportEntriesByProject.get(project) ?? []).forEach((entry) =>
-      recordSymbolUncertainty(state, entry, "dynamic-behavior"),
-    );
-    return;
-  }
-  const moduleIdentity = moduleIdentityForSpecifier(project, specifier);
-  if (!moduleIdentity) return;
-  (state.exportEntriesByModule.get(moduleIdentity) ?? []).forEach((entry) =>
-    recordSymbolUncertainty(state, entry, "dynamic-behavior"),
-  );
-};
-
-const referenceNamespaces = (project, node, symbol) => {
+const referenceNamespaces = (project, node, rawSymbol) => {
   const alias = aliasNode(node);
   if (!alias || !isExportSpecifier(alias)) {
     return [isTypePosition(node) ? "type" : "value"];
   }
   if (alias.isTypeOnly || alias.parent?.parent?.isTypeOnly) return ["type"];
   const namespaces = new Set(
-    declarationsForSymbol(project, symbol).flatMap((declaration) => [
-      ...declarationNamespaces(declaration),
-    ]),
+    declarationsForSymbol(project, resolveAlias(project.checker, rawSymbol)).flatMap(
+      (declaration) => [...declarationNamespaces(declaration)],
+    ),
   );
   return namespaces.size > 0 ? [...namespaces] : [isTypePosition(node) ? "type" : "value"];
 };
 
-const scanSymbolUseFile = (root, state, project, sourceFile, includeDefaultImports) => {
+const surfaceEntriesForNode = (state, project, node, namespace) => {
+  // Resolving the referenced module costs checker round trips, so skip every
+  // identifier that cannot name an export query.
+  if (!state.exportedNames.has(node.text) || moduleEdgeDeclaration(node)) return new Set();
+  const moduleIdentity = referencedModuleIdentity(project, node);
+  if (!moduleIdentity) return new Set();
+  const direct = [...(state.exportEntriesByModule.get(moduleIdentity) ?? [])].filter(
+    (entry) =>
+      entry.query.symbol.exportedName === node.text && entry.query.symbol.namespace === namespace,
+  );
+  const entries = new Set(direct);
+  for (const entry of direct) {
+    for (const { declaration } of entry.resolved.ownerContexts) {
+      const symbol = resolveAlias(project.checker, symbolForDeclaration(project, declaration));
+      matchingSymbolEntries(project, symbol, namespace, state).forEach((related) =>
+        entries.add(related),
+      );
+    }
+  }
+  return entries;
+};
+
+const scanSymbolUseFile = (root, state, project, sourceFile, names) => {
   const projectEntries = classMemberEntrySetForProject(state, project);
   const nodes = [];
   visit(sourceFile, (node) => {
-    recordDynamicImportUncertainty(state, project, node);
+    recordDynamicImportUncertainty(state, project, node, moduleIdentityForSpecifier);
     if (projectEntries.size > 0) {
       recordStringDispatchedMemberAccess(state, projectEntries, node);
       recordComputedMemberAccess(state, project, projectEntries, node);
     }
-    if (isIdentifierReference(node, state.candidateNames, includeDefaultImports)) {
+    if (isIdentifierReference(node, isJavaScriptFile(sourceFile) ? undefined : names)) {
       nodes.push(node);
       return;
     }
     if (isElementReference(node, state.candidateNames)) nodes.push(node);
   });
   const symbols = project.checker.getSymbolAtLocation(nodes);
+  const references = shorthandReferenceSymbols(project, nodes, symbols, state);
+  references.unresolved.forEach((node) => recordNameUncertainty(state, projectEntries, node));
   nodes.forEach((node, index) => {
-    const symbol = resolveAlias(project.checker, symbols[index]);
-    referenceNamespaces(project, node, symbol).forEach((namespace) => {
-      const entries = matchingSymbolEntries(project, symbol, namespace, state.targetsByKey);
+    const rawSymbol = symbols[index];
+    recordNamespaceUse(state, project, node, rawSymbol);
+    referenceNamespaces(project, node, rawSymbol).forEach((namespace) => {
+      const entries = new Set([
+        ...references.symbols[index].flatMap((symbol) => [
+          ...matchingAliasEntries(project, symbol, namespace, state),
+        ]),
+        ...surfaceEntriesForNode(state, project, node, namespace),
+      ]);
       entries.forEach((entry) => recordSymbolUse(root, state, project, entry, node, namespace));
     });
   });
 };
 
-const scanSymbolUseProjects = (root, state, projects, includeDefaultImports) => {
+const scanSymbolUseProjects = (root, state, projects, names) => {
   const scannedFiles = new Set();
   let sourceScanCount = 0;
   for (const project of projects) {
@@ -647,7 +709,7 @@ const scanSymbolUseProjects = (root, state, projects, includeDefaultImports) => 
       if (scannedFiles.has(fileIdentity)) continue;
       scannedFiles.add(fileIdentity);
       sourceScanCount += 1;
-      scanSymbolUseFile(root, state, project, sourceFile, includeDefaultImports);
+      scanSymbolUseFile(root, state, project, sourceFile, names);
     }
   }
   return sourceScanCount;
@@ -656,10 +718,8 @@ const scanSymbolUseProjects = (root, state, projects, includeDefaultImports) => 
 const batchSymbolUseEvidence = (root, resolvedQueries, scanProjects, evidenceLimit) => {
   const state = symbolUseBatchState(resolvedQueries, evidenceLimit);
   resolvedQueries.forEach((entry) => registerSymbolTargets(root, state, entry));
-  const includeDefaultImports = resolvedQueries.some(
-    ({ query }) => query.symbol.exportedName === "default",
-  );
-  const sourceScanCount = scanSymbolUseProjects(root, state, scanProjects, includeDefaultImports);
+  const names = referenceNames(scanProjects, [...state.candidateNames, ...state.targetNames]);
+  const sourceScanCount = scanSymbolUseProjects(root, state, scanProjects, names);
   return {
     evidenceByQuery: state.evidenceByQuery,
     totalByQuery: state.totalByQuery,
@@ -680,8 +740,6 @@ const symbolResolutionError = (query, reasonCode, action) => ({
 });
 
 const isCompleteProjectState = (state) => state?.status === "complete";
-const selectedProjectName = (state) => state?.config ?? "the selected project";
-
 const owningProjectContexts = (statesByProject, absolutePath) =>
   [...statesByProject.entries()]
     .filter(([project]) => project.program.getSourceFile(absolutePath))
@@ -694,11 +752,11 @@ const selectSymbolContext = (
   query,
   allowDefaultFallback,
 ) => {
-  if (!DECLARATION_KINDS.has(query.symbol.declarationKind)) {
+  if (!isSupportedSemanticQuery(query) || !DECLARATION_KINDS.has(query.symbol.declarationKind)) {
     return symbolResolutionError(
       query,
       "unsupported-syntax",
-      "Use a supported declaration kind or retain the syntactic finding.",
+      "Use a supported TypeScript or JavaScript declaration or retain the syntactic finding.",
     );
   }
   let owners = owningProjectContexts(statesByProject, query.symbol.absolutePath);
@@ -721,13 +779,16 @@ const selectSymbolContext = (
   }
   const completeOwners = owners.filter(({ state }) => isCompleteProjectState(state));
   if (completeOwners.length === 0) {
-    return {
-      ...owners[0],
-      ...symbolResolutionError(
-        query,
-        "blocking-diagnostics",
-        `Repair structural diagnostics in ${selectedProjectName(owners[0].state)} and retry.`,
+    const selectedOwner = [...owners].toSorted((left, right) =>
+      compareOmissions(
+        { reason_code: projectStateReason(left.state) },
+        { reason_code: projectStateReason(right.state) },
       ),
+    )[0];
+    const reasonCode = projectStateReason(selectedOwner.state);
+    return {
+      ...selectedOwner,
+      ...symbolResolutionError(query, reasonCode, actionForReason(reasonCode)),
     };
   }
   return { owners, completeOwners };
@@ -735,7 +796,7 @@ const selectSymbolContext = (
 
 const resolvedAnchorTarget = (project, anchor, requestedSymbol) => {
   if (!anchor) return undefined;
-  if (!isExportSpecifier(anchor)) {
+  if (!isExportAnchor(anchor)) {
     return declarationNamespaces(anchor).has(requestedSymbol.namespace)
       ? { declaration: anchor, namespace: requestedSymbol.namespace }
       : undefined;
@@ -881,7 +942,7 @@ const frameworkContractRelationsFor = (root, project, declaration, contracts, me
       : "extends";
     for (const heritageType of clause.types ?? []) {
       const rawSymbol =
-        project.checker.getSymbolAtLocation(heritageType.expression) ??
+        project.checker.getSymbolAtLocation(heritageTypeName(heritageType)) ??
         project.checker.getTypeAtLocation(heritageType).aliasSymbol ??
         project.checker.getTypeAtLocation(heritageType).symbol;
       const symbol = resolveAlias(project.checker, rawSymbol);
@@ -933,7 +994,7 @@ const resolvedOwnerContext = (query, owner) => {
   const anchor = symbolQueryAnchor(owner.project, query);
   const target = resolvedAnchorTarget(owner.project, anchor, query.symbol);
   return symbolQueryResolved(owner.project, query.symbol, anchor, target)
-    ? { ...owner, ...target }
+    ? { ...owner, anchor, ...target }
     : undefined;
 };
 
@@ -1162,31 +1223,6 @@ const wildcardPattern = (target) => {
   return new RegExp(`^${escaped}$`, "u");
 };
 
-const pathWithin = (root, candidate) =>
-  candidate === root || candidate.startsWith(`${root}${path.sep}`);
-
-const packageAt = (directory) => {
-  const packageFile = path.join(directory, "package.json");
-  if (!existsSync(packageFile)) return undefined;
-  try {
-    return { root: directory, json: JSON.parse(readFileSync(packageFile, "utf8")) };
-  } catch {
-    return { root: directory, json: {} };
-  }
-};
-
-const projectPackage = (root, project) => {
-  const normalizedRoot = path.resolve(root);
-  let current = path.dirname(project.configFileName);
-  while (pathWithin(normalizedRoot, current)) {
-    const found = packageAt(current);
-    if (found) return found;
-    if (current === normalizedRoot) break;
-    current = path.dirname(current);
-  }
-  return { root: normalizedRoot, json: {} };
-};
-
 const ancestorRoots = (root, start) => {
   const normalizedRoot = path.resolve(root);
   const roots = [];
@@ -1252,12 +1288,6 @@ const addPathEntry = (entries, sourceFiles, roots, target) => {
       addEntry(entries, sourceFiles.get(canonicalFileIdentity(candidate))),
     ),
   );
-};
-
-const packagePathTargets = (project, packageJson) => {
-  const packageName = packageJson.name;
-  if (typeof packageName !== "string") return [];
-  return project.compilerOptions.paths?.[packageName] ?? [];
 };
 
 const discoverEntryPoints = (root, project, requested) => {
@@ -1376,6 +1406,13 @@ const signatureTypes = (project, type, anchor) =>
   );
 
 const checkerTypeChildren = (project, type, anchor, hasNamedDeclaration) => {
+  if (type.isTypeParameter()) {
+    const constraint = safeCheckerValue(
+      () => project.checker.getConstraintOfTypeParameter(type),
+      undefined,
+    );
+    return constraint ? [constraint] : [];
+  }
   const structural = [
     ...(type.getTypes() ?? []),
     ...safeCheckerValue(() => type.getAliasTypeArguments(), []),
@@ -1546,12 +1583,9 @@ const graphProjects = (snapshot, explicitProjects) =>
 const readyProjectStates = (query, states) => {
   const ready = states.filter((state) => state.status === "complete");
   if (ready.length > 0) return { ready };
+  const reasonCode = unavailableProjectReason(states);
   return {
-    error: unavailable(
-      query,
-      states.length === 0 ? "no-project" : "blocking-diagnostics",
-      "Pass a healthy tsconfig containing the package entry points and retry.",
-    ),
+    error: unavailable(query, reasonCode, actionForReason(reasonCode)),
   };
 };
 
@@ -1683,7 +1717,7 @@ const analyzeApiSurface = (root, query, states, evidenceLimit) => {
         reason_code: "evidence-limit",
         count: omissionCount,
       },
-      { reason_code: "blocking-diagnostics", count: unavailableProjectCount },
+      ...unavailableProjectOmissions(states),
       { reason_code: "unknown-entry-point", count: missingEntryPointCount },
     ],
   });
@@ -1695,8 +1729,10 @@ const emptySemanticAnalysis = (queries) => ({
   results: queries.map((query) =>
     unavailable(
       query,
-      "no-project",
-      "Pass an explicit tsconfig with --type-aware-project and retry.",
+      isSupportedSemanticQuery(query) ? "no-project" : "unsupported-syntax",
+      isSupportedSemanticQuery(query)
+        ? "Pass an explicit tsconfig with --type-aware-project and retry."
+        : "Use a supported TypeScript or JavaScript declaration or retain the syntactic finding.",
     ),
   ),
   phaseTimings: { project_setup: 0, diagnostics: 0, semantic_queries: 0 },
@@ -1755,13 +1791,14 @@ const analyzeGraphSemanticQuery = (root, query, graphStates, evidenceLimit) => {
     return analyzeApiSurface(root, query, graphStates, evidenceLimit);
   }
   return analyzeTypeCoupling(
-    { root, query, states: graphStates, evidenceLimit },
+    { root, query, states: graphStates, evidenceLimit: query.evidenceLimit ?? evidenceLimit },
     {
       boundedResult,
       discoverEntryPoints,
       missingEntryPoints,
       publicApiGraph,
       readyProjectStates,
+      unavailableProjectOmissions,
       uniqueSorted,
     },
   );
@@ -1841,6 +1878,7 @@ const recordAbstainedProjectOutcome = (state, result) => {
     "no-project",
     "ambiguous-project",
     "blocking-diagnostics",
+    "svelte-virtual-module-exports",
     "unknown-symbol",
     "incomplete-project-coverage",
   ]);
@@ -1923,15 +1961,6 @@ const emptyRequestedAnalysis = () => ({
   phaseTimings: { project_setup: 0, diagnostics: 0, semantic_queries: 0 },
   warnings: [],
 });
-
-const semanticOpenFiles = (queries) =>
-  queries.filter((query) => query.symbol).map((query) => query.symbol.absolutePath);
-
-const semanticOpenProjects = (root, projects) => {
-  if (projects.length > 0) return projects.map((project) => project.absolutePath);
-  const conventionalProject = path.join(root, "tsconfig.json");
-  return existsSync(conventionalProject) ? [conventionalProject] : [];
-};
 
 const semanticProjectSelection = (snapshot, openProjects, openFiles, allowDefaultFallback) => {
   const explicitProjects = openProjects
@@ -2067,7 +2096,7 @@ const executeDisposableSemanticAnalysis = (input) => {
 
 export const analyzeSemanticQueries = (
   { root, projects, queries, evidenceLimit },
-  { createApi = (cwd) => new API({ cwd }) } = {},
+  { createApi = (cwd) => createBackendApi({ cwd }) } = {},
 ) => {
   if (queries.length === 0) return emptyRequestedAnalysis();
   const setupStartedAt = performance.now();
@@ -2086,7 +2115,10 @@ export const analyzeSemanticQueries = (
   }
 };
 
-export const createSemanticSession = (root, { createApi = (cwd) => new API({ cwd }) } = {}) => {
+export const createSemanticSession = (
+  root,
+  { createApi = (cwd) => createBackendApi({ cwd }) } = {},
+) => {
   const api = createApi(root);
   const state = {
     openFiles: new Set(),

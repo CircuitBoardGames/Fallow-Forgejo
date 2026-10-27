@@ -7,6 +7,7 @@ fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConf
     FallowConfig {
         type_aware: fallow_config::TypeAwareConfig::default(),
         schema: None,
+        minimum_version: None,
         extends: vec![],
         entry: vec![],
         ignore_patterns: vec![],
@@ -14,6 +15,7 @@ fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConf
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -22,7 +24,10 @@ fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConf
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
+        similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -30,6 +35,7 @@ fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConf
         plugins: vec![],
         rule_packs: vec![],
         dynamically_loaded: vec![],
+        markup_extensions: vec![],
         overrides: vec![],
         regression: None,
         audit: fallow_config::AuditConfig::default(),
@@ -41,7 +47,9 @@ fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConf
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true, None)
@@ -213,8 +221,8 @@ fn is_unused(unused: &[String], suffix: &str) -> bool {
 }
 
 #[test]
-fn manifest_entries_seed_plugin_trees_from_kibana_jsonc() {
-    let root = fixture_path("manifest-entries-kibana");
+fn manifest_entries_seed_plugin_trees_from_manifests() {
+    let root = fixture_path("manifest-entries-external");
     let config = manifest_config(&root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
     let unused = unused_rel_paths(&results);
@@ -249,7 +257,7 @@ fn manifest_entries_seed_plugin_trees_from_kibana_jsonc() {
 fn manifest_entries_are_load_bearing() {
     // Neuter: with the external plugin removed, the plugin trees have no entry
     // point and must report as unused, proving manifestEntries is what seeds them.
-    let root = fixture_path("manifest-entries-kibana");
+    let root = fixture_path("manifest-entries-external");
     let mut config = manifest_config(&root);
     config.external_plugins = vec![];
     let results = fallow_core::analyze(&config).expect("analysis should succeed");

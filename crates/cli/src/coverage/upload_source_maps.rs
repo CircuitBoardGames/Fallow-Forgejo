@@ -1,9 +1,10 @@
-//! `fallow coverage upload-source-maps` - upload build source maps to fallow cloud.
+//! `fallow coverage upload-source-maps` - upload build source maps to Fallow Cloud.
 //!
 //! This is a CI-side helper for bundled runtime coverage. The beacon reports
 //! coverage against deployed bundle paths; source maps uploaded here let the
 //! cloud resolver map those positions back to original source files.
 
+use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -13,6 +14,7 @@ use colored::Colorize as _;
 use fallow_engine::changed_files::clear_ambient_git_env;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
@@ -20,7 +22,13 @@ use crate::api::{
     retry_delay_for_status, sanitize_network_error, should_retry_status,
     try_api_agent_with_timeout,
 };
-use crate::coverage::upload_common::{self, take_last_two_segments, url_encode_path_segment};
+use crate::coverage::source_map_sources::{
+    UnresolvedMap, find_unresolved_map, warn_unresolved_maps,
+};
+use crate::coverage::upload_common::{
+    self, take_last_two_segments, to_posix_string, url_encode_path_segment,
+};
+use crate::report::format_bytes;
 
 const LOG_PREFIX: &str = "fallow coverage upload-source-maps";
 const DEFAULT_ENDPOINT: &str = "https://api.fallow.cloud";
@@ -86,8 +94,7 @@ fn run_inner(args: &UploadSourceMapsArgs, root: &Path) -> Result<(), UploadSourc
         )));
     }
 
-    let include_patterns = vec![args.include.clone()];
-    let include = compile_glob_set(&include_patterns, "--include")?;
+    let include = compile_glob_set(std::slice::from_ref(&args.include), "--include")?;
     let exclude = compile_glob_set(&args.exclude, "--exclude")?;
     let repo = resolve_repo_name(args.repo.as_deref(), root)?;
     let git_sha = resolve_git_sha(args.git_sha.as_deref(), root)?;
@@ -102,11 +109,61 @@ fn run_inner(args: &UploadSourceMapsArgs, root: &Path) -> Result<(), UploadSourc
 
     if args.dry_run {
         print_dry_run(&repo, &git_sha, args.endpoint.as_deref(), &maps);
+        check_maps_for_dry_run(root, &maps);
+        println!("{LOG_PREFIX}: dry run, no uploads performed");
         return Ok(());
     }
 
     let api_key = resolve_api_key()?;
-    upload_maps(args, &repo, &git_sha, &api_key, &maps)
+    upload_maps(args, root, &repo, &git_sha, &api_key, &maps)
+}
+
+/// Warns, without failing, when maps point at sources that are not in the
+/// repository. A build may upload from a stage without the original sources,
+/// so a missing file is a strong signal but not proof of a broken map.
+fn warn_unresolved_sources(repo_root: &Path, ready: &[PreparedSourceMap], total: usize) {
+    let unresolved: Vec<UnresolvedMap> = ready
+        .iter()
+        .filter_map(|prepared| unresolved_map(repo_root, prepared))
+        .collect();
+    warn_unresolved_maps(LOG_PREFIX, &unresolved, total);
+}
+
+fn unresolved_map(repo_root: &Path, prepared: &PreparedSourceMap) -> Option<UnresolvedMap> {
+    let map_path = prepared.candidate.map_path.as_deref()?;
+    find_unresolved_map(repo_root, map_path, &prepared.source_map)
+}
+
+/// Runs the same per-map checks as an upload, one map at a time, so a dry run
+/// never holds every parsed map in memory and still reports maps that an
+/// upload would reject.
+fn check_maps_for_dry_run(repo_root: &Path, maps: &[SourceMapCandidate]) {
+    let mut unresolved = Vec::new();
+    let mut failed = Vec::new();
+    for candidate in maps {
+        warn_large_source_map(candidate);
+        match prepare_source_map(candidate) {
+            MapOutcome::Ready(prepared) => unresolved.extend(unresolved_map(repo_root, &prepared)),
+            outcome @ MapOutcome::Failed { .. } => failed.push(outcome),
+            MapOutcome::Success => {}
+        }
+    }
+    warn_unresolved_maps(LOG_PREFIX, &unresolved, maps.len());
+    for outcome in &failed {
+        if let MapOutcome::Failed {
+            file_name, reason, ..
+        } = outcome
+        {
+            eprintln!("  {} {file_name} ({reason})", "x".red());
+        }
+    }
+    if !failed.is_empty() {
+        eprintln!(
+            "{LOG_PREFIX}: {} of {} maps would fail to upload",
+            failed.len(),
+            maps.len()
+        );
+    }
 }
 
 fn resolve_build_dir(root: &Path, dir: &Path) -> PathBuf {
@@ -211,6 +268,11 @@ fn validate_repo_name(repo: &str) -> Result<&str, UploadSourceMapsError> {
             "repo name must not contain '..' or backslashes".to_owned(),
         ));
     }
+    if repo == "." {
+        return Err(UploadSourceMapsError::Validation(
+            "repo name must not be '.'; pass --repo owner/repo".to_owned(),
+        ));
+    }
     Ok(repo)
 }
 
@@ -223,20 +285,14 @@ fn resolve_git_sha(explicit: Option<&str>, root: &Path) -> Result<String, Upload
     {
         sha
     } else {
-        let mut command = Command::new("git");
-        command.args(["rev-parse", "HEAD"]).current_dir(root);
-        clear_ambient_git_env(&mut command);
-        let output = command.output().map_err(|_| {
-            UploadSourceMapsError::Validation(
-                "unable to determine git SHA; pass --git-sha or set $GITHUB_SHA".to_owned(),
-            )
-        })?;
-        if !output.status.success() {
-            return Err(UploadSourceMapsError::Validation(
-                "unable to determine git SHA; pass --git-sha or set $GITHUB_SHA".to_owned(),
-            ));
-        }
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        fallow_engine::repo_refs::head_sha(root)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                UploadSourceMapsError::Validation(
+                    "unable to determine git SHA; pass --git-sha or set $GITHUB_SHA".to_owned(),
+                )
+            })?
     };
     validate_git_sha(&sha)?;
     Ok(sha)
@@ -302,7 +358,50 @@ fn collect_source_maps(
     };
     collect_source_maps_inner(&mut input, dir)?;
     maps.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    if strip_path {
+        key_colliding_file_names_by_path(&mut maps);
+    }
     Ok(maps)
+}
+
+const MAX_REPORTED_COLLISIONS: usize = 5;
+
+/// The cloud stores one map per `fileName` for a commit, so a second map with
+/// the same basename would replace the first (issue #3298). Key each map in a
+/// colliding group by its path in the build directory instead. Paths in one
+/// directory tree are unique, and a basename contains no `/`, so the result
+/// has no collisions. Maps with a unique basename keep the basename key.
+fn key_colliding_file_names_by_path(maps: &mut [SourceMapCandidate]) {
+    let mut counts: FxHashMap<String, usize> = FxHashMap::default();
+    for map in maps.iter() {
+        *counts.entry(map.file_name.clone()).or_default() += 1;
+    }
+    let mut renamed: Vec<String> = Vec::new();
+    for map in maps.iter_mut() {
+        if counts.get(&map.file_name).copied().unwrap_or(0) > 1 {
+            map.file_name = to_posix_string(&map.rel_path);
+            renamed.push(map.file_name.clone());
+        }
+    }
+    if renamed.is_empty() {
+        return;
+    }
+    let mut note = format!(
+        "{LOG_PREFIX}: {} source maps share a file name with another map, so each one is \
+         uploaded under its path in the build directory:",
+        renamed.len()
+    );
+    for name in renamed.iter().take(MAX_REPORTED_COLLISIONS) {
+        let _ = write!(note, "\n  {name}");
+    }
+    if renamed.len() > MAX_REPORTED_COLLISIONS {
+        let _ = write!(
+            note,
+            "\n  ... and {} more",
+            renamed.len() - MAX_REPORTED_COLLISIONS
+        );
+    }
+    eprintln!("{note}");
 }
 
 struct SourceMapWalkInput<'a> {
@@ -407,10 +506,6 @@ fn validate_file_name(file_name: &str) -> Result<(), UploadSourceMapsError> {
         )));
     }
     Ok(())
-}
-
-fn to_posix_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
 }
 
 fn resolve_api_key() -> Result<String, UploadSourceMapsError> {
@@ -664,6 +759,7 @@ fn securely_open_source_map(candidate: &SourceMapCandidate) -> std::io::Result<s
 
 fn upload_maps(
     args: &UploadSourceMapsArgs,
+    repo_root: &Path,
     repo: &str,
     git_sha: &str,
     api_key: &str,
@@ -673,6 +769,7 @@ fn upload_maps(
     if ready.is_empty() {
         return Err(UploadSourceMapsError::Partial(outcomes));
     }
+    warn_unresolved_sources(repo_root, &ready, maps.len());
 
     print_upload_source_maps_summary(args, repo, git_sha, maps);
 
@@ -1082,26 +1179,6 @@ fn print_dry_run(
     if maps.len() > 20 {
         println!("  ... and {} more", maps.len() - 20);
     }
-    println!("{LOG_PREFIX}: dry run, no uploads performed");
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "source map byte sizes are well under f64 precision loss range"
-)]
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.0} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]
@@ -1177,6 +1254,29 @@ mod tests {
 
         let file_names: Vec<&str> = maps.iter().map(|map| map.file_name.as_str()).collect();
         assert_eq!(file_names, vec!["assets/app.js.map", "root.js.map"]);
+    }
+
+    #[test]
+    fn collect_source_maps_keys_colliding_basenames_by_path() {
+        let dir = tempdir().expect("tempdir");
+        for sub in ["consumers/base", "consumers/feed"] {
+            std::fs::create_dir_all(dir.path().join(sub)).expect("consumer dir");
+            std::fs::write(dir.path().join(sub).join("index.js.map"), "{}").expect("map");
+        }
+        std::fs::write(dir.path().join("consumers/base/worker.js.map"), "{}").expect("map");
+        let include = compile_glob_set(&["**/*.map".to_owned()], "--include").unwrap();
+        let exclude = compile_glob_set(&[], "--exclude").unwrap();
+
+        let maps = collect_source_maps(dir.path(), dir.path(), &include, &exclude, true).unwrap();
+        let file_names: Vec<&str> = maps.iter().map(|map| map.file_name.as_str()).collect();
+        assert_eq!(
+            file_names,
+            vec![
+                "consumers/base/index.js.map",
+                "worker.js.map",
+                "consumers/feed/index.js.map",
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -1562,6 +1662,7 @@ mod tests {
         assert!(validate_repo_name("").is_err());
         assert!(validate_repo_name("acme/../widgets").is_err());
         assert!(validate_repo_name("acme\\widgets").is_err());
+        assert!(validate_repo_name(".").is_err());
     }
 
     #[test]
@@ -1636,19 +1737,6 @@ mod tests {
             display_endpoint_url(Some("http://localhost:3000/"), "owner/repo"),
             "http://localhost:3000/v1/coverage/owner%2Frepo/source-maps"
         );
-    }
-
-    #[test]
-    fn format_bytes_scales_through_units() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(2 * 1024), "2 KiB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
-        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
-    }
-
-    #[test]
-    fn to_posix_string_normalizes_separators() {
-        assert_eq!(to_posix_string(Path::new("a/b/c.map")), "a/b/c.map");
     }
 
     #[test]

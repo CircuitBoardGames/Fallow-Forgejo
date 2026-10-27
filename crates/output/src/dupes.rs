@@ -12,13 +12,13 @@ use fallow_types::workspace::WorkspaceDiagnostic;
 use serde::Serialize;
 
 use crate::GroupByMode;
-use crate::root_envelopes::{RootEnvelopeMode, attach_telemetry_meta, serialize_named_json_output};
+use crate::root_envelopes::{attach_telemetry_meta, serialize_named_json_output};
 
 /// Current schema version for `fallow dupes --format json`.
-pub const DUPES_SCHEMA_VERSION: u32 = 8;
+pub const DUPES_SCHEMA_VERSION: u32 = 10;
 
 /// Current schema version for programmatic duplication JSON.
-pub const DUPES_PROGRAMMATIC_SCHEMA_VERSION: u32 = 2;
+pub const DUPES_PROGRAMMATIC_SCHEMA_VERSION: u32 = 4;
 
 /// Schema projection for the duplication envelope's CLI and programmatic
 /// version lineages.
@@ -49,6 +49,21 @@ pub struct DupesOutput<Report, Group> {
     /// Duplication report body, flattened into the envelope root.
     #[serde(flatten)]
     pub report: Report,
+    /// Number of clone groups carried in `clone_groups[]`.
+    pub clone_groups_shown: usize,
+    /// Number of scoped-corpus clone groups withheld from `clone_groups[]` by
+    /// a presentation cap such as `--top`. `0` on an untruncated run, so
+    /// `clone_groups_shown + clone_groups_omitted == stats.clone_groups`
+    /// always holds and `stats` keeps describing the whole measured corpus.
+    pub clone_groups_omitted: usize,
+    /// Number of clone families carried in `clone_families[]`.
+    pub clone_families_shown: usize,
+    /// Number of scoped-corpus clone families withheld from `clone_families[]`
+    /// by a presentation cap such as `--top`, which rebuilds the families from
+    /// the groups that survived the cap. `0` on an untruncated run, so
+    /// `clone_families_shown + clone_families_omitted == stats.clone_families`
+    /// always holds and `stats` keeps describing the whole measured corpus.
+    pub clone_families_omitted: usize,
     /// Grouping mode when `--group-by` was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grouped_by: Option<GroupByMode>,
@@ -58,15 +73,45 @@ pub struct DupesOutput<Report, Group> {
     /// Grouped findings; present only in grouped output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<Group>>,
+    /// This run's view of the loaded baseline, present only in baseline runs.
+    /// Carries the staleness counts, the advisory verdict and `gate_trips`, the
+    /// same boolean `--fail-on-stale-baseline` exits on, so a CI integration
+    /// reads one field instead of restating the rule. Read `change_scoped`
+    /// before dividing `matched_entries` by `baseline_entries`: a narrowed run
+    /// can report `matched_entries: 0` on a healthy baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_staleness: Option<crate::BaselineStaleness>,
+    /// The verdict of every gate this run armed, keyed by name, absent when
+    /// it armed none. `dupes` has no default exit rule: a run with no armed
+    /// gate always exits 0, so an absent object means that the run passed.
+    /// `--fail-on-issues` and `--ci` arm `duplication-findings`, which fails
+    /// on any clone group. A gate fails the build when `status` is `fail` AND
+    /// `enforced` is true. See [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run RECEIVED, keyed by name,
+    /// absent when it was asked for nothing. An entry whose `status` is not
+    /// `applied` means the run could not do what it was asked and reported
+    /// something WIDER instead, so what follows is a valid report of a scope
+    /// nobody requested. Honoured requests are published too, with
+    /// `status: "applied"`, so an absent object means "nothing was asked for",
+    /// never "nothing failed". See [`crate::RequestOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
+    /// Applied package Git refs, omitted outside package-baseline runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_baselines: Vec<crate::PackageBaselineStatus>,
     /// `_meta` block with metric / rule definitions, emitted when `--explain`
     /// is passed (always present in MCP responses).
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
-    /// Workspace-discovery diagnostics surfaced during config load
+    /// Workspace-discovery and source-discovery diagnostics for the run
     /// (issue #473). See `CheckOutput::workspace_diagnostics` for the full
     /// contract; the same list is repeated on each top-level command's
     /// envelope so single-command consumers see it without having to look at
-    /// a separate top-level field.
+    /// a separate top-level field. A standalone `fallow dupes` run has no
+    /// dead-code analyze pass, so the two analysis-stage kinds never appear
+    /// here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Read-only follow-up commands computed from this run's findings. See
@@ -87,15 +132,31 @@ pub struct DupesOutputInput<Report, Group> {
     pub elapsed: Duration,
     /// Duplication report body to flatten into the envelope root.
     pub report: Report,
+    /// Number of clone groups carried in `clone_groups[]`.
+    pub clone_groups_shown: usize,
+    /// Number of scoped-corpus clone groups withheld by a presentation cap.
+    pub clone_groups_omitted: usize,
+    /// Number of clone families carried in `clone_families[]`.
+    pub clone_families_shown: usize,
+    /// Number of scoped-corpus clone families withheld by a presentation cap.
+    pub clone_families_omitted: usize,
     /// Grouping mode when `--group-by` was passed.
     pub grouped_by: Option<GroupByMode>,
     /// Total finding count across all groups, for grouped output.
     pub total_issues: Option<usize>,
     /// Grouped findings, for grouped output.
     pub groups: Option<Vec<Group>>,
+    /// This run's view of the loaded duplication baseline, for baseline runs.
+    pub baseline_staleness: Option<crate::BaselineStaleness>,
+    /// Every gate this run evaluated, absent when it evaluated none.
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run received, absent when it
+    /// was asked for nothing.
+    pub request_outcomes: Option<crate::RequestOutcomes>,
     /// `_meta` block to attach when `--explain` was passed.
     pub meta: Option<Meta>,
-    /// Workspace-discovery diagnostics surfaced during config load.
+    /// Workspace-discovery and source-discovery diagnostics. See
+    /// `CheckOutput::workspace_diagnostics` for the contract.
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Read-only follow-up commands computed from this run's findings.
     pub next_steps: Vec<NextStep>,
@@ -111,9 +172,17 @@ pub fn build_dupes_output<Report, Group>(
         version: ToolVersion(input.version),
         elapsed_ms: ElapsedMs(input.elapsed.as_millis() as u64),
         report: input.report,
+        clone_groups_shown: input.clone_groups_shown,
+        clone_groups_omitted: input.clone_groups_omitted,
+        clone_families_shown: input.clone_families_shown,
+        clone_families_omitted: input.clone_families_omitted,
         grouped_by: input.grouped_by,
         total_issues: input.total_issues,
         groups: input.groups,
+        baseline_staleness: input.baseline_staleness,
+        gate_outcomes: input.gate_outcomes,
+        request_outcomes: input.request_outcomes,
+        package_baselines: Vec::new(),
         meta: input.meta,
         workspace_diagnostics: input.workspace_diagnostics,
         next_steps: input.next_steps,
@@ -128,14 +197,13 @@ pub fn build_dupes_output<Report, Group>(
 /// JSON.
 pub fn serialize_dupes_json_output<Report, Group>(
     output: DupesOutput<Report, Group>,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error>
 where
     Report: Serialize,
     Group: Serialize,
 {
-    let mut value = serialize_named_json_output(output, "dupes", mode)?;
+    let mut value = serialize_named_json_output(output, "dupes")?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -294,10 +362,17 @@ mod tests {
     #[test]
     fn dupes_json_output_uses_output_owned_root_contract() {
         let output = build_dupes_output(DupesOutputInput::<_, serde_json::Value> {
+            gate_outcomes: None,
+            request_outcomes: None,
+            baseline_staleness: None,
             schema_version: 7,
             version: "0.0.0".to_string(),
             elapsed: Duration::from_millis(5),
             report: json!({"stats": {"clone_groups": 0}}),
+            clone_groups_shown: 0,
+            clone_groups_omitted: 0,
+            clone_families_shown: 0,
+            clone_families_omitted: 0,
             grouped_by: None,
             total_issues: None,
             groups: None,
@@ -306,9 +381,8 @@ mod tests {
             next_steps: Vec::new(),
         });
 
-        let value =
-            serialize_dupes_json_output(output, RootEnvelopeMode::Tagged, Some("run-dupes"))
-                .expect("dupes output should serialize");
+        let value = serialize_dupes_json_output(output, Some("run-dupes"))
+            .expect("dupes output should serialize");
 
         assert_eq!(value["kind"], "dupes");
         assert_eq!(value["_meta"]["telemetry"]["analysis_run_id"], "run-dupes");

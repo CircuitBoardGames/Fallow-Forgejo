@@ -9,7 +9,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ciWorkflowRelativePath = ".github/workflows/ci.yml";
 const requiredPolicyPaths = [
   ".claude/hooks/pre-bash-guard.py",
-  ".githooks/pre-push",
+  "hk.pkl",
   ciWorkflowRelativePath,
   "scripts/scaffold-analyzer-plan.mjs",
 ];
@@ -19,37 +19,30 @@ const optionalPolicyPaths = [
   ".codex/hooks/pre-bash-guard.py",
 ];
 const fullValidationPaths = [
-  ".githooks/pre-push",
+  "hk.pkl",
   "scripts/scaffold-analyzer-plan.mjs",
   "docs/development/quality-gates.md",
   ".codex/references/quality-gates.md",
 ];
 
 const normalTestCommand = "cargo test --workspace --lib --bins --tests --examples";
+// CI runs the same target set through cargo-nextest with the `ci` profile.
+const ciNextestCommand =
+  "cargo nextest run --profile ci --workspace --lib --bins --tests --examples";
+// CI splits the same target set over two Check jobs.
+const ciPartitionedNextestCommand = `${ciNextestCommand} --partition hash:\${{ matrix.partition }}/2`;
 const benchCompileCommand = "cargo check --workspace --benches";
 
-const commandScopes = (command) =>
-  command
-    .split(/\s+/u)
-    .slice(1)
-    .filter((token) => !token.startsWith("-"));
-
-const assertPreCommitCoversJavaScriptScopes = (hook, packageJson) => {
-  const lintScopes = commandScopes(packageJson.scripts["lint:js"]);
-  const formatScopes = commandScopes(packageJson.scripts["fmt:js:check"]);
-  assert.deepEqual(lintScopes, formatScopes, "root JavaScript lint and format scopes must agree");
-
-  const pathExpression = hook.match(/grep -E '(\^\([^']+\))'/u)?.[1];
-  assert.ok(pathExpression, "pre-commit hook must contain a staged JavaScript path expression");
-  const hookScopes = new Set(pathExpression.slice(2, -1).split("|"));
-
-  for (const scope of lintScopes) {
-    const hookScope = scope.includes(".") && !scope.includes("/") ? `${scope}$` : `${scope}/`;
-    assert.ok(
-      hookScopes.has(hookScope.replaceAll(".", "\\.")),
-      `pre-commit JavaScript path expression is missing ${scope}`,
-    );
-  }
+const guardedToolCommand = (script, dependency, executable) => {
+  const segments = script.split("&&").map((segment) => segment.trim());
+  assert.deepEqual(
+    segments.slice(0, 1),
+    [`node scripts/assert-local-resolution.mjs ${dependency}`],
+    `${executable} must assert local resolution in its main script body`,
+  );
+  assert.equal(segments.length, 2, `${executable} must have one guarded tool command`);
+  assert.match(segments[1], new RegExp(`^${executable}(?:\\s|$)`, "u"));
+  return segments[1];
 };
 
 const existingPaths = (root, paths) =>
@@ -131,12 +124,19 @@ const yamlRunCommands = (text) => {
 
 const assertCiWorkspaceTestCommands = (text) => {
   const workspaceTestCommands = yamlRunCommands(text).filter(
-    (command) => command.includes("cargo test") && command.includes("--workspace"),
+    (command) =>
+      (command.includes("cargo test") || command.includes("cargo nextest run")) &&
+      command.includes("--workspace"),
   );
 
   assert.notEqual(workspaceTestCommands.length, 0, "CI must execute workspace tests");
   for (const command of workspaceTestCommands) {
-    assert.equal(command, normalTestCommand, `unsafe CI workspace test command: ${command}`);
+    assert.ok(
+      command === normalTestCommand ||
+        command === ciNextestCommand ||
+        command === ciPartitionedNextestCommand,
+      `unsafe CI workspace test command: ${command}`,
+    );
   }
 };
 
@@ -153,15 +153,15 @@ test("Claude routes command policy through the shared repository contract", () =
   assert.match(claude, /@docs\/README\.md/u);
 });
 
-test("pre-commit JavaScript gate covers the root lint and format scopes", () => {
-  const hook = readFileSync(join(repoRoot, ".githooks/pre-commit"), "utf8");
+test("root tool scripts do not rely on skippable npm lifecycle guards", () => {
   const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
-
-  assertPreCommitCoversJavaScriptScopes(hook, packageJson);
-  assert.throws(
-    () => assertPreCommitCoversJavaScriptScopes(hook.replace("|scripts/|", "|"), packageJson),
-    /missing scripts/u,
-  );
+  guardedToolCommand(packageJson.scripts.commitlint, "@commitlint/cli", "commitlint");
+  guardedToolCommand(packageJson.scripts["lint:js"], "oxlint", "oxlint");
+  guardedToolCommand(packageJson.scripts["fmt:js"], "oxfmt", "oxfmt");
+  guardedToolCommand(packageJson.scripts["fmt:js:check"], "oxfmt", "oxfmt");
+  assert.equal(packageJson.scripts["prelint:js"], undefined);
+  assert.equal(packageJson.scripts["prefmt:js"], undefined);
+  assert.equal(packageJson.scripts["prefmt:js:check"], undefined);
 });
 
 test("normal test guidance never executes benchmark targets", () => {

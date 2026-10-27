@@ -156,6 +156,495 @@ snapshots:
     );
 }
 
+/// Issue #2909: with `packageManager` set, pnpm 12 writes `pnpm-lock.yaml` as
+/// two YAML documents. The first holds the package manager environment. The
+/// second holds the project graph, which resolves the override target.
+#[test]
+fn override_resolved_in_second_pnpm_lockfile_document_is_used() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"repro","private":true,"packageManager":"pnpm@12.6.0","devDependencies":{"@types/node":"22.20.4"}}"#,
+    )
+    .expect("write root package.json");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "overrides:\n  undici-types: 6.23.0\n  pnpm: 12.6.0\n  left-pad: 1.3.0\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    fs::write(root.join("index.ts"), "export {};\n").expect("write index.ts");
+    fs::write(
+        root.join("pnpm-lock.yaml"),
+        r"---
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    configDependencies: {}
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.6.0
+        version: 12.6.0
+
+packages:
+
+  pnpm@12.6.0:
+    resolution: {integrity: sha512-p}
+
+snapshots:
+
+  pnpm@12.6.0: {}
+
+---
+lockfileVersion: '9.0'
+
+overrides:
+  undici-types: 6.23.0
+
+importers:
+
+  .:
+    devDependencies:
+      '@types/node':
+        specifier: 22.20.4
+        version: 22.20.4
+
+packages:
+
+  '@types/node@22.20.4':
+    resolution: {integrity: sha512-n}
+
+  undici-types@6.23.0:
+    resolution: {integrity: sha512-u}
+
+snapshots:
+
+  '@types/node@22.20.4':
+    dependencies:
+      undici-types: 6.23.0
+
+  undici-types@6.23.0: {}
+",
+    )
+    .expect("write pnpm lockfile");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let actual: FxHashSet<&str> = results
+        .unused_dependency_overrides
+        .iter()
+        .map(|finding| finding.entry.target_package.as_str())
+        .collect();
+
+    // `pnpm` resolves only in the package manager document, so it must stay
+    // reported: that document does not hold project packages.
+    assert_eq!(
+        actual,
+        FxHashSet::from_iter(["pnpm", "left-pad"]),
+        "the second lockfile document resolves undici-types; got {:?}",
+        results.unused_dependency_overrides
+    );
+}
+
+// Trimmed from a real `bun install` run (bun 1.3.x); keeps bun's trailing
+// commas so the JSONC dialect is exercised end to end. `ws` is a transitive
+// dependency of `happy-dom`, declared in no dependency section.
+const BUN_LOCK_TRANSITIVE_WS: &str = r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "issue-2341-bun-overrides",
+      "devDependencies": {
+        "happy-dom": "^20.10.6",
+      },
+    },
+  },
+  "overrides": {
+    "ws": "^8.21.0",
+  },
+  "packages": {
+    "@types/whatwg-mimetype": ["@types/whatwg-mimetype@3.0.2", "", {}, "sha512-c2"],
+    "happy-dom": ["happy-dom@20.11.6", "", { "dependencies": { "@types/whatwg-mimetype": "^3.0.2", "whatwg-mimetype": "^3.0.0", "ws": "^8.21.0" } }, "sha512-Hl"],
+    "whatwg-mimetype": ["whatwg-mimetype@3.0.0", "", {}, "sha512-nt"],
+    "ws": ["ws@8.21.3", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-20"],
+  }
+}
+"#;
+
+fn write_bun_repro_package_json(root: &std::path::Path, overrides: &str) {
+    fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{
+  "name": "issue-2341-bun-overrides",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "bun@1.3.2",
+  "devDependencies": {{ "happy-dom": "^20.10.6" }},
+  "overrides": {overrides}
+}}"#
+        ),
+    )
+    .expect("write root package.json");
+}
+
+/// Issue #2341 repro: bun declares overrides through the npm-style top-level
+/// `overrides` key, and transitive resolution lives in `bun.lock`. The
+/// override target must be credited from the bun lockfile instead of being
+/// flagged as unused.
+#[test]
+fn transitive_only_targets_in_bun_lockfile_are_used() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_bun_repro_package_json(root, r#"{ "ws": "^8.21.0" }"#);
+    fs::write(root.join("bun.lock"), BUN_LOCK_TRANSITIVE_WS).expect("write bun.lock");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert!(
+        results.unused_dependency_overrides.is_empty(),
+        "ws resolves in bun.lock as a transitive dependency of happy-dom; flagged: {:?}",
+        results.unused_dependency_overrides
+    );
+}
+
+#[test]
+fn unresolved_override_in_bun_repo_is_flagged_with_bun_hint() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_bun_repro_package_json(root, r#"{ "left-pad": "^1.3.0" }"#);
+    fs::write(root.join("bun.lock"), BUN_LOCK_TRANSITIVE_WS).expect("write bun.lock");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let flagged: Vec<&str> = results
+        .unused_dependency_overrides
+        .iter()
+        .map(|f| f.entry.target_package.as_str())
+        .collect();
+    assert_eq!(
+        flagged,
+        vec!["left-pad"],
+        "left-pad appears in no dep section and not in bun.lock"
+    );
+    let hint = results.unused_dependency_overrides[0]
+        .entry
+        .hint
+        .as_deref()
+        .expect("unused override carries a hint");
+    assert!(
+        hint.contains("bun install"),
+        "hint should name bun, not pnpm, in a bun repo; got {hint:?}"
+    );
+}
+
+/// bun's legacy binary lockfile cannot be parsed, so resolution ground truth
+/// is unavailable; the analysis must stay silent instead of flagging every
+/// transitive-only override.
+#[test]
+fn bun_lockb_without_text_lockfile_suppresses_unused_overrides() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_bun_repro_package_json(root, r#"{ "ws": "^8.21.0" }"#);
+    fs::write(root.join("bun.lockb"), b"\x00binary lockfile\x01\x02").expect("write bun.lockb");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert!(
+        results.unused_dependency_overrides.is_empty(),
+        "bun.lockb is unreadable; unused-override analysis must be skipped; flagged: {:?}",
+        results.unused_dependency_overrides
+    );
+}
+
+/// A stale leftover `bun.lockb` next to a parseable pnpm lockfile (bun repo
+/// migrated to pnpm, or a one-off `bun install` in a pnpm repo) must not
+/// disable the analysis: pnpm-lock.yaml is complete resolution ground truth.
+#[test]
+fn bun_lockb_alongside_pnpm_lockfile_keeps_analysis_running() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "issue-2341-bun-lockb-leftover",
+  "private": true,
+  "version": "0.0.0",
+  "devDependencies": { "happy-dom": "^20.10.6" },
+  "overrides": { "ws": "^8.21.0", "left-pad": "^1.3.0" }
+}"#,
+    )
+    .expect("write root package.json");
+    fs::write(
+        root.join("pnpm-lock.yaml"),
+        r"lockfileVersion: '9.0'
+
+packages:
+  happy-dom@20.11.6:
+    resolution: {integrity: sha512-Hl}
+  ws@8.21.3:
+    resolution: {integrity: sha512-20}
+
+snapshots:
+  happy-dom@20.11.6:
+    dependencies:
+      ws: 8.21.3
+  ws@8.21.3: {}
+",
+    )
+    .expect("write pnpm lockfile");
+    fs::write(root.join("bun.lockb"), b"\x00binary lockfile\x01\x02").expect("write bun.lockb");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let flagged: Vec<&str> = results
+        .unused_dependency_overrides
+        .iter()
+        .map(|f| f.entry.target_package.as_str())
+        .collect();
+    assert_eq!(
+        flagged,
+        vec!["left-pad"],
+        "pnpm-lock.yaml resolves ws; the stale bun.lockb must not suppress the whole check"
+    );
+}
+
+/// npm renames `package-lock.json` to `npm-shrinkwrap.json` for publishable
+/// packages; the format is identical, so shrinkwrap repos must get the same
+/// transitive-resolution crediting instead of declaration-only degradation.
+#[test]
+fn transitive_only_targets_in_npm_shrinkwrap_are_used() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "shrinkwrap-overrides",
+  "private": true,
+  "version": "0.0.0",
+  "overrides": { "postcss": ">=8.5.10", "left-pad": "^1.3.0" }
+}"#,
+    )
+    .expect("write root package.json");
+    fs::write(
+        root.join("npm-shrinkwrap.json"),
+        r#"{
+  "name": "shrinkwrap-overrides",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "shrinkwrap-overrides", "version": "0.0.0" },
+    "node_modules/postcss": { "version": "8.5.10" }
+  }
+}"#,
+    )
+    .expect("write npm shrinkwrap");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let flagged: Vec<&str> = results
+        .unused_dependency_overrides
+        .iter()
+        .map(|f| f.entry.target_package.as_str())
+        .collect();
+    assert_eq!(
+        flagged,
+        vec!["left-pad"],
+        "postcss resolves in npm-shrinkwrap.json; only left-pad is unused"
+    );
+    let hint = results.unused_dependency_overrides[0]
+        .entry
+        .hint
+        .as_deref()
+        .expect("unused override carries a hint");
+    assert!(
+        hint.contains("npm ci"),
+        "hint should name npm in a shrinkwrap repo; got {hint:?}"
+    );
+}
+
+/// A malformed text `bun.lock` fails closed because declaration-only analysis
+/// cannot distinguish a transitive-only pin from a removable override.
+#[test]
+fn malformed_bun_lock_skips_removal_advice_with_a_diagnostic() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_bun_repro_package_json(root, r#"{ "ws": "^8.21.0" }"#);
+    fs::write(root.join("bun.lock"), "not json {{{").expect("write bun.lock");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let flagged: Vec<&str> = results
+        .unused_dependency_overrides
+        .iter()
+        .map(|f| f.entry.target_package.as_str())
+        .collect();
+    assert!(
+        flagged.is_empty(),
+        "an unreadable lockfile must not produce removal advice: {flagged:?}"
+    );
+    assert!(
+        fallow_config::workspace_diagnostics_for(root)
+            .iter()
+            .any(|diagnostic| {
+                matches!(
+                    diagnostic.kind,
+                    fallow_config::WorkspaceDiagnosticKind::BunLockOverrideResolutionSkipped
+                )
+            })
+    );
+}
+
+/// The `packageManager` field alone (lockfile not committed yet) must pick
+/// the bun hint instead of falling back to the pnpm wording from the issue's
+/// closing paragraph.
+#[test]
+fn package_manager_field_selects_bun_hint_without_lockfile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_bun_repro_package_json(root, r#"{ "left-pad": "^1.3.0" }"#);
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let hint = results
+        .unused_dependency_overrides
+        .first()
+        .and_then(|f| f.entry.hint.as_deref())
+        .expect("declaration-only fallback still flags left-pad with a hint");
+    assert!(
+        hint.contains("bun install"),
+        "packageManager: bun must select the bun hint even without a lockfile; got {hint:?}"
+    );
+}
+
+/// yarn (classic and berry) resolves version pins through `resolutions` and
+/// never applies the npm `overrides` object, so a yarn repo gets a hint that
+/// explains the entry is inert instead of citing a pnpm command.
+#[test]
+fn yarn_repo_gets_resolutions_hint() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "yarn-overrides",
+  "private": true,
+  "version": "0.0.0",
+  "overrides": { "ws": "^8.21.0" }
+}"#,
+    )
+    .expect("write root package.json");
+    fs::write(root.join("yarn.lock"), "# yarn lockfile v1\n").expect("write yarn.lock");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let hint = results
+        .unused_dependency_overrides
+        .first()
+        .and_then(|f| f.entry.hint.as_deref())
+        .expect("inert overrides entry in a yarn repo is flagged with a hint");
+    assert!(
+        hint.contains("resolutions"),
+        "yarn repos should be pointed at `resolutions`; got {hint:?}"
+    );
+}
+
+/// bun workspace shape: the override target resolves only through a workspace
+/// member's dependency, keyed in the shared top-level `packages` map.
+#[test]
+fn bun_workspace_member_transitive_targets_are_used() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "bun-workspace-root",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "bun@1.3.2",
+  "workspaces": ["packages/*"],
+  "overrides": { "ws": "^8.21.0" }
+}"#,
+    )
+    .expect("write root package.json");
+    fs::create_dir_all(root.join("packages/app")).expect("member dir");
+    fs::write(
+        root.join("packages/app/package.json"),
+        r#"{ "name": "@repro/app", "version": "0.0.0", "devDependencies": { "happy-dom": "^20.10.6" } }"#,
+    )
+    .expect("write member package.json");
+    fs::write(
+        root.join("bun.lock"),
+        r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bun-workspace-root",
+    },
+    "packages/app": {
+      "name": "@repro/app",
+      "devDependencies": {
+        "happy-dom": "^20.10.6",
+      },
+    },
+  },
+  "overrides": {
+    "ws": "^8.21.0",
+  },
+  "packages": {
+    "@repro/app": ["@repro/app@workspace:packages/app"],
+    "happy-dom": ["happy-dom@20.11.6", "", { "dependencies": { "ws": "^8.21.0" } }, "sha512-Hl"],
+    "ws": ["ws@8.21.3", "", {}, "sha512-20"],
+  }
+}
+"#,
+    )
+    .expect("write bun.lock");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert!(
+        results.unused_dependency_overrides.is_empty(),
+        "ws resolves in bun.lock via the workspace member's dependency; flagged: {:?}",
+        results.unused_dependency_overrides
+    );
+}
+
+/// Misconfigured-override detection is static and does not depend on lockfile
+/// resolution, so it keeps reporting even when only `bun.lockb` exists.
+#[test]
+fn bun_lockb_does_not_suppress_misconfigured_overrides() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_bun_repro_package_json(root, r#"{ "ws": "" }"#);
+    fs::write(root.join("bun.lockb"), b"\x00binary lockfile\x01\x02").expect("write bun.lockb");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let any_empty_value = results.misconfigured_dependency_overrides.iter().any(|f| {
+        f.entry.raw_key == "ws" && f.entry.reason == DependencyOverrideMisconfigReason::EmptyValue
+    });
+    assert!(
+        any_empty_value,
+        "empty-value override must stay reported with bun.lockb present; got {:?}",
+        results.misconfigured_dependency_overrides
+    );
+}
+
 #[test]
 fn detects_misconfigured_overrides() {
     let root = fixture_path("issue-336-unused-overrides");
@@ -286,4 +775,143 @@ fn unused_overrides_carry_transitive_hint_on_every_shape() {
             finding.entry.raw_key
         );
     }
+}
+
+/// Copy a fixture directory into a tempdir. With `theirs`, wrap the `ours`
+/// block of `lock_file` in merge-conflict markers, with `theirs` as the other
+/// side. The markers are built at runtime, so the repository holds no literal
+/// conflict markers. The copy keeps the lockfile name.
+fn lock_conflict_project(
+    fixture: &str,
+    lock_file: &str,
+    ours: &str,
+    theirs: Option<&str>,
+) -> tempfile::TempDir {
+    let source = fixture_path(fixture);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for entry in fs::read_dir(&source).expect("read fixture dir") {
+        let entry = entry.expect("fixture entry");
+        fs::copy(entry.path(), tmp.path().join(entry.file_name())).expect("copy fixture file");
+    }
+    if let Some(theirs) = theirs {
+        let lock_path = tmp.path().join(lock_file);
+        let lock = fs::read_to_string(&lock_path).expect("read lockfile");
+        assert!(lock.contains(ours), "fixture {lock_file} changed shape");
+        let (start, separator, end) = ("<".repeat(7), "=".repeat(7), ">".repeat(7));
+        let conflict = format!("{start} HEAD\n{ours}{separator}\n{theirs}{end} feature-branch\n");
+        fs::write(&lock_path, lock.replacen(ours, &conflict, 1)).expect("write lockfile");
+    }
+    tmp
+}
+
+const PNPM_CONFLICT_FIXTURE: &str = "pnpm-lock-merge-conflict-overrides";
+const PNPM_OURS: &str = "        specifier: ^4.21.2\n        version: 4.21.2\n";
+const PNPM_THEIRS: &str = "        specifier: ^4.21.1\n        version: 4.21.1\n";
+
+const NPM_CONFLICT_FIXTURE: &str = "npm-lock-merge-conflict-overrides";
+const NPM_OURS: &str = r#"    "node_modules/express": {
+      "version": "4.21.2",
+      "dependencies": {
+        "path-to-regexp": "0.1.13"
+      }
+    },
+"#;
+const NPM_THEIRS: &str = r#"    "node_modules/express": {
+      "version": "4.21.1",
+      "dependencies": {
+        "path-to-regexp": "0.1.10"
+      }
+    },
+"#;
+
+fn skip_diagnostics(
+    root: &std::path::Path,
+    kind: &fallow_config::WorkspaceDiagnosticKind,
+) -> Vec<fallow_config::WorkspaceDiagnostic> {
+    fallow_config::workspace_diagnostics_for(root)
+        .into_iter()
+        .filter(|diagnostic| &diagnostic.kind == kind)
+        .collect()
+}
+
+fn flagged_override_targets(root: &std::path::Path) -> Vec<String> {
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    results
+        .unused_dependency_overrides
+        .iter()
+        .map(|f| f.entry.target_package.clone())
+        .collect()
+}
+
+/// Control: the valid lockfiles resolve the transitive-only pin.
+#[test]
+fn valid_lockfiles_resolve_the_transitive_override() {
+    for (fixture, lock_file, ours) in [
+        (PNPM_CONFLICT_FIXTURE, "pnpm-lock.yaml", PNPM_OURS),
+        (NPM_CONFLICT_FIXTURE, "package-lock.json", NPM_OURS),
+    ] {
+        let project = lock_conflict_project(fixture, lock_file, ours, None);
+        let flagged = flagged_override_targets(project.path());
+        assert!(flagged.is_empty(), "{fixture}: got {flagged:?}");
+        assert!(
+            fallow_config::workspace_diagnostics_for(project.path())
+                .iter()
+                .all(|diagnostic| !diagnostic
+                    .kind
+                    .id()
+                    .ends_with("-override-resolution-skipped")),
+            "{fixture}: a valid lockfile records no skip diagnostic"
+        );
+    }
+}
+
+/// A `pnpm-lock.yaml` with unresolved merge-conflict markers does not parse.
+/// Declaration-only analysis cannot tell a transitive-only pin from a
+/// removable override, so the check fails closed with a diagnostic.
+#[test]
+fn pnpm_lock_with_merge_conflict_markers_skips_removal_advice_with_a_diagnostic() {
+    let project = lock_conflict_project(
+        PNPM_CONFLICT_FIXTURE,
+        "pnpm-lock.yaml",
+        PNPM_OURS,
+        Some(PNPM_THEIRS),
+    );
+    let flagged = flagged_override_targets(project.path());
+    assert!(
+        flagged.is_empty(),
+        "a transitive-only override must not be reported while pnpm-lock.yaml does not parse: \
+         {flagged:?}"
+    );
+    let diagnostics = skip_diagnostics(
+        project.path(),
+        &fallow_config::WorkspaceDiagnosticKind::PnpmLockOverrideResolutionSkipped,
+    );
+    assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+    assert!(diagnostics[0].path.ends_with("pnpm-lock.yaml"));
+}
+
+/// A `package-lock.json` with unresolved merge-conflict markers does not
+/// parse. Without another lockfile, the check fails closed with a diagnostic
+/// instead of reporting a transitive-only npm override as unused.
+#[test]
+fn npm_lock_with_merge_conflict_markers_skips_removal_advice_with_a_diagnostic() {
+    let project = lock_conflict_project(
+        NPM_CONFLICT_FIXTURE,
+        "package-lock.json",
+        NPM_OURS,
+        Some(NPM_THEIRS),
+    );
+    let flagged = flagged_override_targets(project.path());
+    assert!(
+        flagged.is_empty(),
+        "a transitive-only override must not be reported while package-lock.json does not parse: \
+         {flagged:?}"
+    );
+    let diagnostics = skip_diagnostics(
+        project.path(),
+        &fallow_config::WorkspaceDiagnosticKind::NpmLockOverrideResolutionSkipped,
+    );
+    assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+    assert!(diagnostics[0].path.ends_with("package-lock.json"));
 }

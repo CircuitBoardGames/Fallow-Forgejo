@@ -15,7 +15,7 @@
 // bin/fallow exits non-zero before execing the binary. FALLOW_SKIP_BINARY_VERIFY
 // remains the documented escape hatch.
 //
-// Refs: SECURITY.md "Binary distribution and verification".
+// See SECURITY.md for binary distribution and verification.
 //
 // No external deps beyond node:fs / node:path / node:crypto.
 
@@ -24,24 +24,42 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 
 const { resolveSentinelPath } = require("./sentinel-path");
-const { verifyInstalledSync, SKIP_ENV } = require("./verify-binary");
+const {
+  verifyInstalledSync,
+  binaryTargetsForPlatform,
+  isSkipRequested,
+  SKIP_ENV,
+} = require("./verify-binary");
 
 // Bumped to 2 when SHA-256 + platformPkgDir binding landed (closes the
-// cross-install reuse gap in the shared $XDG fallback cache). v1 sentinels
-// without these fields are invalidated automatically.
-const SENTINEL_SCHEMA_VERSION = 2;
+// cross-install reuse gap in the shared $XDG fallback cache), and to 3 when
+// the sentinel started tracking fallow-similar-code alongside the multicall
+// CLI. Sentinels written under an older schema are invalidated automatically.
+const SENTINEL_SCHEMA_VERSION = 3;
 const VERIFY_LOG_ENV = "FALLOW_VERIFY_LOG";
 
 // One-shot warning state: each warning class fires once per process,
 // keyed by `code` so independent failure modes are still surfaced.
 const _warningEmitted = new Set();
 
+// Write to fd 2 directly. Under Bun, the first use of `process.stderr` sets
+// O_NONBLOCK on the pipe, and the platform binary inherits that pipe (and
+// stdout too when stderr and stdout share one pipe). See issue #3276.
+// Diagnostics are best-effort, so a failed write is ignored.
+function writeStderr(text) {
+  try {
+    fs.writeSync(2, text);
+  } catch {
+    // Ignore: no reader, or a closed descriptor.
+  }
+}
+
 function warnOnce(code, message) {
   if (_warningEmitted.has(code)) {
     return;
   }
   _warningEmitted.add(code);
-  process.stderr.write(`fallow: ${message}\n`);
+  writeStderr(`fallow: ${message}\n`);
 }
 
 function isVerifyLogEnabled(env) {
@@ -62,15 +80,13 @@ function emitVerifyLog(env, payload) {
       parts.push(`${key}=${v}`);
     }
   }
-  process.stderr.write(`fallow-verify ${parts.join(" ")}\n`);
+  writeStderr(`fallow-verify ${parts.join(" ")}\n`);
 }
 
-function binaryTargetsForPlatform(platform) {
-  // Platform packages ship one binary: the multicall `fallow`. The bundled
-  // lsp/mcp launchers spawn `fallow lsp-server` / `fallow mcp-server`, so there
-  // is only one binary to sentinel-track and verify.
-  const ext = platform === "win32" ? ".exe" : "";
-  return [`fallow${ext}`];
+// The sentinel binds the same binaries that verify-binary checks, so a new
+// binary cannot pass verification without also invalidating the sentinel.
+function binaryNamesForPlatform(platform) {
+  return binaryTargetsForPlatform(platform).map((t) => t.binary);
 }
 
 function statMtimeMs(absPath) {
@@ -145,7 +161,7 @@ function sha256OfFile(absPath) {
 // integrity gate that defends against same-mtime cross-install reuse where a
 // tampered binary happens to land with the recorded mtime.
 function sentinelBinariesMatch(parsed, platformPkgDir, platform) {
-  for (const target of binaryTargetsForPlatform(platform)) {
+  for (const target of binaryNamesForPlatform(platform)) {
     const recorded = parsed.binaries[target];
     if (!recorded || typeof recorded.mtimeMs !== "number") return false;
     if (typeof recorded.sha256 !== "string" || recorded.sha256.length !== 64) return false;
@@ -173,7 +189,7 @@ function isSentinelValid(sentinelPath, platformPkgDir, manifest, platform) {
 
 function buildSentinelPayload(platformPkgDir, manifest, platform) {
   const binaries = {};
-  for (const target of binaryTargetsForPlatform(platform)) {
+  for (const target of binaryNamesForPlatform(platform)) {
     const binaryPath = path.join(platformPkgDir, target);
     const mtimeMs = statMtimeMs(binaryPath);
     const sha256 = sha256OfFile(binaryPath);
@@ -213,11 +229,6 @@ function writeSentinel(sentinelPath, payload) {
   }
 }
 
-function isSkipRequested(env) {
-  const v = (env || process.env)[SKIP_ENV];
-  return v === "1" || v === "true" || v === "yes";
-}
-
 // Main entry point. Synchronous by design: bin/fallow runs this before
 // execFileSync, so the verify result must be available without awaiting.
 //
@@ -235,6 +246,9 @@ function isSkipRequested(env) {
 //                    production install path always has fallowDigests)
 //   env            - process.env (defaults to process.env)
 //   platform       - process.platform (defaults to process.platform)
+//   homedir        - os.homedir() override (tests only)
+//   isWritable     - sentinel directory probe override (tests only)
+//   ensureDir      - sentinel directory creation override (tests only)
 //   logger         - function (line: string) -> void (defaults to stderr)
 //
 // Returns one of:
@@ -250,6 +264,16 @@ function buildVerifyOptions(input, manifest) {
   };
   if (typeof input.verifyFn === "function") opts.verifyFn = input.verifyFn;
   if (typeof input.digestProvider === "function") opts.digestProvider = input.digestProvider;
+  return opts;
+}
+
+function buildSentinelOptions(input, platformPkgDir, packageName, env, platform) {
+  const opts = { platformPkgDir, packageName, env, platform };
+  for (const key of ["homedir", "isWritable", "ensureDir"]) {
+    if (Object.prototype.hasOwnProperty.call(input, key)) {
+      opts[key] = input[key];
+    }
+  }
   return opts;
 }
 
@@ -287,7 +311,7 @@ function ensureVerified(input) {
     platform = process.platform,
   } = input || {};
 
-  if (isSkipRequested(env)) {
+  if (isSkipRequested(env || process.env)) {
     const reason = `${SKIP_ENV} is set`;
     // Warn once per process so the bypass stays visible in CI logs and
     // vendor audits regardless of whether the user runs `--version` or
@@ -315,7 +339,9 @@ function ensureVerified(input) {
     };
   }
 
-  const sentinel = resolveSentinelPath({ platformPkgDir, packageName, env, platform });
+  const sentinel = resolveSentinelPath(
+    buildSentinelOptions(input || {}, platformPkgDir, packageName, env, platform),
+  );
 
   // Cache hit: sentinel exists, schema matches, mtimes match, version matches.
   if (sentinel.path && isSentinelValid(sentinel.path, platformPkgDir, manifest, platform)) {
@@ -349,6 +375,5 @@ function _resetWarningState() {
 module.exports = {
   ensureVerified,
   SENTINEL_SCHEMA_VERSION,
-  VERIFY_LOG_ENV,
   _resetWarningState,
 };

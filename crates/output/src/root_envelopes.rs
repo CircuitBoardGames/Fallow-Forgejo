@@ -2,13 +2,20 @@
 
 use fallow_types::envelope::{ElapsedMs, Meta, SchemaVersion, TelemetryMeta, ToolVersion};
 use fallow_types::output::NextStep;
+use fallow_types::workspace::WorkspaceDiagnostic;
 use serde::Serialize;
 
 /// Current schema version for `fallow audit --format json`.
-pub const AUDIT_SCHEMA_VERSION: u32 = 9;
+///
+/// Version 13 tracks the embedded health contract: the required
+/// `targets[].category` enum gained `resolve_hidden_coupling`.
+pub const AUDIT_SCHEMA_VERSION: u32 = 13;
 
 /// Current schema version for bare combined JSON output.
-pub const COMBINED_SCHEMA_VERSION: u32 = 9;
+///
+/// Version 14 tracks the embedded health contract: the required
+/// `targets[].category` enum gained `resolve_hidden_coupling`.
+pub const COMBINED_SCHEMA_VERSION: u32 = 14;
 
 /// Schema projection for the audit envelope's exact version.
 #[cfg(feature = "schema")]
@@ -24,15 +31,7 @@ struct AuditSchemaVersion(u32);
 #[schemars(extend("const" = COMBINED_SCHEMA_VERSION))]
 struct CombinedSchemaVersion(u32);
 
-/// JSON root envelope discriminator policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RootEnvelopeMode {
-    /// Emit a top-level `kind` discriminator on the JSON root.
-    Tagged,
-}
-
-/// Serialize a typed fallow root envelope with the requested discriminator
-/// mode.
+/// Serialize a typed fallow root envelope.
 ///
 /// # Errors
 ///
@@ -40,9 +39,7 @@ pub enum RootEnvelopeMode {
 /// JSON value.
 pub fn serialize_json_root_output<T: Serialize>(
     output: T,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let _ = mode;
     serde_json::to_value(output)
 }
 
@@ -59,10 +56,9 @@ pub fn serialize_json_root_output<T: Serialize>(
 pub fn serialize_named_json_output<T: Serialize>(
     output: T,
     kind: &'static str,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let mut value = serde_json::to_value(output)?;
-    apply_root_kind(&mut value, kind, mode);
+    apply_root_kind(&mut value, kind);
     Ok(value)
 }
 
@@ -82,7 +78,6 @@ pub fn serialize_audit_json_output<
     Complexity,
 >(
     output: AuditOutput<Verdict, Summary, Attribution, DeadCode, Duplication, Complexity>,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error>
 where
@@ -94,7 +89,7 @@ where
     Complexity: Serialize,
 {
     let mut value = serde_json::to_value(output)?;
-    apply_root_kind(&mut value, "audit", mode);
+    apply_root_kind(&mut value, "audit");
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -108,7 +103,6 @@ where
 /// JSON value.
 pub fn serialize_combined_json_output<Check, Dupes, Health>(
     output: CombinedOutput<Check, Dupes, Health>,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error>
 where
@@ -117,21 +111,24 @@ where
     Health: Serialize,
 {
     let mut value = serde_json::to_value(output)?;
-    apply_root_kind(&mut value, "combined", mode);
+    apply_root_kind(&mut value, "combined");
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
 
 /// Apply a document-root discriminator.
-pub fn apply_root_kind(value: &mut serde_json::Value, kind: &'static str, mode: RootEnvelopeMode) {
-    let _ = mode;
+pub fn apply_root_kind(value: &mut serde_json::Value, kind: &'static str) {
     if let serde_json::Value::Object(map) = value {
-        let existing = std::mem::take(map);
-        map.insert(
+        let previous = map.shift_insert(
+            0,
             "kind".to_string(),
             serde_json::Value::String(kind.to_string()),
         );
-        map.extend(existing);
+        if let Some(previous) = previous
+            && let Some(current) = map.get_mut("kind")
+        {
+            *current = previous;
+        }
     }
 }
 
@@ -195,11 +192,21 @@ pub struct AuditOutput<Verdict, Summary, Attribution, DeadCode, Duplication, Com
     pub summary: Summary,
     /// New-vs-inherited attribution of findings against the base.
     pub attribution: Attribution,
+    /// The verdict of every gate this run evaluated, keyed by name. The CLI
+    /// always emits it, with the command's default exit rule in it also when
+    /// no flag armed a gate, so a CI integration reads the verdict instead of
+    /// guessing from a process status it usually cannot see. A gate fails the
+    /// build when `status` is `fail` AND `enforced` is true. The typed
+    /// programmatic API runs no CLI gate and leaves it absent. See
+    /// [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
     /// `_meta` block with metric / rule definitions, when `--explain` was
     /// passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
-    /// Dead-code findings scoped to the audit changeset.
+    /// Dead-code findings scoped to the audit changeset. Absent when no file
+    /// changed, or when `summary.dead_code_skipped` says the pass was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dead_code: Option<DeadCode>,
     /// Duplication findings scoped to the audit changeset.
@@ -208,6 +215,11 @@ pub struct AuditOutput<Verdict, Summary, Attribution, DeadCode, Duplication, Com
     /// Complexity findings scoped to the audit changeset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<Complexity>,
+    /// Diff-risk findings: facts about the change itself, such as weakened
+    /// tests or added suppressions. Every finding is introduced. Absent when
+    /// the change has no diff-risk finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_risk: Option<crate::DiffRiskReport>,
     /// Read-only follow-up commands computed from this run's findings. See
     /// `CheckOutput::next_steps` for the contract.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -238,6 +250,38 @@ pub struct CombinedOutput<Check, Dupes, Health> {
     pub version: ToolVersion,
     /// Wall-clock analysis duration in milliseconds.
     pub elapsed_ms: ElapsedMs,
+    /// The verdict of every gate this run evaluated, keyed by name. The CLI
+    /// always emits it, with the default exit rule of each section that ran
+    /// (`error-severity-findings`, `health-findings`). A `coverage-gaps` rule
+    /// at `error` adds `health-coverage-gaps`. Without
+    /// `--fail-on-issues` or `--ci`, the machine formats of the combined run
+    /// exit 0 for findings, so most entries have `enforced: false`. With one of
+    /// these flags, the findings rules, `health-coverage-gaps` and
+    /// `duplication-threshold` are
+    /// `enforced`, the dupes section adds an enforced `duplication-findings`
+    /// entry, and every format exits 1 when one fails. For the default
+    /// exit rules (`error-severity-findings`,
+    /// `health-findings`), `status` gives the verdict of the human run. An
+    /// advisory entry can report `fail` without a failure of the human run: an
+    /// example is a `stale-baseline` entry that `--fail-on-stale-baseline` did
+    /// not arm. A gate fails the build when `status` is `fail` AND `enforced`
+    /// is true. The typed
+    /// programmatic API leaves it absent. See [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run RECEIVED, keyed by name,
+    /// absent when it was asked for nothing. An entry whose `status` is not
+    /// `applied` means the run could not do what it was asked and reported
+    /// something WIDER instead, so what follows is a valid report of a scope
+    /// nobody requested. Honoured requests are published too, with
+    /// `status: "applied"`, so an absent object means "nothing was asked for",
+    /// never "nothing failed". See [`crate::RequestOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
+    /// Applied package Git refs of the `check` and `dupes` sections. The map
+    /// does not narrow the `health` section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_baselines: Vec<crate::PackageBaselineStatus>,
     /// Per-section `_meta` blocks, when `--explain` was passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<CombinedMeta>,
@@ -250,6 +294,14 @@ pub struct CombinedOutput<Check, Dupes, Health> {
     /// Health section of the combined run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<Health>,
+    /// Workspace-discovery, source-discovery, and analysis-stage diagnostics
+    /// for the run (issue #2366). See `CheckOutput::workspace_diagnostics` for
+    /// the full contract: root-relative paths, omitted when empty. The
+    /// combined envelope carries them here rather than inside a section, so a
+    /// run that skips a section (`--skip check`, `--only health`,
+    /// `--only dupes`) still reports every diagnostic its analyses recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Read-only follow-up commands aggregated across the combined run's
     /// findings. See `CheckOutput::next_steps` for the contract.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -305,6 +357,7 @@ pub enum FallowOutput<
     Explain,
     Inspect,
     Trace,
+    TraceError,
     ReviewEnvelope,
     ReviewReconcile,
     CoverageSetup,
@@ -314,6 +367,7 @@ pub enum FallowOutput<
     Health,
     Dupes,
     CheckGrouped,
+    ArchitectureGrouped,
     Impact,
     ImpactCrossRepo,
     SecuritySummary,
@@ -321,6 +375,7 @@ pub enum FallowOutput<
     SecuritySurvivors,
     SecurityBlindSpots,
     Check,
+    Architecture,
     Combined,
     FeatureFlags,
     AuditBrief,
@@ -328,7 +383,16 @@ pub enum FallowOutput<
     WalkthroughGuide,
     WalkthroughValidation,
     SuppressionInventory,
+    Doctor,
     TypeAwareStatus,
+    SimilarCode,
+    SimilarCodeInspect,
+    SimilarCodeReview,
+    SimilarCodeStatus,
+    SimilarCodeCacheClear,
+    Mutation,
+    MutationPlan,
+    MutationInspect,
 > {
     /// `fallow audit --format json`.
     #[serde(rename = "audit")]
@@ -342,6 +406,9 @@ pub enum FallowOutput<
     /// `fallow trace <symbol> --format json`.
     #[serde(rename = "trace")]
     Trace(Trace),
+    /// `fallow trace-error [FILE|-] --format json`.
+    #[serde(rename = "trace-error")]
+    TraceError(TraceError),
     /// `fallow --format review-github` / `--format review-gitlab`.
     #[serde(rename = "review-envelope")]
     ReviewEnvelope(ReviewEnvelope),
@@ -369,6 +436,9 @@ pub enum FallowOutput<
     /// `fallow dead-code --format json --group-by <mode>`.
     #[serde(rename = "dead-code-grouped")]
     CheckGrouped(CheckGrouped),
+    /// `fallow architecture --format json --group-by <mode>`.
+    #[serde(rename = "architecture-grouped")]
+    ArchitectureGrouped(ArchitectureGrouped),
     /// `fallow impact --format json`.
     #[serde(rename = "impact")]
     Impact(Impact),
@@ -390,6 +460,9 @@ pub enum FallowOutput<
     /// `fallow dead-code --format json`.
     #[serde(rename = "dead-code")]
     Check(Check),
+    /// `fallow architecture --format json`.
+    #[serde(rename = "architecture")]
+    Architecture(Architecture),
     /// Bare `fallow --format json`.
     #[serde(rename = "combined")]
     Combined(Combined),
@@ -411,9 +484,36 @@ pub enum FallowOutput<
     /// `fallow suppressions --format json`.
     #[serde(rename = "suppression-inventory")]
     SuppressionInventory(SuppressionInventory),
+    /// `fallow doctor --format json`.
+    #[serde(rename = "doctor")]
+    Doctor(Doctor),
     /// `fallow type-aware status --format json`.
     #[serde(rename = "type-aware-status")]
     TypeAwareStatus(TypeAwareStatus),
+    /// `fallow similar-code --format json`.
+    #[serde(rename = "similar-code")]
+    SimilarCode(SimilarCode),
+    /// `fallow similar-code inspect --format json`.
+    #[serde(rename = "similar-code-inspect")]
+    SimilarCodeInspect(SimilarCodeInspect),
+    /// `fallow similar-code review --format json`.
+    #[serde(rename = "similar-code-review")]
+    SimilarCodeReview(SimilarCodeReview),
+    /// `fallow similar-code status --format json` and successful setup output.
+    #[serde(rename = "similar-code-status")]
+    SimilarCodeStatus(SimilarCodeStatus),
+    /// `fallow similar-code cache clear --format json`.
+    #[serde(rename = "similar-code-cache-clear")]
+    SimilarCodeCacheClear(SimilarCodeCacheClear),
+    /// `fallow mutation --format json`.
+    #[serde(rename = "mutation")]
+    Mutation(Mutation),
+    /// `fallow mutation --plan --format json`.
+    #[serde(rename = "mutation-plan")]
+    MutationPlan(MutationPlan),
+    /// `fallow mutation inspect --format json`.
+    #[serde(rename = "mutation-inspect")]
+    MutationInspect(MutationInspect),
 }
 
 #[cfg(test)]
@@ -424,12 +524,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_root_kind_sets_tagged_mode() {
+    fn apply_root_kind_sets_kind() {
         let mut value = json!({});
 
-        apply_root_kind(&mut value, "dead_code", RootEnvelopeMode::Tagged);
+        apply_root_kind(&mut value, "dead_code");
 
         assert_eq!(value["kind"], "dead_code");
+    }
+
+    #[test]
+    fn apply_root_kind_prepends_without_reordering_existing_fields() {
+        let mut value = json!({ "schema_version": 1, "summary": { "total": 0 } });
+
+        apply_root_kind(&mut value, "example");
+
+        assert_eq!(
+            serde_json::to_string(&value).expect("root output should serialize"),
+            r#"{"kind":"example","schema_version":1,"summary":{"total":0}}"#
+        );
+    }
+
+    #[test]
+    fn apply_root_kind_preserves_existing_value_and_moves_it_first() {
+        let mut value = json!({ "before": 1, "kind": "custom", "after": 2 });
+
+        apply_root_kind(&mut value, "replacement");
+
+        assert_eq!(
+            serde_json::to_string(&value).expect("root output should serialize"),
+            r#"{"kind":"custom","before":1,"after":2}"#
+        );
+    }
+
+    #[test]
+    fn apply_root_kind_preserves_non_object_roots() {
+        let mut value = json!(["not", "an", "object"]);
+
+        apply_root_kind(&mut value, "example");
+
+        assert_eq!(value, json!(["not", "an", "object"]));
     }
 
     #[test]
@@ -461,7 +594,6 @@ mod tests {
                 "summary": { "total": 0 }
             }),
             "example",
-            RootEnvelopeMode::Tagged,
         )
         .expect("named output should serialize");
 
@@ -473,6 +605,7 @@ mod tests {
     fn serialize_audit_json_output_applies_audit_kind() {
         let value = serialize_audit_json_output(
             AuditOutput {
+                gate_outcomes: None,
                 schema_version: SchemaVersion(7),
                 version: ToolVersion("1.2.3".to_string()),
                 command: AuditCommand::Audit,
@@ -489,9 +622,9 @@ mod tests {
                 dead_code: Some(json!({ "summary": { "total_issues": 0 } })),
                 duplication: None::<serde_json::Value>,
                 complexity: None::<serde_json::Value>,
+                diff_risk: None,
                 next_steps: Vec::new(),
             },
-            RootEnvelopeMode::Tagged,
             Some("run-audit"),
         )
         .expect("audit output should serialize");
@@ -506,6 +639,9 @@ mod tests {
     fn serialize_combined_json_output_applies_combined_kind() {
         let value = serialize_combined_json_output(
             CombinedOutput {
+                package_baselines: Vec::new(),
+                gate_outcomes: None,
+                request_outcomes: None,
                 schema_version: SchemaVersion(7),
                 version: ToolVersion("1.2.3".to_string()),
                 elapsed_ms: ElapsedMs(42),
@@ -513,9 +649,9 @@ mod tests {
                 check: Some(json!({ "summary": { "total_issues": 0 } })),
                 dupes: None::<serde_json::Value>,
                 health: None::<serde_json::Value>,
+                workspace_diagnostics: Vec::new(),
                 next_steps: Vec::new(),
             },
-            RootEnvelopeMode::Tagged,
             Some("run-combined"),
         )
         .expect("combined output should serialize");

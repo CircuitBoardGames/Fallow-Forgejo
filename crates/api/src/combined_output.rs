@@ -4,13 +4,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use fallow_output::{
-    COMBINED_SCHEMA_VERSION, CombinedMeta, CombinedOutput, HealthReport, RootEnvelopeMode,
-    check_meta, dupes_meta, harmonize_dead_code_health_suppress_line_actions, health_meta,
-    serialize_combined_json_output, strip_root_prefix,
+    COMBINED_SCHEMA_VERSION, CombinedMeta, CombinedOutput, HealthReport, check_meta, dupes_meta,
+    harmonize_dead_code_health_suppress_line_actions, health_meta, serialize_combined_json_output,
+    strip_root_prefix,
 };
 use fallow_types::envelope::{ElapsedMs, SchemaVersion, ToolVersion};
 use fallow_types::output::NextStep;
 use fallow_types::results::AnalysisResults;
+use fallow_types::workspace::WorkspaceDiagnostic;
 
 use crate::{
     CheckJsonExtraOutputs, CheckJsonPayloadInput, DupesReportPayload, serialize_check_json_payload,
@@ -33,6 +34,17 @@ pub struct CombinedCheckJsonSection<'a> {
 
 /// Inputs for bare `fallow --format json` output assembly.
 pub struct CombinedJsonOutputInput<'a> {
+    /// Applied refs for exact workspace package roots.
+    pub package_baselines: Vec<fallow_output::PackageBaselineStatus>,
+    /// Every gate this run evaluated, absent when it evaluated none. The
+    /// programmatic route runs no CLI-layer gate and leaves this `None`.
+    pub gate_outcomes: Option<fallow_output::GateOutcomes>,
+    /// Every narrowing or shaping request this run received, absent when it
+    /// was asked for nothing. The programmatic route resolves no CLI flag and
+    /// leaves this `None`; an entry whose `status` is not `applied` means the
+    /// report is wider than what was asked for.
+    pub request_outcomes: Option<fallow_output::RequestOutcomes>,
+
     /// Dead-code section; `None` omits `check` from the envelope.
     pub check: Option<CombinedCheckJsonSection<'a>>,
     /// Duplication section; `None` omits `dupes` from the envelope.
@@ -48,10 +60,13 @@ pub struct CombinedJsonOutputInput<'a> {
     /// Type-aware pass metadata, merged into the check section's meta even
     /// when `explain` is off.
     pub type_aware: Option<fallow_types::envelope::TypeAwareMeta>,
+    /// Workspace, source-discovery, and analysis-stage diagnostics for the
+    /// run: the same list the standalone envelopes carry, emitted on the
+    /// combined root and omitted when empty. The root is the only carrier, so
+    /// a run that skips a section still reports them (issue #2366).
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Suggested follow-up commands for the consumer.
     pub next_steps: Vec<NextStep>,
-    /// Whether the root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<&'a str>,
 }
@@ -100,17 +115,25 @@ pub fn serialize_combined_json(
     }
 
     let output = CombinedOutput {
+        package_baselines: input.package_baselines,
         schema_version: SchemaVersion(COMBINED_SCHEMA_VERSION),
         version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
         elapsed_ms: ElapsedMs(elapsed_ms_for_output(input.elapsed)),
+        gate_outcomes: input.gate_outcomes,
+        request_outcomes: input.request_outcomes,
         meta,
         check,
         dupes,
         health,
+        workspace_diagnostics: input.workspace_diagnostics,
         next_steps: input.next_steps,
     };
 
-    serialize_combined_json_output(output, input.envelope_mode, input.telemetry_analysis_run_id)
+    let mut value = serialize_combined_json_output(output, input.telemetry_analysis_run_id)?;
+    if let Some(diagnostics) = value.get_mut("workspace_diagnostics") {
+        strip_root_prefix(diagnostics, &format!("{}/", input.root.display()));
+    }
+    Ok(value)
 }
 
 fn serialize_combined_check_json(
@@ -187,17 +210,20 @@ mod tests {
 
     use fallow_output::{
         ComplexityViolation, ExceededThreshold, FindingSeverity, HealthFinding, HealthReport,
-        RootEnvelopeMode,
     };
     use fallow_types::output_dead_code::UnusedExportFinding;
     use fallow_types::output_health::{HealthFindingAction, HealthFindingActionType};
     use fallow_types::results::{AnalysisResults, UnusedExport};
+    use fallow_types::workspace::{WorkspaceDiagnostic, WorkspaceDiagnosticKind};
 
     use super::{CombinedCheckJsonSection, CombinedJsonOutputInput, serialize_combined_json};
 
     #[test]
     fn combined_json_root_contains_stable_envelope_fields() {
         let root = serialize_combined_json(CombinedJsonOutputInput {
+            package_baselines: Vec::new(),
+            gate_outcomes: None,
+            request_outcomes: None,
             check: None,
             dupes: None,
             health: None,
@@ -205,8 +231,8 @@ mod tests {
             elapsed: Duration::from_millis(42),
             explain: false,
             type_aware: None,
+            workspace_diagnostics: Vec::new(),
             next_steps: Vec::new(),
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
         })
         .expect("combined JSON root");
@@ -238,6 +264,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let health = HealthReport {
             findings: vec![HealthFinding::new(
@@ -247,6 +275,7 @@ mod tests {
                     line: 7,
                     col: 0,
                     cyclomatic: 22,
+                    standard_cyclomatic: None,
                     cognitive: 18,
                     line_count: 40,
                     param_count: 1,
@@ -255,8 +284,10 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Both,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
@@ -282,6 +313,9 @@ mod tests {
         };
 
         let output = serialize_combined_json(CombinedJsonOutputInput {
+            package_baselines: Vec::new(),
+            gate_outcomes: None,
+            request_outcomes: None,
             check: Some(CombinedCheckJsonSection {
                 results: &results,
                 root,
@@ -295,8 +329,8 @@ mod tests {
             elapsed: Duration::ZERO,
             explain: false,
             type_aware: None,
+            workspace_diagnostics: Vec::new(),
             next_steps: Vec::new(),
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
         })
         .expect("combined JSON");
@@ -308,6 +342,101 @@ mod tests {
         assert_eq!(
             output["health"]["findings"][0]["actions"][0]["comment"],
             "// fallow-ignore-next-line unused-export, complexity"
+        );
+    }
+
+    fn combined_json_with_diagnostics(
+        root: &std::path::Path,
+        include_check: bool,
+        workspace_diagnostics: Vec<WorkspaceDiagnostic>,
+    ) -> serde_json::Value {
+        let results = AnalysisResults::default();
+        serialize_combined_json(CombinedJsonOutputInput {
+            package_baselines: Vec::new(),
+            gate_outcomes: None,
+            request_outcomes: None,
+            check: include_check.then(|| CombinedCheckJsonSection {
+                results: &results,
+                root,
+                elapsed: Duration::ZERO,
+                config_fixable: false,
+                extras: crate::CheckJsonExtraOutputs::default(),
+            }),
+            dupes: None,
+            health: None,
+            root,
+            elapsed: Duration::ZERO,
+            explain: false,
+            type_aware: None,
+            workspace_diagnostics,
+            next_steps: Vec::new(),
+            telemetry_analysis_run_id: None,
+        })
+        .expect("combined JSON")
+    }
+
+    fn malformed_yaml_diagnostic(root: &std::path::Path) -> WorkspaceDiagnostic {
+        WorkspaceDiagnostic::new(
+            root,
+            root.join("pnpm-workspace.yaml"),
+            WorkspaceDiagnosticKind::MalformedPnpmWorkspaceYaml {
+                error: "could not find expected ':'".to_owned(),
+            },
+        )
+    }
+
+    /// Issue #2366: the combined root carries the diagnostics it is given,
+    /// root-relative like the standalone envelopes, and omits the array when
+    /// there are none. The `check` section never grows its own copy, so the
+    /// document has exactly one carrier.
+    #[test]
+    fn combined_root_carries_workspace_diagnostics_root_relative_or_omits_them() {
+        let root = std::path::Path::new("/project");
+        let output =
+            combined_json_with_diagnostics(root, true, vec![malformed_yaml_diagnostic(root)]);
+        assert_eq!(
+            output["workspace_diagnostics"][0]["kind"],
+            "malformed-pnpm-workspace-yaml"
+        );
+        assert_eq!(
+            output["workspace_diagnostics"][0]["path"],
+            "pnpm-workspace.yaml"
+        );
+        assert!(
+            output["check"].is_object(),
+            "the check section is present, so the absence check below is not vacuous: {output}"
+        );
+        assert!(
+            output["check"].get("workspace_diagnostics").is_none(),
+            "the check section is not a second carrier: {output}"
+        );
+
+        let empty = combined_json_with_diagnostics(root, true, Vec::new());
+        assert!(
+            empty.get("workspace_diagnostics").is_none(),
+            "an empty list is omitted from the combined root: {empty}"
+        );
+    }
+
+    /// Issue #2366: the carrier does not depend on which sections ran, so a
+    /// combined run without a `check` section (`--skip check`, `--only health`,
+    /// `--only dupes`) still reports the diagnostics.
+    #[test]
+    fn combined_root_carries_workspace_diagnostics_without_a_check_section() {
+        let root = std::path::Path::new("/project");
+        let output =
+            combined_json_with_diagnostics(root, false, vec![malformed_yaml_diagnostic(root)]);
+        assert!(
+            output.get("check").is_none(),
+            "this run has no check section: {output}"
+        );
+        assert_eq!(
+            output["workspace_diagnostics"][0]["kind"],
+            "malformed-pnpm-workspace-yaml"
+        );
+        assert_eq!(
+            output["workspace_diagnostics"][0]["path"],
+            "pnpm-workspace.yaml"
         );
     }
 }

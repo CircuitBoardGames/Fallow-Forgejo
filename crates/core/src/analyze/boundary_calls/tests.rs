@@ -94,6 +94,7 @@ fn build_graph(root: &std::path::Path, file_names: &[&str]) -> ModuleGraph {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         })
         .collect();
 
@@ -121,6 +122,7 @@ fn import(source: &str, imported: ImportedName, local: &str, is_type_only: bool)
         imported_name: imported,
         local_name: local.to_string(),
         is_type_only,
+        is_type_only_star: false,
         from_style: false,
         span: oxc_span::Span::new(0, 10),
         source_span: oxc_span::Span::new(0, 10),

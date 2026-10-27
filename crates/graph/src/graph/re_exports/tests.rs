@@ -1,11 +1,11 @@
 use rustc_hash::FxHashSet;
 
-use super::propagate::{count_named_import_origin_index_builds, count_star_reference_set_rebuilds};
+use super::propagate::{count_star_name_checks, count_star_reference_set_rebuilds};
 use super::{
-    ReExportPropagationPlan, ReExportTuple, capture_propagation_visits,
+    ReExportPropagationPlan, ReExportTuple, capture_propagation_visits, tarjan_scc,
     with_re_export_differential_check,
 };
-use crate::graph::ModuleGraph;
+use crate::graph::{EffectiveExportResolution, ExportNamespace, ModuleGraph};
 use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport};
 use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
 use fallow_types::extract::{ExportName, ImportInfo, ImportedName, VisibilityTag};
@@ -63,6 +63,7 @@ fn graph_re_export_chain_propagates_references() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -74,18 +75,6 @@ fn graph_re_export_chain_propagates_references() {
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/barrel.ts"),
-            exports: vec![fallow_types::extract::ExportInfo {
-                name: ExportName::Named("foo".to_string()),
-                local_name: Some("foo".to_string()),
-                is_type_only: false,
-                visibility: VisibilityTag::None,
-                expected_unused_reason: None,
-                span: oxc_span::Span::new(0, 20),
-                members: vec![],
-                is_side_effect_used: false,
-                super_class: None,
-            }]
-            .into(),
             re_exports: vec![ResolvedReExport {
                 info: fallow_types::extract::ReExportInfo {
                     source: "./source".to_string(),
@@ -113,6 +102,8 @@ fn graph_re_export_chain_propagates_references() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -168,6 +159,7 @@ fn barrel_re_export_creates_export_symbol() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -199,20 +191,15 @@ fn barrel_re_export_creates_export_symbol() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
         },
     ];
 
-    let (graph, origin_index_builds) = count_named_import_origin_index_builds(|| {
-        ModuleGraph::build(&resolved_modules, &entry_points, &files)
-    });
-
-    assert_eq!(
-        origin_index_builds, 0,
-        "named re-exports should not build the star-import origin index"
-    );
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
     let barrel = &graph.modules[1];
     let foo_export = barrel.exports.iter().find(|e| e.name.to_string() == "foo");
@@ -278,6 +265,7 @@ fn barrel_unused_re_export_has_no_references() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -331,6 +319,8 @@ fn barrel_unused_re_export_has_no_references() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("bar".to_string()),
@@ -342,6 +332,8 @@ fn barrel_unused_re_export_has_no_references() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -409,6 +401,7 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                     imported_name: ImportedName::Named("UsedType".to_string()),
                     local_name: "UsedType".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -462,6 +455,8 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("UnusedType".to_string()),
@@ -473,6 +468,8 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -542,6 +539,7 @@ fn default_re_export_creates_default_export_symbol() {
                     imported_name: ImportedName::Named("Accordion".to_string()),
                     local_name: "Accordion".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -580,6 +578,8 @@ fn default_re_export_creates_default_export_symbol() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -655,6 +655,7 @@ fn multi_level_re_export_chain_propagation() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -710,6 +711,8 @@ fn multi_level_re_export_chain_propagation() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -753,6 +756,10 @@ fn multi_level_re_export_chain_propagation() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixture names every ExportInfo field so a new field is a compile error here"
+)]
 fn entry_point_named_re_export_propagates_to_source() {
     let files = vec![
         DiscoveredFile {
@@ -818,6 +825,8 @@ fn entry_point_named_re_export_propagates_to_source() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("hydrate".to_string()),
@@ -829,6 +838,8 @@ fn entry_point_named_re_export_propagates_to_source() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -914,6 +925,8 @@ fn entry_point_star_re_export_propagates_to_source() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("bar".to_string()),
@@ -925,6 +938,8 @@ fn entry_point_star_re_export_propagates_to_source() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -932,14 +947,7 @@ fn entry_point_star_re_export_propagates_to_source() {
         },
     ];
 
-    let (graph, origin_index_builds) = count_named_import_origin_index_builds(|| {
-        ModuleGraph::build(&resolved_modules, &entry_points, &files)
-    });
-
-    assert_eq!(
-        origin_index_builds, 0,
-        "entry-point star re-exports should use the fast path without an origin index"
-    );
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
     let utils_module = &graph.modules[1];
     let foo = utils_module
@@ -961,6 +969,57 @@ fn entry_point_star_re_export_propagates_to_source() {
         !bar.references.is_empty(),
         "bar should be marked as used via entry point star re-export"
     );
+}
+
+#[test]
+fn entry_point_type_star_credits_value_backed_type_binding() {
+    let files = vec![
+        discovered_file(0, "/project/index.ts"),
+        discovered_file(1, "/project/source.ts"),
+    ];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: files[0].path.clone(),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./source".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: files[1].path.clone(),
+            exports: vec![merged_export(false)].into(),
+            ..Default::default()
+        },
+    ];
+    let graph = ModuleGraph::build(
+        &resolved_modules,
+        &[EntryPoint {
+            path: files[0].path.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }],
+        &files,
+    );
+
+    assert!(matches!(
+        graph.resolve_export(FileId(0), "Merged", ExportNamespace::Type),
+        EffectiveExportResolution::Unique(_)
+    ));
+    assert_eq!(
+        graph.resolve_export(FileId(0), "Merged", ExportNamespace::Value),
+        EffectiveExportResolution::Missing
+    );
+    assert!(!graph.modules[1].exports[0].references.is_empty());
 }
 
 #[test]
@@ -1015,6 +1074,8 @@ fn entry_point_star_re_export_does_not_mark_default_as_used() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Default,
@@ -1026,6 +1087,8 @@ fn entry_point_star_re_export_does_not_mark_default_as_used() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -1130,6 +1193,8 @@ fn entry_point_multi_level_named_re_export_chain() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -1205,6 +1270,7 @@ fn star_re_export_through_multiple_barrel_layers() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -1261,6 +1327,8 @@ fn star_re_export_through_multiple_barrel_layers() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("bar".to_string()),
@@ -1272,6 +1340,8 @@ fn star_re_export_through_multiple_barrel_layers() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -1377,6 +1447,8 @@ fn entry_point_star_re_export_through_multiple_barrel_layers() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -1431,6 +1503,7 @@ fn named_re_export_with_rename() {
                     imported_name: ImportedName::Named("bar".to_string()),
                     local_name: "bar".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -1469,6 +1542,8 @@ fn named_re_export_with_rename() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -1551,6 +1626,8 @@ fn entry_point_star_re_export_source_has_only_default() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -1641,6 +1718,7 @@ fn cycle_detection_does_not_infinite_loop() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -1693,6 +1771,8 @@ fn star_re_export_cycle_terminates() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             re_exports: vec![ResolvedReExport {
@@ -1735,6 +1815,7 @@ fn star_re_export_cycle_terminates() {
                     imported_name: ImportedName::Named("x".to_string()),
                     local_name: "x".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -1799,6 +1880,7 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                         imported_name: ImportedName::Named("foo".to_string()),
                         local_name: "foo".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
                         from_style: false,
                         span: oxc_span::Span::new(0, 10),
                         source_span: oxc_span::Span::default(),
@@ -1811,6 +1893,7 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                         imported_name: ImportedName::Named("bar".to_string()),
                         local_name: "bar".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
                         from_style: false,
                         span: oxc_span::Span::new(15, 25),
                         source_span: oxc_span::Span::default(),
@@ -1865,6 +1948,8 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("baz".to_string()),
@@ -1876,6 +1961,8 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -1978,6 +2065,8 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("destroy".to_string()),
@@ -1989,6 +2078,8 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("internal_helper".to_string()),
@@ -2000,6 +2091,8 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -2092,6 +2185,8 @@ fn entry_point_star_re_export_skips_default() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: ExportName::Named("named".to_string()),
@@ -2103,6 +2198,8 @@ fn entry_point_star_re_export_skips_default() {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -2162,6 +2259,7 @@ fn no_re_exports_skips_chain_resolution() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -2183,6 +2281,8 @@ fn no_re_exports_skips_chain_resolution() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -2198,6 +2298,153 @@ fn no_re_exports_skips_chain_resolution() {
         .unwrap();
     assert_eq!(foo.references.len(), 1);
     assert_eq!(foo.references[0].from_file, FileId(0));
+}
+
+fn fan_out_export(name: String) -> fallow_types::extract::ExportInfo {
+    fallow_types::extract::ExportInfo {
+        name: ExportName::Named(name),
+        local_name: None,
+        is_type_only: false,
+        visibility: VisibilityTag::None,
+        expected_unused_reason: None,
+        span: oxc_span::Span::new(0, 10),
+        members: vec![],
+        is_side_effect_used: false,
+        super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
+    }
+}
+
+/// A root barrel that `export *`s `packages` package barrels, each of which
+/// `export *`s one leaf with the exports `p{i}` and `q{i}`. The entry imports
+/// every `p{i}` through the root barrel.
+fn star_fan_out_graph(packages: u32) -> ModuleGraph {
+    let entry = FileId(0);
+    let root = FileId(1);
+    let barrel = |package: u32| FileId(2 + package * 2);
+    let leaf = |package: u32| FileId(3 + package * 2);
+    let mut files = vec![
+        DiscoveredFile {
+            id: entry,
+            path: PathBuf::from("/project/main.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: root,
+            path: PathBuf::from("/project/packages/index.ts"),
+            size_bytes: 50,
+        },
+    ];
+    let mut resolved_modules = vec![
+        ResolvedModule {
+            file_id: entry,
+            path: PathBuf::from("/project/main.ts"),
+            resolved_imports: (0..packages)
+                .map(|package| ResolvedImport {
+                    info: ImportInfo {
+                        source: "./packages".to_string(),
+                        imported_name: ImportedName::Named(format!("p{package}")),
+                        local_name: format!("p{package}"),
+                        is_type_only: false,
+                        is_type_only_star: false,
+                        from_style: false,
+                        span: oxc_span::Span::default(),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(root),
+                })
+                .collect(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: root,
+            path: PathBuf::from("/project/packages/index.ts"),
+            re_exports: (0..packages)
+                .map(|package| {
+                    plain_re_export(
+                        &format!("./p{package}"),
+                        "*",
+                        ResolveResult::InternalModule(barrel(package)),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        },
+    ];
+    for package in 0..packages {
+        let barrel_path = PathBuf::from(format!("/project/packages/p{package}/index.ts"));
+        let leaf_path = PathBuf::from(format!("/project/packages/p{package}/leaf.ts"));
+        files.push(DiscoveredFile {
+            id: barrel(package),
+            path: barrel_path.clone(),
+            size_bytes: 50,
+        });
+        files.push(DiscoveredFile {
+            id: leaf(package),
+            path: leaf_path.clone(),
+            size_bytes: 50,
+        });
+        resolved_modules.push(ResolvedModule {
+            file_id: barrel(package),
+            path: barrel_path,
+            re_exports: vec![plain_re_export(
+                "./leaf",
+                "*",
+                ResolveResult::InternalModule(leaf(package)),
+            )],
+            ..Default::default()
+        });
+        resolved_modules.push(ResolvedModule {
+            file_id: leaf(package),
+            path: leaf_path,
+            exports: vec![
+                fan_out_export(format!("p{package}")),
+                fan_out_export(format!("q{package}")),
+            ]
+            .into(),
+            ..Default::default()
+        });
+    }
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/main.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    with_re_export_differential_check(|| {
+        ModuleGraph::build(&resolved_modules, &entry_points, &files)
+    })
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "too slow under Miri: a scale test of safe code")]
+fn star_fan_out_checks_each_imported_name_against_its_own_source() {
+    let (small, small_checks) = count_star_name_checks(|| star_fan_out_graph(8));
+    let (large, large_checks) = count_star_name_checks(|| star_fan_out_graph(32));
+
+    for (graph, packages) in [(&small, 8_u32), (&large, 32)] {
+        for package in 0..packages {
+            let leaf = &graph.modules[(3 + package * 2) as usize];
+            let referenced = |name: &str| {
+                leaf.exports
+                    .iter()
+                    .any(|export| export.name.to_string() == name && !export.references.is_empty())
+            };
+            assert!(
+                referenced(&format!("p{package}")),
+                "p{package} must be credited"
+            );
+            assert!(
+                !referenced(&format!("q{package}")),
+                "q{package} must stay unused"
+            );
+        }
+    }
+    // Each imported name resolves through one package barrel, so the checks
+    // grow with the package count, not with its square.
+    assert!(
+        large_checks <= small_checks * 5,
+        "star name checks grew from {small_checks} to {large_checks} for 4x the packages"
+    );
 }
 
 #[expect(
@@ -2247,6 +2494,7 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
                     imported_name: ImportedName::Named("shared".to_string()),
                     local_name: "shared".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -2289,6 +2537,8 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
             fallow_types::extract::ExportInfo {
                 name: ExportName::Named("other".to_string()),
@@ -2300,6 +2550,8 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
         ]
         .into(),
@@ -2380,6 +2632,7 @@ fn deep_named_re_export_chain_propagates_25_hops() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -2428,6 +2681,8 @@ fn deep_named_re_export_chain_propagates_25_hops() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -2510,6 +2765,7 @@ fn work_queue_does_not_revisit_unrelated_settled_edge() {
                 imported_name: ImportedName::Named("Merged".to_string()),
                 local_name: "Merged".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 10),
                 source_span: oxc_span::Span::default(),
@@ -2565,6 +2821,7 @@ fn work_queue_does_not_revisit_unrelated_settled_edge() {
                 imported_name: ImportedName::Named("Merged".to_string()),
                 local_name: "Merged".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 10),
                 source_span: oxc_span::Span::default(),
@@ -2599,6 +2856,7 @@ fn work_queue_does_not_revisit_unrelated_settled_edge() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "too slow under Miri: a scale test of safe code")]
 fn work_queue_matches_legacy_on_generated_small_graphs() {
     with_re_export_differential_check(|| {
         for barrel_count in 1..=8 {
@@ -2681,6 +2939,7 @@ fn propagation_plan_requeues_only_affected_observers_once() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "too slow under Miri: a scale test of safe code")]
 fn named_only_chain_safety_cap_excludes_synthetic_export_states() {
     let graph = graph_for_named_chain(256);
     let re_export_info = graph.collect_re_export_tuples();
@@ -2755,6 +3014,7 @@ fn graph_for_named_chain(barrel_count: u32) -> ModuleGraph {
                 imported_name: ImportedName::Named("Merged".to_string()),
                 local_name: "Merged".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 10),
                 source_span: oxc_span::Span::default(),
@@ -2904,6 +3164,8 @@ fn re_export_cycle_terminates_and_does_not_block_unrelated_propagation() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             re_exports: vec![ResolvedReExport {
@@ -2981,6 +3243,8 @@ fn re_export_cycle_terminates_and_does_not_block_unrelated_propagation() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -2995,6 +3259,7 @@ fn re_export_cycle_terminates_and_does_not_block_unrelated_propagation() {
                         imported_name: ImportedName::Named("x".to_string()),
                         local_name: "x".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
                         from_style: false,
                         span: oxc_span::Span::new(0, 10),
                         source_span: oxc_span::Span::default(),
@@ -3007,6 +3272,7 @@ fn re_export_cycle_terminates_and_does_not_block_unrelated_propagation() {
                         imported_name: ImportedName::Named("y".to_string()),
                         local_name: "y".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
                         from_style: false,
                         span: oxc_span::Span::new(15, 25),
                         source_span: oxc_span::Span::default(),
@@ -3116,6 +3382,8 @@ fn type_only_star_chain_synthesizes_type_only_stub() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -3189,6 +3457,7 @@ fn type_only_star_chain_named_consumer_synthesizes_type_only_stub() {
                     imported_name: ImportedName::Named("X".to_string()),
                     local_name: "X".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -3244,6 +3513,8 @@ fn type_only_star_chain_named_consumer_synthesizes_type_only_stub() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -3270,7 +3541,7 @@ fn type_only_star_chain_named_consumer_synthesizes_type_only_stub() {
     clippy::too_many_lines,
     reason = "fixture enumerates a mixed star-export graph across value and type paths"
 )]
-fn mixed_type_only_and_value_star_paths_synthesize_value_stub() {
+fn value_star_path_does_not_invent_a_value_binding_for_a_type_export() {
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -3325,6 +3596,7 @@ fn mixed_type_only_and_value_star_paths_synthesize_value_stub() {
                     imported_name: ImportedName::Named("X".to_string()),
                     local_name: "X".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -3342,6 +3614,7 @@ fn mixed_type_only_and_value_star_paths_synthesize_value_stub() {
                     imported_name: ImportedName::Named("X".to_string()),
                     local_name: "X".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
@@ -3414,6 +3687,8 @@ fn mixed_type_only_and_value_star_paths_synthesize_value_stub() {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -3428,18 +3703,16 @@ fn mixed_type_only_and_value_star_paths_synthesize_value_stub() {
         .iter()
         .find(|e| e.name.to_string() == "X" && e.is_type_only)
         .expect("source should have a synthetic type stub for X");
-    let value_stub = source
-        .exports
-        .iter()
-        .find(|e| e.name.to_string() == "X" && !e.is_type_only)
-        .expect("source should have a synthetic value stub for X");
     assert!(
         !type_stub.references.is_empty(),
         "type-only star edge should keep a type synthetic stub"
     );
     assert!(
-        !value_stub.references.is_empty(),
-        "value star edge should keep a value synthetic stub"
+        !source
+            .exports
+            .iter()
+            .any(|export| export.name.to_string() == "X" && !export.is_type_only),
+        "a value star path must not synthesize a value binding for a type-only export"
     );
 }
 
@@ -3651,23 +3924,11 @@ fn star_re_export_duplicate_name_value_import_credits_value_export() {
         type_export.references.is_empty(),
         "value use through a star barrel must not credit the type-only namespace"
     );
-    assert!(
-        !value_export.references.is_empty(),
-        "value use through a star barrel should credit the value export"
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value],
+        "value use through a star barrel should retain the value namespace"
     );
-}
-
-#[test]
-fn star_re_export_origin_index_is_built_once_per_graph() {
-    let (_, builds) = count_named_import_origin_index_builds(|| {
-        graph_for_merged_star_chain_import(
-            vec![named_import("Merged", "Local", false)],
-            vec![],
-            vec!["Local"],
-        )
-    });
-
-    assert_eq!(builds, 1, "the whole-edge origin index must be shared");
 }
 
 #[test]
@@ -3679,9 +3940,10 @@ fn star_re_export_duplicate_name_type_import_credits_type_export() {
     );
 
     let (type_export, value_export) = merged_exports(&graph);
-    assert!(
-        !type_export.references.is_empty(),
-        "type-only use through a star barrel should credit the type export"
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "type-only use through a star barrel should retain the type namespace"
     );
     assert!(
         value_export.references.is_empty(),
@@ -3690,8 +3952,94 @@ fn star_re_export_duplicate_name_type_import_credits_type_export() {
 }
 
 #[test]
-fn star_re_export_duplicate_name_mixed_import_credits_both_exports() {
-    let graph = graph_for_merged_star_import(
+fn named_type_re_export_does_not_credit_same_named_value_export() {
+    let files = vec![
+        discovered_file(0, "/project/consumer.ts"),
+        discovered_file(1, "/project/barrel.ts"),
+        discovered_file(2, "/project/merged.ts"),
+    ];
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: files[0].path.clone(),
+            resolved_imports: vec![named_import("Merged", "MergedType", true)],
+            type_referenced_import_bindings: vec!["MergedType".to_string()],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: files[1].path.clone(),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./merged".to_string(),
+                    imported_name: "Merged".to_string(),
+                    exported_name: "Merged".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: files[2].path.clone(),
+            exports: vec![merged_export(true), merged_export(false)].into(),
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+    let (type_export, value_export) = merged_exports(&graph);
+
+    assert!(!type_export.references.is_empty());
+    assert!(
+        value_export.references.is_empty(),
+        "a named type-only route must not credit the same-named value binding"
+    );
+}
+
+#[test]
+fn named_re_export_value_use_credits_only_value_namespace() {
+    let graph = graph_for_merged_named_import(
+        vec![named_import("Merged", "MergedValue", false)],
+        vec![],
+        vec!["MergedValue"],
+    );
+    let (type_export, value_export) = merged_exports(&graph);
+    assert!(type_export.references.is_empty());
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value]
+    );
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Value]);
+}
+
+#[test]
+fn named_re_export_type_use_credits_only_type_namespace() {
+    let graph = graph_for_merged_named_import(
+        vec![named_import("Merged", "MergedType", true)],
+        vec!["MergedType"],
+        vec![],
+    );
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type]
+    );
+    assert!(value_export.references.is_empty());
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Type]);
+}
+
+#[test]
+fn named_re_export_mixed_use_credits_both_namespaces() {
+    let graph = graph_for_merged_named_import(
         vec![
             named_import("Merged", "MergedValue", false),
             named_import("Merged", "MergedType", true),
@@ -3699,15 +4047,153 @@ fn star_re_export_duplicate_name_mixed_import_credits_both_exports() {
         vec!["MergedType"],
         vec!["MergedValue"],
     );
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type]
+    );
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value]
+    );
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Type, ExportNamespace::Value]);
+    assert_eq!(graph.modules[1].exports[0].physical_references().count(), 1);
+}
+
+#[test]
+fn named_re_export_namespace_references_survive_cache_roundtrip() {
+    let graph = graph_for_merged_named_import(
+        vec![
+            named_import("Merged", "MergedValue", false),
+            named_import("Merged", "MergedType", true),
+        ],
+        vec!["MergedType"],
+        vec!["MergedValue"],
+    );
+    let encoded = postcard::to_allocvec(&graph).expect("encode graph");
+    let decoded: ModuleGraph = postcard::from_bytes(&encoded).expect("decode graph");
+
+    assert_single_merged_barrel_stub(&decoded, &[ExportNamespace::Type, ExportNamespace::Value]);
+}
+
+#[test]
+fn named_type_re_export_credits_value_backed_type_binding() {
+    let graph = graph_for_named_import(
+        vec![named_import("Merged", "MergedType", true)],
+        vec!["MergedType"],
+        vec![],
+        vec![merged_export(false)],
+        true,
+    );
+    let source = &graph.modules[2];
+    assert_eq!(source.exports.len(), 1);
+    assert_eq!(
+        reference_namespaces(&source.exports[0]),
+        vec![ExportNamespace::Type]
+    );
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Type]);
+}
+
+fn reference_namespaces(export: &crate::graph::ExportSymbol) -> Vec<ExportNamespace> {
+    let mut namespaces: Vec<_> = export
+        .references
+        .iter()
+        .map(|reference| reference.namespace)
+        .collect();
+    namespaces.sort_unstable_by_key(|namespace| match namespace {
+        ExportNamespace::Type => 0,
+        ExportNamespace::Value => 1,
+    });
+    namespaces
+}
+
+fn assert_single_merged_barrel_stub(graph: &ModuleGraph, namespaces: &[ExportNamespace]) {
+    let stubs: Vec<_> = graph.modules[1]
+        .exports
+        .iter()
+        .filter(|export| export.name.matches_str("Merged"))
+        .collect();
+    assert_eq!(stubs.len(), 1);
+    assert_eq!(reference_namespaces(stubs[0]), namespaces);
+    assert!(stubs[0].reference_paths.is_empty());
+}
+
+#[test]
+fn star_re_export_single_import_mixed_use_credits_both_exports() {
+    let graph = graph_for_merged_star_import(
+        vec![named_import("Merged", "MergedBoth", false)],
+        vec!["MergedBoth"],
+        vec!["MergedBoth"],
+    );
 
     let (type_export, value_export) = merged_exports(&graph);
-    assert!(
-        !type_export.references.is_empty(),
-        "type use through a star barrel should credit the type export"
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "type use through a star barrel should retain the type namespace"
     );
-    assert!(
-        !value_export.references.is_empty(),
-        "value use through a star barrel should credit the value export"
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value],
+        "value use through a star barrel should retain the value namespace"
+    );
+}
+
+/// An import binding the extractor could not classify (no recorded type or
+/// value usage) must still credit a name that only exists as a type, instead of
+/// resolving in the value namespace and attaching nothing.
+#[test]
+fn star_re_export_unclassified_import_credits_a_type_only_export() {
+    let graph = graph_for_star_import(
+        vec![named_import("Merged", "Merged", false)],
+        vec![],
+        vec![],
+        vec![merged_export(true)],
+    );
+
+    let source = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("merged.ts"))
+        .expect("source module should exist");
+    let type_export = source
+        .exports
+        .iter()
+        .find(|export| export.name.to_string() == "Merged" && export.is_type_only)
+        .expect("type export should exist");
+
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "an unclassified binding through a star barrel must credit the type-only export"
+    );
+}
+
+#[test]
+fn named_re_export_unclassified_import_credits_a_type_only_export() {
+    let graph = graph_for_named_import(
+        vec![named_import("Merged", "Merged", false)],
+        vec![],
+        vec![],
+        vec![merged_export(true)],
+        false,
+    );
+
+    let source = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("merged.ts"))
+        .expect("source module should exist");
+    let type_export = source
+        .exports
+        .iter()
+        .find(|export| export.name.to_string() == "Merged" && export.is_type_only)
+        .expect("type export should exist");
+
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "an unclassified binding through a named re-export must credit the type-only export"
     );
 }
 
@@ -3720,9 +4206,10 @@ fn star_re_export_duplicate_name_multi_hop_type_usage_credits_type_export() {
     );
 
     let (type_export, value_export) = merged_exports(&graph);
-    assert!(
-        !type_export.references.is_empty(),
-        "normal import used only as a type through a multi-hop star barrel should credit the type export"
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "normal import used only as a type through a multi-hop star barrel should retain the type namespace"
     );
     assert!(
         value_export.references.is_empty(),
@@ -3742,13 +4229,15 @@ fn star_re_export_duplicate_name_multi_hop_mixed_usage_credits_both_exports() {
     );
 
     let (type_export, value_export) = merged_exports(&graph);
-    assert!(
-        !type_export.references.is_empty(),
-        "type use forwarded through an intermediate star stub should credit the type export"
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "type use forwarded through an intermediate star stub should retain the type namespace"
     );
-    assert!(
-        !value_export.references.is_empty(),
-        "value use forwarded through an intermediate star stub should credit the value export"
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value],
+        "value use forwarded through an intermediate star stub should retain the value namespace"
     );
 }
 
@@ -3756,6 +4245,20 @@ fn graph_for_merged_star_import(
     imports: Vec<ResolvedImport>,
     type_usages: Vec<&str>,
     value_usages: Vec<&str>,
+) -> ModuleGraph {
+    graph_for_star_import(
+        imports,
+        type_usages,
+        value_usages,
+        vec![merged_export(true), merged_export(false)],
+    )
+}
+
+fn graph_for_star_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+    source_exports: Vec<fallow_types::extract::ExportInfo>,
 ) -> ModuleGraph {
     let files = vec![
         discovered_file(0, "/project/consumer.ts"),
@@ -3800,11 +4303,80 @@ fn graph_for_merged_star_import(
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/merged.ts"),
-            exports: vec![merged_export(true), merged_export(false)].into(),
+            exports: source_exports.into(),
             ..Default::default()
         },
     ];
 
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+fn graph_for_merged_named_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+) -> ModuleGraph {
+    graph_for_named_import(
+        imports,
+        type_usages,
+        value_usages,
+        vec![merged_export(true), merged_export(false)],
+        false,
+    )
+}
+
+fn graph_for_named_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+    source_exports: Vec<fallow_types::extract::ExportInfo>,
+    is_type_only_re_export: bool,
+) -> ModuleGraph {
+    let files = vec![
+        discovered_file(0, "/project/consumer.ts"),
+        discovered_file(1, "/project/barrel.ts"),
+        discovered_file(2, "/project/merged.ts"),
+    ];
+    let entry_points = vec![EntryPoint {
+        path: files[0].path.clone(),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: files[0].path.clone(),
+            resolved_imports: imports,
+            type_referenced_import_bindings: type_usages.into_iter().map(str::to_string).collect(),
+            value_referenced_import_bindings: value_usages
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: files[1].path.clone(),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./merged".to_string(),
+                    imported_name: "Merged".to_string(),
+                    exported_name: "Merged".to_string(),
+                    is_type_only: is_type_only_re_export,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: files[2].path.clone(),
+            exports: source_exports.into(),
+            ..Default::default()
+        },
+    ];
     ModuleGraph::build(&resolved_modules, &entry_points, &files)
 }
 
@@ -3907,6 +4479,7 @@ fn named_import_with_span(
             imported_name: ImportedName::Named(imported_name.to_string()),
             local_name: local_name.to_string(),
             is_type_only,
+            is_type_only_star: false,
             from_style: false,
             span: oxc_span::Span::new(span_start, span_end),
             source_span: oxc_span::Span::default(),
@@ -3930,6 +4503,8 @@ fn named_export(name: &str, is_type_only: bool) -> fallow_types::extract::Export
         members: vec![],
         is_side_effect_used: false,
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     }
 }
 
@@ -3955,4 +4530,178 @@ fn merged_exports(
         .find(|export| export.name.to_string() == "Merged" && !export.is_type_only)
         .expect("value export should exist");
     (type_export, value_export)
+}
+
+/// A `ResolvedReExport` that renames the binding on the way out.
+fn renaming_re_export(
+    source: &str,
+    imported_name: &str,
+    exported_name: &str,
+    target: ResolveResult,
+) -> ResolvedReExport {
+    ResolvedReExport {
+        info: fallow_types::extract::ReExportInfo {
+            source: source.to_string(),
+            imported_name: imported_name.to_string(),
+            exported_name: exported_name.to_string(),
+            is_type_only: false,
+            span: oxc_span::Span::default(),
+            statement_span: oxc_span::Span::default(),
+            source_span: oxc_span::Span::default(),
+        },
+        target,
+    }
+}
+
+fn star_re_export(source: &str, target: ResolveResult) -> ResolvedReExport {
+    plain_re_export(source, "*", target)
+}
+
+/// leaf/other declare `one`; the three barrels forward it, shadow it and
+/// receive it twice.
+fn graph_for_forwarding_shapes() -> ModuleGraph {
+    let files = vec![
+        discovered_file(0, "/project/leaf.ts"),
+        discovered_file(1, "/project/other.ts"),
+        discovered_file(2, "/project/rename.ts"),
+        discovered_file(3, "/project/shadow.ts"),
+        discovered_file(4, "/project/ambiguous.ts"),
+        discovered_file(5, "/project/consumer.ts"),
+    ];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/leaf.ts"),
+            exports: vec![named_export("one", false)].into(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/other.ts"),
+            exports: vec![named_export("one", false)].into(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/rename.ts"),
+            re_exports: vec![renaming_re_export(
+                "./leaf",
+                "one",
+                "renamed",
+                ResolveResult::InternalModule(FileId(0)),
+            )],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/shadow.ts"),
+            exports: vec![named_export("one", false)].into(),
+            re_exports: vec![star_re_export(
+                "./leaf",
+                ResolveResult::InternalModule(FileId(0)),
+            )],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(4),
+            path: PathBuf::from("/project/ambiguous.ts"),
+            re_exports: vec![
+                star_re_export("./leaf", ResolveResult::InternalModule(FileId(0))),
+                star_re_export("./other", ResolveResult::InternalModule(FileId(1))),
+            ],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(5),
+            path: PathBuf::from("/project/consumer.ts"),
+            ..Default::default()
+        },
+    ];
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+#[test]
+fn forwards_binding_agrees_with_phase_2c_on_rename_shadow_and_ambiguity() {
+    let graph = graph_for_forwarding_shapes();
+    let (leaf, other) = (FileId(0), FileId(1));
+    let (rename, shadow, ambiguous) = (FileId(2), FileId(3), FileId(4));
+
+    // A rename hop forwards the leaf binding; a local declaration on the
+    // barrel and the same name arriving from two stars both stop the chain.
+    for (source, source_name, barrel, barrel_name, expected, why) in [
+        (
+            leaf,
+            "one",
+            rename,
+            "renamed",
+            true,
+            "a rename hop forwards",
+        ),
+        (
+            leaf,
+            "one",
+            shadow,
+            "one",
+            false,
+            "a local declaration shadows",
+        ),
+        (
+            leaf,
+            "one",
+            ambiguous,
+            "one",
+            false,
+            "two stars carry the name at once",
+        ),
+        (
+            other,
+            "one",
+            ambiguous,
+            "one",
+            false,
+            "the second star is ambiguous too",
+        ),
+    ] {
+        assert_eq!(
+            graph.forwards_binding(source, source_name, barrel, barrel_name),
+            expected,
+            "the closure search must agree that {why}"
+        );
+        assert_eq!(
+            crate::graph::namespace_indexes::uniquely_forwards_binding(
+                &graph,
+                source,
+                source_name,
+                barrel,
+                barrel_name,
+                ExportNamespace::Value,
+            ),
+            expected,
+            "Phase 2c's own walk must agree that {why}"
+        );
+    }
+}
+
+#[test]
+fn tarjan_scc_returns_only_multi_node_components() {
+    // 0 -> 1 -> 2 -> 3 -> 1 is one three-node cycle. Node 0 and node 4 are
+    // single-node components on either side of it.
+    let adj = vec![vec![1], vec![2], vec![3], vec![1, 4], vec![]];
+    let mut sccs = tarjan_scc(adj.len(), &adj);
+    for scc in &mut sccs {
+        scc.sort_unstable();
+    }
+    assert_eq!(sccs, vec![vec![1, 2, 3]]);
+}
+
+#[test]
+fn tarjan_scc_acyclic_chain_has_no_components() {
+    let adj: Vec<Vec<usize>> = (0..64)
+        .map(|i| if i < 63 { vec![i + 1] } else { vec![] })
+        .collect();
+    assert!(tarjan_scc(adj.len(), &adj).is_empty());
 }

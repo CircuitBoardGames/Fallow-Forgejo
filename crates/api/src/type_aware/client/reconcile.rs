@@ -51,10 +51,108 @@ impl DeadCodeResponsePlan {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the transaction plans every capability delta before its infallible commit"
-)]
+#[derive(Default)]
+struct CandidateResponsePlan {
+    class_decisions: Vec<(usize, SemanticCandidateDecision)>,
+    export_decisions: Vec<(usize, SemanticCandidateDecision)>,
+    type_decisions: Vec<(usize, SemanticCandidateDecision)>,
+    confirmed_class: BTreeSet<usize>,
+    confirmed_exports: BTreeSet<usize>,
+    confirmed_types: BTreeSet<usize>,
+    candidate_decisions: Vec<SemanticCandidateDecision>,
+    decision_stats: CandidateDecisionStats,
+}
+
+impl CandidateResponsePlan {
+    fn record_class(
+        &mut self,
+        results: &AnalysisResults,
+        index: usize,
+        decision: SemanticCandidateDecision,
+    ) -> Result<(), TypeAwareError> {
+        let finding = results.unused_class_members.get(index).ok_or_else(|| {
+            TypeAwareError::from("type-aware class-member target no longer exists".to_string())
+        })?;
+        let semantic_only = finding.semantic_only_candidate;
+        record_candidate_decision(
+            &decision,
+            index,
+            &mut self.confirmed_class,
+            &mut self.decision_stats,
+        );
+        if semantic_only_candidate_stays_hidden(semantic_only, decision.decision) {
+            self.confirmed_class.insert(index);
+        }
+        self.class_decisions.push((index, decision.clone()));
+        self.candidate_decisions.push(decision);
+        Ok(())
+    }
+
+    fn record_export(
+        &mut self,
+        results: &AnalysisResults,
+        index: usize,
+        decision: SemanticCandidateDecision,
+    ) -> Result<(), TypeAwareError> {
+        results.unused_exports.get(index).ok_or_else(|| {
+            TypeAwareError::from("type-aware export target no longer exists".to_string())
+        })?;
+        record_candidate_decision(
+            &decision,
+            index,
+            &mut self.confirmed_exports,
+            &mut self.decision_stats,
+        );
+        self.export_decisions.push((index, decision.clone()));
+        self.candidate_decisions.push(decision);
+        Ok(())
+    }
+
+    fn record_type(
+        &mut self,
+        results: &AnalysisResults,
+        index: usize,
+        decision: SemanticCandidateDecision,
+    ) -> Result<(), TypeAwareError> {
+        results.unused_types.get(index).ok_or_else(|| {
+            TypeAwareError::from("type-aware type target no longer exists".to_string())
+        })?;
+        record_candidate_decision(
+            &decision,
+            index,
+            &mut self.confirmed_types,
+            &mut self.decision_stats,
+        );
+        self.type_decisions.push((index, decision.clone()));
+        self.candidate_decisions.push(decision);
+        Ok(())
+    }
+
+    fn hide_unverified_class_candidates(&mut self, results: &AnalysisResults) {
+        let planned_class_decisions = self
+            .class_decisions
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<BTreeSet<_>>();
+        for (index, finding) in results.unused_class_members.iter().enumerate() {
+            if finding.semantic_only_candidate
+                && finding.semantic.is_none()
+                && !planned_class_decisions.contains(&index)
+            {
+                self.confirmed_class.insert(index);
+            }
+        }
+    }
+}
+
+struct PlannedResponse {
+    candidates: CandidateResponsePlan,
+    api_surface: Option<ApiSurfaceResult>,
+    api_surface_mutation: Option<ApiSurfaceMutation>,
+    type_coupling: Option<TypeCouplingReport>,
+    query_summaries: Vec<SemanticQuerySummary>,
+}
+
 fn build_dead_code_response_plan(
     root: &Path,
     results: &AnalysisResults,
@@ -62,24 +160,51 @@ fn build_dead_code_response_plan(
     response: SemanticResponse,
     requested_capabilities: Vec<SemanticCapability>,
 ) -> Result<DeadCodeResponsePlan, TypeAwareError> {
-    let DeadCodeReconciliation {
-        request,
-        targets,
-        capacity: local_capacity,
-    } = reconciliation;
-    let mut confirmed_class = BTreeSet::new();
-    let mut confirmed_exports = BTreeSet::new();
-    let mut confirmed_types = BTreeSet::new();
-    let mut class_decisions = Vec::new();
-    let mut export_decisions = Vec::new();
-    let mut type_decisions = Vec::new();
+    let mut planned = plan_response_results(root, results, reconciliation, &response)?;
+    apply_symbol_capacity(&mut planned, reconciliation.capacity);
+    planned.candidates.hide_unverified_class_candidates(results);
+    let completeness = response_completeness(&response, reconciliation);
+    let type_aware = build_type_aware_outcome(
+        response,
+        reconciliation,
+        requested_capabilities,
+        completeness,
+        &mut planned,
+    );
+    Ok(DeadCodeResponsePlan {
+        class_decisions: planned.candidates.class_decisions,
+        export_decisions: planned.candidates.export_decisions,
+        type_decisions: planned.candidates.type_decisions,
+        remove_class: planned.candidates.confirmed_class,
+        remove_exports: planned.candidates.confirmed_exports,
+        remove_types: planned.candidates.confirmed_types,
+        api_surface: planned.api_surface_mutation,
+        outcome: SemanticDeadCodeOutcome {
+            type_aware,
+            type_coupling: planned.type_coupling,
+        },
+    })
+}
+
+fn plan_response_results(
+    root: &Path,
+    results: &AnalysisResults,
+    reconciliation: DeadCodeReconciliation<'_>,
+    response: &SemanticResponse,
+) -> Result<PlannedResponse, TypeAwareError> {
+    let request = reconciliation.request;
+    let targets = reconciliation.targets;
+    let mut candidates = CandidateResponsePlan::default();
     let mut api_surface = None;
     let mut api_surface_mutation = None;
     let mut type_coupling = None;
     let mut query_summaries = Vec::new();
-    let mut candidate_decisions = Vec::new();
-    let mut decision_stats = CandidateDecisionStats::default();
     let mut source_cache = FxHashMap::default();
+    let unreachable_files = results
+        .unused_files
+        .iter()
+        .filter_map(|finding| protocol_path(root, &finding.file.path).ok())
+        .collect::<BTreeSet<_>>();
 
     for result in &response.results {
         let Some(target) = targets.get(&result.query_id) else {
@@ -98,61 +223,37 @@ fn build_dead_code_response_plan(
         let mut summary = query_summary(result);
         match target {
             QueryTarget::ClassMember(index) => {
-                let fix_supported = query_supports_guarded_fix(query);
-                let decision = decode_candidate_decision(
-                    root,
-                    query,
-                    result,
-                    fix_supported,
-                    &mut source_cache,
-                )?;
-                let finding = results.unused_class_members.get(*index).ok_or_else(|| {
-                    TypeAwareError::from(
-                        "type-aware class-member target no longer exists".to_string(),
-                    )
-                })?;
-                let semantic_only = finding.semantic_only_candidate;
-                record_candidate_decision(
-                    &decision,
-                    *index,
-                    &mut confirmed_class,
-                    &mut decision_stats,
+                // Guarded-fix evidence comes from the default backend only.
+                let fix_supported =
+                    query_supports_guarded_fix(query) && response.backend == BACKEND_FAMILY;
+                let decision = retain_non_crediting_evidence(
+                    decode_candidate_decision(
+                        root,
+                        query,
+                        result,
+                        fix_supported,
+                        &mut source_cache,
+                    )?,
+                    &unreachable_files,
+                    &mut summary,
                 );
-                if semantic_only_candidate_stays_hidden(semantic_only, decision.decision) {
-                    confirmed_class.insert(*index);
-                }
-                class_decisions.push((*index, decision.clone()));
-                candidate_decisions.push(decision);
+                candidates.record_class(results, *index, decision)?;
             }
             QueryTarget::UnusedExport(index) => {
-                let decision =
-                    decode_candidate_decision(root, query, result, false, &mut source_cache)?;
-                results.unused_exports.get(*index).ok_or_else(|| {
-                    TypeAwareError::from("type-aware export target no longer exists".to_string())
-                })?;
-                record_candidate_decision(
-                    &decision,
-                    *index,
-                    &mut confirmed_exports,
-                    &mut decision_stats,
+                let decision = retain_non_crediting_evidence(
+                    decode_candidate_decision(root, query, result, false, &mut source_cache)?,
+                    &unreachable_files,
+                    &mut summary,
                 );
-                export_decisions.push((*index, decision.clone()));
-                candidate_decisions.push(decision);
+                candidates.record_export(results, *index, decision)?;
             }
             QueryTarget::UnusedType(index) => {
-                let decision =
-                    decode_candidate_decision(root, query, result, false, &mut source_cache)?;
-                results.unused_types.get(*index).ok_or_else(|| {
-                    TypeAwareError::from("type-aware type target no longer exists".to_string())
-                })?;
-                record_candidate_decision(
-                    &decision,
-                    *index,
-                    &mut confirmed_types,
-                    &mut decision_stats,
+                let decision = retain_non_crediting_evidence(
+                    decode_candidate_decision(root, query, result, false, &mut source_cache)?,
+                    &unreachable_files,
+                    &mut summary,
                 );
-                type_decisions.push((*index, decision.clone()));
-                candidate_decisions.push(decision);
+                candidates.record_type(results, *index, decision)?;
             }
             QueryTarget::ApiSurface {
                 unrequested_candidate_count,
@@ -165,37 +266,40 @@ fn build_dead_code_response_plan(
                 api_surface_mutation = Some(mutation);
             }
             QueryTarget::TypeCoupling => {
-                type_coupling = Some(decode_type_coupling(&response, request, result)?);
+                type_coupling = Some(decode_type_coupling(response, request, result)?);
             }
         }
         query_summaries.push(summary);
     }
+    Ok(PlannedResponse {
+        candidates,
+        api_surface,
+        api_surface_mutation,
+        type_coupling,
+        query_summaries,
+    })
+}
+
+fn apply_symbol_capacity(planned: &mut PlannedResponse, local_capacity: LocalCapacity) {
     if local_capacity.unrequested_symbol_count > 0
-        && let Some(summary) = query_summaries
+        && let Some(summary) = planned
+            .query_summaries
             .iter_mut()
             .rev()
             .find(|summary| summary.capability == SemanticCapability::SymbolUse)
     {
         add_summary_capacity_gap(summary, local_capacity.unrequested_symbol_count);
     }
+}
 
-    let planned_class_decisions = class_decisions
-        .iter()
-        .map(|(index, _)| *index)
-        .collect::<BTreeSet<_>>();
-    for (index, finding) in results.unused_class_members.iter().enumerate() {
-        if finding.semantic_only_candidate
-            && finding.semantic.is_none()
-            && !planned_class_decisions.contains(&index)
-        {
-            confirmed_class.insert(index);
-        }
-    }
-
+fn response_completeness(
+    response: &SemanticResponse,
+    reconciliation: DeadCodeReconciliation<'_>,
+) -> SemanticCompleteness {
     let mut completeness = aggregate_completeness(&response.results);
     if completeness == SemanticCompleteness::Complete
-        && (local_capacity.unrequested_symbol_count > 0
-            || targets.values().any(|target| {
+        && (reconciliation.capacity.unrequested_symbol_count > 0
+            || reconciliation.targets.values().any(|target| {
                 matches!(
                     target,
                     QueryTarget::ApiSurface {
@@ -206,6 +310,22 @@ fn build_dead_code_response_plan(
     {
         completeness = SemanticCompleteness::Partial;
     }
+    completeness
+}
+
+fn build_type_aware_outcome(
+    response: SemanticResponse,
+    reconciliation: DeadCodeReconciliation<'_>,
+    requested_capabilities: Vec<SemanticCapability>,
+    completeness: SemanticCompleteness,
+    planned: &mut PlannedResponse,
+) -> TypeAwareOutcome {
+    let request = reconciliation.request;
+    let local_capacity = reconciliation.capacity;
+    let query_summaries = std::mem::take(&mut planned.query_summaries);
+    let candidate_decisions = std::mem::take(&mut planned.candidates.candidate_decisions);
+    let mut decision_stats = std::mem::take(&mut planned.candidates.decision_stats);
+    let api_surface = planned.api_surface.take();
     let capabilities = requested_capabilities
         .into_iter()
         .collect::<BTreeSet<_>>()
@@ -229,32 +349,8 @@ fn build_dead_code_response_plan(
         backend_family: response.backend.clone(),
         completeness,
     };
-    let projects = response
-        .projects
-        .into_iter()
-        .map(|project| TypeAwareProjectMeta {
-            config: project.config,
-            source: project.source,
-            status: project.status,
-            candidate_count: project.candidate_count,
-            confirmed_used_count: project.confirmed_used_count,
-            contract_preserved_count: project.contract_preserved_count,
-            no_static_references_count: project.no_static_references_count,
-            fix_eligible_count: project.fix_eligible_count,
-            unresolved_count: project.unresolved_count,
-            abstained_count: project.abstained_count,
-            blocking_diagnostic_count: project.blocking_diagnostic_count,
-            source_file_count: project.source_file_count,
-            program_reused: Some(project.program_reused),
-            program_shared_across_queries: Some(project.program_reused),
-            program_reused_from_previous_snapshot: project.program_reused_from_previous_snapshot,
-            snapshot_revision: project.snapshot_revision,
-            invalidation_kind: project.invalidation_kind,
-            reason_code: project.reason_code,
-            abstain_reason: None,
-        })
-        .collect();
-    let type_aware = TypeAwareOutcome {
+    let projects = project_metadata(response.projects);
+    TypeAwareOutcome {
         meta: TypeAwareMeta {
             identity: Some(identity),
             required_completeness: None,
@@ -263,7 +359,7 @@ fn build_dead_code_response_plan(
             symbol_traces: Vec::new(),
             api_surface,
             symbol_impacts: Vec::new(),
-            type_coupling: type_coupling.clone(),
+            type_coupling: planned.type_coupling.clone(),
             executed: true,
             protocol_version: response.protocol_version,
             sidecar_version: Some(response.sidecar_version),
@@ -289,20 +385,95 @@ fn build_dead_code_response_plan(
             },
         },
         warnings,
+    }
+}
+
+fn project_metadata(projects: Vec<SemanticProjectResponse>) -> Vec<TypeAwareProjectMeta> {
+    projects
+        .into_iter()
+        .map(|project| TypeAwareProjectMeta {
+            config: project.config,
+            source: project.source,
+            status: project.status,
+            candidate_count: project.candidate_count,
+            confirmed_used_count: project.confirmed_used_count,
+            contract_preserved_count: project.contract_preserved_count,
+            no_static_references_count: project.no_static_references_count,
+            fix_eligible_count: project.fix_eligible_count,
+            unresolved_count: project.unresolved_count,
+            abstained_count: project.abstained_count,
+            blocking_diagnostic_count: project.blocking_diagnostic_count,
+            source_file_count: project.source_file_count,
+            program_reused: Some(project.program_reused),
+            program_shared_across_queries: Some(project.program_reused),
+            program_reused_from_previous_snapshot: project.program_reused_from_previous_snapshot,
+            snapshot_revision: project.snapshot_revision,
+            invalidation_kind: project.invalidation_kind,
+            reason_code: project.reason_code,
+            abstain_reason: None,
+        })
+        .collect()
+}
+
+fn retain_non_crediting_evidence(
+    mut decision: SemanticCandidateDecision,
+    unreachable_files: &BTreeSet<PathBuf>,
+    summary: &mut SemanticQuerySummary,
+) -> SemanticCandidateDecision {
+    if decision.decision != SemanticCandidateDecisionKind::ConfirmedUsed
+        || decision.evidence.is_empty()
+    {
+        return decision;
+    }
+
+    let only_unreachable = decision
+        .evidence
+        .iter()
+        .all(|evidence| unreachable_files.contains(&evidence.path));
+    let only_re_exports = decision
+        .evidence
+        .iter()
+        .all(|evidence| evidence.role.contains("re-export"));
+    let all_non_crediting = decision.evidence.iter().all(|evidence| {
+        unreachable_files.contains(&evidence.path) || evidence.role.contains("re-export")
+    });
+    if !all_non_crediting {
+        return decision;
+    }
+    let (action, assertion, explanation) = if only_unreachable {
+        (
+            "Review the unreachable consumer files before removing this declaration.",
+            "retained-unreachable-evidence",
+            "came only from files unreachable from analyzed entry points",
+        )
+    } else if only_re_exports {
+        (
+            "Confirm that a reachable consumer reads the re-exported binding before removing it.",
+            "retained-non-crediting-evidence",
+            "consisted only of re-export declarations with no proven consumer read",
+        )
+    } else {
+        (
+            "Confirm that a reachable consumer reads this binding before removing it.",
+            "retained-non-crediting-evidence",
+            "combined reads from unreachable files with re-export declarations that had no proven reachable consumer",
+        )
     };
-    Ok(DeadCodeResponsePlan {
-        class_decisions,
-        export_decisions,
-        type_decisions,
-        remove_class: confirmed_class,
-        remove_exports: confirmed_exports,
-        remove_types: confirmed_types,
-        api_surface: api_surface_mutation,
-        outcome: SemanticDeadCodeOutcome {
-            type_aware,
-            type_coupling,
-        },
-    })
+    decision.decision = SemanticCandidateDecisionKind::RetainedAbstained;
+    decision.status = SemanticCompleteness::Partial;
+    decision.closed_world_eligible = false;
+    decision.edit_guard = None;
+    decision.reason_code = None;
+    decision.explanation = format!(
+        "Type-aware evidence for '{}' {explanation}, so it does not refute the dead-code finding.",
+        decision.subject.exported_name,
+    );
+    decision.actions = vec![action.to_string()];
+    summary.assertion = assertion.to_string();
+    summary.status = SemanticCompleteness::Partial;
+    summary.reason_code = None;
+    summary.actions = vec![action.to_string()];
+    decision
 }
 
 pub(super) const fn semantic_only_candidate_stays_hidden(
@@ -314,4 +485,149 @@ pub(super) const fn semantic_only_candidate_stays_hidden(
             decision,
             SemanticCandidateDecisionKind::ConfirmedNoStaticReferences
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn confirmed_used(path: &str) -> SemanticCandidateDecision {
+        SemanticCandidateDecision {
+            query_id: 0,
+            subject: SemanticSymbol {
+                path: PathBuf::from("src/source.ts"),
+                namespace: SemanticNamespace::Value,
+                declaration_kind: "export".to_string(),
+                exported_name: "helper".to_string(),
+                local_name: "helper".to_string(),
+                owner: None,
+                line: 1,
+                col: 13,
+            },
+            decision: SemanticCandidateDecisionKind::ConfirmedUsed,
+            status: SemanticCompleteness::Complete,
+            owning_projects: vec!["tsconfig.json".to_string()],
+            evidence: vec![SemanticReference {
+                path: PathBuf::from(path),
+                line: 2,
+                col: 14,
+                role: "read".to_string(),
+                namespace: SemanticNamespace::Value,
+                via: Vec::new(),
+            }],
+            contract: None,
+            framework_contract: None,
+            closed_world_eligible: false,
+            edit_guard: None,
+            reason_code: None,
+            explanation: "checker found one reference".to_string(),
+            actions: Vec::new(),
+            total_evidence_count: 1,
+            truncated: false,
+            omissions: Vec::new(),
+        }
+    }
+
+    fn summary() -> SemanticQuerySummary {
+        SemanticQuerySummary {
+            query_id: 0,
+            capability: SemanticCapability::SymbolUse,
+            assertion: "confirmed-used".to_string(),
+            status: SemanticCompleteness::Complete,
+            reason_code: None,
+            total_evidence_count: 1,
+            truncated: false,
+            omissions: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn checker_evidence_only_from_unreachable_files_cannot_refute_dead_code() {
+        let unreachable = BTreeSet::from([PathBuf::from("src/orphan.ts")]);
+        let mut query_summary = summary();
+        let decision = retain_non_crediting_evidence(
+            confirmed_used("src/orphan.ts"),
+            &unreachable,
+            &mut query_summary,
+        );
+
+        assert_eq!(
+            decision.decision,
+            SemanticCandidateDecisionKind::RetainedAbstained
+        );
+        assert_eq!(decision.reason_code, None);
+        assert_eq!(query_summary.status, SemanticCompleteness::Partial);
+    }
+
+    #[test]
+    fn reachable_checker_evidence_still_refutes_dead_code() {
+        let unreachable = BTreeSet::from([PathBuf::from("src/orphan.ts")]);
+        let mut query_summary = summary();
+        let decision = retain_non_crediting_evidence(
+            confirmed_used("src/index.ts"),
+            &unreachable,
+            &mut query_summary,
+        );
+
+        assert_eq!(
+            decision.decision,
+            SemanticCandidateDecisionKind::ConfirmedUsed
+        );
+        assert_eq!(query_summary.status, SemanticCompleteness::Complete);
+    }
+
+    #[test]
+    fn truncated_unreachable_evidence_fails_closed() {
+        let unreachable = BTreeSet::from([PathBuf::from("src/orphan.ts")]);
+        let mut candidate = confirmed_used("src/orphan.ts");
+        candidate.total_evidence_count = 41;
+        candidate.truncated = true;
+        let mut query_summary = summary();
+        query_summary.total_evidence_count = 41;
+        query_summary.truncated = true;
+
+        let decision = retain_non_crediting_evidence(candidate, &unreachable, &mut query_summary);
+
+        assert_eq!(
+            decision.decision,
+            SemanticCandidateDecisionKind::RetainedAbstained
+        );
+        assert!(decision.truncated);
+        assert_eq!(decision.total_evidence_count, 41);
+    }
+
+    #[test]
+    fn re_export_declaration_without_consumer_read_cannot_refute_dead_code() {
+        let mut candidate = confirmed_used("src/barrel.ts");
+        candidate.evidence[0].role = "re-export".to_string();
+        let mut query_summary = summary();
+        let decision =
+            retain_non_crediting_evidence(candidate, &BTreeSet::new(), &mut query_summary);
+
+        assert_eq!(
+            decision.decision,
+            SemanticCandidateDecisionKind::RetainedAbstained
+        );
+        assert_eq!(decision.reason_code, None);
+    }
+
+    #[test]
+    fn mixed_unreachable_and_re_export_evidence_cannot_refute_dead_code() {
+        let unreachable = BTreeSet::from([PathBuf::from("src/orphan.ts")]);
+        let mut candidate = confirmed_used("src/orphan.ts");
+        let mut re_export = candidate.evidence[0].clone();
+        re_export.path = PathBuf::from("src/barrel.ts");
+        re_export.role = "re-export".to_string();
+        candidate.evidence.push(re_export);
+        let mut query_summary = summary();
+
+        let decision = retain_non_crediting_evidence(candidate, &unreachable, &mut query_summary);
+
+        assert_eq!(
+            decision.decision,
+            SemanticCandidateDecisionKind::RetainedAbstained
+        );
+        assert_eq!(query_summary.status, SemanticCompleteness::Partial);
+    }
 }

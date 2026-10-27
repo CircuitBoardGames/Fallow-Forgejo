@@ -3,18 +3,25 @@
     clippy::expect_used,
     reason = "benches use unwrap and expect to keep fixture setup concise"
 )]
+#![allow(
+    clippy::significant_drop_tightening,
+    reason = "the external Criterion macro owns the benchmark lifecycle"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fallow_config::{
-    FallowConfig, OutputFormat, discover_workspaces, discover_workspaces_with_diagnostics,
+    FallowConfig, IgnorePatternSet, OutputFormat, discover_workspaces,
+    discover_workspaces_with_diagnostics,
 };
-use globset::GlobSet;
 use tempfile::TempDir;
 
-const BENCH_THREADS: usize = 4;
+#[path = "support/threads.rs"]
+mod threads;
+
+use threads::bench_threads;
 const WORKSPACE_COUNT: usize = 16;
 
 struct ConfigFixture {
@@ -93,7 +100,7 @@ fn component_config_load_and_resolve(c: &mut Criterion) {
                 config.resolve(
                     fixture.root.clone(),
                     OutputFormat::Json,
-                    BENCH_THREADS,
+                    bench_threads(),
                     true,
                     true,
                     None,
@@ -119,7 +126,8 @@ fn component_config_workspace_diagnostics(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_config_fixture,
             |fixture| {
-                discover_workspaces_with_diagnostics(&fixture.root, &GlobSet::empty()).unwrap()
+                discover_workspaces_with_diagnostics(&fixture.root, &IgnorePatternSet::empty())
+                    .unwrap()
             },
             BatchSize::LargeInput,
         );

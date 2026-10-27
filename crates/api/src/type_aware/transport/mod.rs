@@ -18,8 +18,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::manifest::{
-    BACKEND_FAMILY, BACKEND_VERSION, SESSION_ENVELOPE_TYPES, SIDECAR_PACKAGE as SIDECAR_BINARY,
-    STATUS_OPERATION, WIRE_PROTOCOL_VERSION as TYPE_AWARE_PROTOCOL_VERSION,
+    BACKEND_ENV, SESSION_ENVELOPE_TYPES, SIDECAR_PACKAGE as SIDECAR_BINARY, STATUS_OPERATION,
+    WIRE_PROTOCOL_VERSION as TYPE_AWARE_PROTOCOL_VERSION, selected_backend,
 };
 #[cfg(windows)]
 use discovery::canonical_sidecar_path;
@@ -41,7 +41,8 @@ pub use session::{TypeAwareFileChanges, TypeAwareSession};
 
 #[cfg(windows)]
 const SIDECAR_SCRIPT_ENV: &str = "FALLOW_TYPE_AWARE_SCRIPT";
-const SIDECAR_TIMEOUT: Duration = Duration::from_mins(2);
+const SIDECAR_TIMEOUT_ENV: &str = "FALLOW_TYPE_AWARE_TIMEOUT_SECS";
+const DEFAULT_SIDECAR_TIMEOUT_SECS: u64 = 120;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEMANTIC_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -55,6 +56,27 @@ static ACTIVE_SIDECARS: OnceLock<Mutex<BTreeMap<u64, fallow_process::ProcessTree
 
 fn active_sidecars() -> &'static Mutex<BTreeMap<u64, fallow_process::ProcessTreeTerminator>> {
     ACTIVE_SIDECARS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Wall clock allowed for one sidecar request, overridable with
+/// `FALLOW_TYPE_AWARE_TIMEOUT_SECS`.
+///
+/// The cost of a semantic query is a whole-program scan, so the ceiling that
+/// suits a typical project is not the ceiling a very large TypeScript program
+/// needs, especially on Windows where the sidecar transport is a named pipe.
+fn sidecar_timeout() -> Duration {
+    sidecar_timeout_from(non_empty_env(SIDECAR_TIMEOUT_ENV).as_deref())
+}
+
+/// Parse a raw `FALLOW_TYPE_AWARE_TIMEOUT_SECS` value, falling back to the
+/// default for absent, zero, or non-numeric input. Pure so the parsing branches
+/// stay testable without mutating the process env.
+fn sidecar_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok().filter(|&secs| secs > 0))
+        .map_or(
+            Duration::from_secs(DEFAULT_SIDECAR_TIMEOUT_SECS),
+            Duration::from_secs,
+        )
 }
 
 /// Terminate every active type-aware sidecar started by this process.
@@ -178,13 +200,13 @@ pub fn status(root: &Path) -> TypeAwareStatus {
         Err(error) => {
             // Both the sibling and wrapper paths are installation problems the
             // npm package fixes; only a user-set override keeps the raw error.
-            let remediation = if discovery_source != "environment-override" {
+            let remediation = if discovery_source == "environment-override" {
+                error
+            } else {
                 format!(
                     "Install the matching companion with: npm install --save-dev fallow-type-aware@{}",
                     env!("CARGO_PKG_VERSION")
                 )
-            } else {
-                error
             };
             return TypeAwareStatus {
                 available: false,
@@ -198,6 +220,21 @@ pub fn status(root: &Path) -> TypeAwareStatus {
             };
         }
     };
+    let (backend_family, backend_version) = match selected_backend() {
+        Ok(backend) => backend,
+        Err(error) => {
+            return TypeAwareStatus {
+                available: false,
+                discovery_source: Some(discovery_source),
+                companion_path: Some(sidecar),
+                package_version: None,
+                protocol_version: TYPE_AWARE_PROTOCOL_VERSION,
+                backend_family: None,
+                backend_version: None,
+                remediation: Some(error),
+            };
+        }
+    };
     let request = StatusRequest {
         protocol_version: TYPE_AWARE_PROTOCOL_VERSION,
         operation: STATUS_OPERATION,
@@ -206,14 +243,14 @@ pub fn status(root: &Path) -> TypeAwareStatus {
         &sidecar,
         root,
         &request,
-        SIDECAR_TIMEOUT,
+        sidecar_timeout(),
         MAX_RESPONSE_BYTES,
     ) {
         Ok(response)
             if response.protocol_version == TYPE_AWARE_PROTOCOL_VERSION
                 && response.package_version == env!("CARGO_PKG_VERSION")
-                && response.backend_family == BACKEND_FAMILY
-                && response.backend_version == BACKEND_VERSION =>
+                && response.backend_family == backend_family
+                && response.backend_version == backend_version =>
         {
             TypeAwareStatus {
                 available: true,
@@ -251,6 +288,17 @@ pub fn status(root: &Path) -> TypeAwareStatus {
     }
 }
 
+/// Check whether the trusted type-aware companion can be discovered without
+/// starting it or reading project source.
+///
+/// # Errors
+///
+/// Returns the same actionable discovery error used by [`status`] when no
+/// trusted companion file is available.
+pub fn discover_companion(root: &Path) -> Result<(), String> {
+    discover_type_aware_sidecar(root).map(|_| ())
+}
+
 /// Result of a completed type-aware pass.
 #[derive(Debug)]
 pub struct TypeAwareOutcome {
@@ -286,13 +334,14 @@ where
     Request: Serialize + ?Sized,
     Response: DeserializeOwned,
 {
+    selected_backend()?;
     let root = canonicalize_root(root)?;
     let sidecar = discover_type_aware_sidecar(&root)?;
     run_sidecar_json(
         &sidecar,
         &root,
         request,
-        SIDECAR_TIMEOUT,
+        sidecar_timeout(),
         MAX_SEMANTIC_RESPONSE_BYTES,
     )
     .map_err(TypeAwareError)
@@ -309,6 +358,18 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[test]
+    fn sidecar_timeout_honors_a_valid_override_and_falls_back_otherwise() {
+        let default = Duration::from_secs(DEFAULT_SIDECAR_TIMEOUT_SECS);
+        assert_eq!(sidecar_timeout_from(Some("600")), Duration::from_mins(10));
+        assert_eq!(sidecar_timeout_from(None), default);
+        // Zero would mean "no time at all"; treat it as unset, like the other
+        // timeout overrides in this repository.
+        assert_eq!(sidecar_timeout_from(Some("0")), default);
+        assert_eq!(sidecar_timeout_from(Some("not-a-number")), default);
+        assert_eq!(sidecar_timeout_from(Some("-30")), default);
     }
 
     #[test]
@@ -566,7 +627,10 @@ mod tests {
         .expect_err("blocked sidecar should time out");
 
         assert!(error.contains("timed out"), "unexpected error: {error}");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Without the timeout the request lasts the full 30 second sleep. The
+        // bound stays far below that and far above a slow start on a loaded
+        // machine.
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 
     #[cfg(unix)]
@@ -580,12 +644,13 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary sidecar root");
         let sidecar = root.path().join("blocking-sidecar.sh");
         let ready = root.path().join("sidecar-ready");
-        // Ready only once the request has arrived: `write_request` drops stdin after writing, so the
-        // read returns then. Signalled before it, a busy host could terminate the sidecar before the
-        // request thread wrote, failing the write ("Broken pipe") instead of the blocked read.
+        // The transport writes the request only after its post-spawn
+        // termination-epoch re-check passed, so signaling readiness after
+        // consuming stdin guarantees termination lands past the start window
+        // and surfaces the exit status instead of start cancellation (#2231).
         fs::write(
             &sidecar,
-            "#!/bin/sh\nread -r _request\nprintf ready > sidecar-ready\nexec sleep 30\n",
+            "#!/bin/sh\nread request\nprintf ready > sidecar-ready\nexec sleep 30\n",
         )
         .expect("write sidecar");
         let mut permissions = fs::metadata(&sidecar)
@@ -608,11 +673,14 @@ mod tests {
             )
         });
 
-        let ready_deadline = Instant::now() + Duration::from_secs(5);
-        while !ready.exists() && Instant::now() < ready_deadline {
+        let ready_deadline = Instant::now() + Duration::from_mins(2);
+        while !ready.exists() && !request.is_finished() && Instant::now() < ready_deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(ready.exists(), "sidecar did not start");
+        if !ready.exists() {
+            let outcome = request.join().expect("request thread");
+            panic!("sidecar did not start; request result: {outcome:?}");
+        }
 
         let started = Instant::now();
         terminate_active_type_aware_sidecars();
@@ -621,8 +689,12 @@ mod tests {
             .expect("request thread")
             .expect_err("terminated sidecar should fail");
 
+        // Without termination the request ends only at its 30 second
+        // transport timeout. A slow start shortens that margin, so the
+        // `exited with status` check below is what separates a real
+        // termination from the timeout.
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(20),
             "sidecar termination did not unblock the request"
         );
         assert!(
@@ -836,6 +908,7 @@ for await (const line of lines) {
     fn cancelled_session_does_not_restart_after_request_failure() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
 
         #[derive(Serialize)]
         struct Request {
@@ -863,7 +936,8 @@ for await (const line of lines) {
   if (envelope.type === "shutdown") process.exit(0);
   fs.writeFileSync(path.join(process.cwd(), ".session-request-seen"), "1");
   const cancellationAcknowledgement = path.join(process.cwd(), ".session-cancelled");
-  for (let attempt = 0; attempt < 6000 && !fs.existsSync(cancellationAcknowledgement); attempt += 1) {
+  const deadline = Date.now() + 120_000;
+  while (!fs.existsSync(cancellationAcknowledgement) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   process.exit(1);
@@ -886,39 +960,44 @@ for await (const line of lines) {
         let process = TypeAwareSessionProcess::spawn(&canonical_sidecar, &canonical_root)
             .expect("spawn persistent sidecar");
         let cancellation = Arc::new(AtomicBool::new(false));
-        let cancellation_watcher = Arc::clone(&cancellation);
         let request_marker = sidecar_dir.join(".session-request-seen");
         let cancellation_marker = sidecar_dir.join(".session-cancelled");
-        // Both waits are deadlines for an event that does arrive, so they are generous: a loaded
-        // runner can take longer than half a second to start node, and a watcher that gave up
-        // first let the sidecar exit uncancelled and restart, failing this test.
-        let watcher = std::thread::spawn(move || {
-            for _ in 0..6000 {
-                if request_marker.exists() {
-                    cancellation_watcher.store(true, Ordering::SeqCst);
-                    fs::write(cancellation_marker, "1").expect("acknowledge cancellation");
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
         let mut session = TypeAwareSession {
             root: canonical_root.clone(),
             sidecar: canonical_sidecar,
             process: Some(process),
             request_id: 0,
             revision: 0,
-            cancellation: Some(cancellation),
+            cancellation: Some(Arc::clone(&cancellation)),
         };
+        let request_root = canonical_root;
+        let request = std::thread::spawn(move || {
+            let error = session
+                .run_semantic_request::<_, serde_json::Value>(
+                    &request_root,
+                    &Request { value: 9 },
+                    None,
+                )
+                .expect_err("cancelled owner prevents restart");
+            (session, error)
+        });
 
-        let error = session
-            .run_semantic_request::<_, serde_json::Value>(
-                &canonical_root,
-                &Request { value: 9 },
-                None,
-            )
-            .expect_err("cancelled owner prevents restart");
-        watcher.join().expect("cancellation watcher");
+        // Node startup can take many seconds on a loaded machine. The request
+        // thread finishing first means the sidecar failed before it saw the
+        // request, so the long deadline only guards against a hang.
+        let request_deadline = Instant::now() + Duration::from_mins(2);
+        while !request_marker.exists()
+            && !request.is_finished()
+            && Instant::now() < request_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let request_seen = request_marker.exists();
+        cancellation.store(true, Ordering::SeqCst);
+        fs::write(cancellation_marker, "1").expect("acknowledge cancellation");
+        let (session, error) = request.join().expect("semantic request");
+
+        assert!(request_seen, "sidecar did not observe the semantic request");
 
         assert!(
             error.to_string().contains("owner is closing"),

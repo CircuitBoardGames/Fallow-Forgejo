@@ -25,6 +25,7 @@ fn test_only_dep_from_root_test_file() {
                 imported_name: ImportedName::Named("describe".to_string()),
                 local_name: "describe".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
@@ -45,6 +46,7 @@ fn test_only_dep_from_root_test_file() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -84,6 +86,7 @@ fn test_only_dep_from_root_config_file() {
                 imported_name: ImportedName::Named("defineConfig".to_string()),
                 local_name: "defineConfig".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
@@ -104,6 +107,7 @@ fn test_only_dep_from_root_config_file() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -145,6 +149,7 @@ fn test_only_dep_from_workspace_config_file() {
                 imported_name: ImportedName::Named("defineConfig".to_string()),
                 local_name: "defineConfig".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
@@ -165,6 +170,7 @@ fn test_only_dep_from_workspace_config_file() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -205,6 +211,7 @@ fn not_test_only_when_imported_from_app_config() {
                 imported_name: ImportedName::Named("provideRouter".to_string()),
                 local_name: "provideRouter".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
@@ -225,6 +232,7 @@ fn not_test_only_when_imported_from_app_config() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -278,6 +286,7 @@ fn not_test_only_when_also_imported_from_source() {
                     imported_name: ImportedName::Named("configure".to_string()),
                     local_name: "configure".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
@@ -298,6 +307,7 @@ fn not_test_only_when_also_imported_from_source() {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         },
         ResolvedModule {
             file_id: FileId(1),
@@ -310,6 +320,7 @@ fn not_test_only_when_also_imported_from_source() {
                     imported_name: ImportedName::Named("doSomething".to_string()),
                     local_name: "doSomething".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
                     from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
@@ -330,6 +341,7 @@ fn not_test_only_when_also_imported_from_source() {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         },
     ];
 
@@ -370,6 +382,7 @@ fn test_only_dep_from_workspace_jest_config() {
                 imported_name: ImportedName::Named("pathsToModuleNameMapper".to_string()),
                 local_name: "pathsToModuleNameMapper".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
                 from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
@@ -390,6 +403,7 @@ fn test_only_dep_from_workspace_jest_config() {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);

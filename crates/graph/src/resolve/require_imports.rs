@@ -5,15 +5,19 @@
 //!
 //! Destructured requires (`const { a, b } = require('./x')`) become named imports.
 //! Non-destructured requires (`const mod = require('./x')`) become namespace imports
-//! as a conservative default — the entire module binding may be used in ways that
+//! as a conservative default: the entire module binding may be used in ways that
 //! cannot be statically determined.
+//!
+//! `RequireCallInfo::is_type_only` carries through to the resolved import so
+//! the erased `import type X = require('./x')` spelling stays out of runtime
+//! dependency classification, matching `import type * as X from './x'`.
 
 use std::path::Path;
 
 use fallow_types::extract::{ImportInfo, ImportedName, RequireCallInfo};
 
 use super::ResolvedImport;
-use super::specifier::resolve_specifier;
+use super::specifier::resolve_import_specifier;
 use super::types::ResolveContext;
 
 /// Resolve CommonJS `require()` calls.
@@ -35,7 +39,8 @@ pub(super) fn resolve_single_require(
     file_path: &Path,
     req: &RequireCallInfo,
 ) -> Vec<ResolvedImport> {
-    let target = resolve_specifier(ctx, file_path, &req.source, false).into_commonjs_require();
+    let target =
+        resolve_import_specifier(ctx, file_path, &req.source, false).into_commonjs_require();
 
     if req.destructured_names.is_empty() {
         return vec![ResolvedImport {
@@ -43,7 +48,8 @@ pub(super) fn resolve_single_require(
                 source: req.source.clone(),
                 imported_name: ImportedName::Namespace,
                 local_name: req.local_name.clone().unwrap_or_default(),
-                is_type_only: false,
+                is_type_only: req.is_type_only,
+                is_type_only_star: false,
                 from_style: false,
                 span: req.span,
                 source_span: req.source_span,
@@ -59,7 +65,8 @@ pub(super) fn resolve_single_require(
                 source: req.source.clone(),
                 imported_name: ImportedName::Named(name.clone()),
                 local_name: name.clone(),
-                is_type_only: false,
+                is_type_only: req.is_type_only,
+                is_type_only_star: false,
                 from_style: false,
                 span: req.span,
                 source_span: req.source_span,

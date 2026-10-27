@@ -9,19 +9,19 @@ use std::sync::Arc;
 
 use std::path::{Path, PathBuf};
 
+use fallow_types::cache_rejection::CacheRejection;
 use fallow_types::discover::{DiscoveredFile, FileId, StableFileKey};
 use fallow_types::extract::{ImportInfo, ReExportInfo};
-use fallow_types::source_fingerprint::SourceFingerprint;
 use oxc_span::Span;
 
 use crate::resolve::{
-    ResolveResult, ResolvedImport, ResolvedModule, ResolvedProject, ResolvedReExport,
-    ResolvedReplacedModuleTarget,
+    MissingExportTarget, ResolveResult, ResolvedImport, ResolvedModule, ResolvedProject,
+    ResolvedReExport, ResolvedReplacedModuleTarget,
 };
 
 mod store;
 
-pub use store::GraphCacheStore;
+pub use store::{GRAPH_CACHE_FILE, GraphCacheStore};
 
 /// Persisted graph cache schema version.
 ///
@@ -37,27 +37,10 @@ pub use store::GraphCacheStore;
 /// unmodified tree and silently hides the new behaviour. The same applies to
 /// plugin config extraction, which seeds entry points and path aliases.
 ///
-/// Bumped to 17 for issue #2031: cached resolver output retains canonical
-/// test-root replacements and ESM/CommonJS mechanisms, while profiled graphs
-/// retain target-sparse reachability masks plus exact compact reference routes.
-/// Ordinary graphs omit unused provenance. Versions 7 through 16 were used by
-/// published development commits for this change, so the final version remains
-/// 17 rather than reusing a potentially stale intermediate cache version.
-///
-/// Bumped to 18 for issue #2083: reference provenance moved out of
-/// `SymbolReference` into the per-export `reference_paths` side table, changing
-/// the persisted layout of every export's reference list.
-///
-/// Bumped to 19 for issue #2084 (PR #2096): profiled test-reachability masking
-/// now falls back to the legacy fail-open classification when a graph would
-/// need more than the mask-profile cap, so caches written by the unbounded
-/// profiling code must not replay their old profiled results on large
-/// monorepos where the cap now engages.
-///
-/// Bumped to 20: cached re-export edges now carry the enclosing statement
-/// span and the source string-literal span used to anchor unresolved-import
-/// findings on the specifier. Warm 19 caches lack both spans.
-pub const GRAPH_CACHE_VERSION: u32 = 20;
+/// Never reuse a version number that a published build wrote, even from a
+/// development commit. Git history and the CHANGELOG record the reason for
+/// each bump.
+pub const GRAPH_CACHE_VERSION: u32 = 96;
 
 /// Cached form of a resolved target.
 ///
@@ -243,6 +226,8 @@ pub struct CachedImportInfo {
     local_name: String,
     /// Whether this import is type-only.
     is_type_only: bool,
+    /// Whether this whole-module import only carries the target's type meanings.
+    is_type_only_star: bool,
     /// Whether this import originated from a style context.
     from_style: bool,
     /// Span of the full import declaration.
@@ -258,6 +243,7 @@ impl From<&ImportInfo> for CachedImportInfo {
             imported_name: info.imported_name.clone(),
             local_name: info.local_name.clone(),
             is_type_only: info.is_type_only,
+            is_type_only_star: info.is_type_only_star,
             from_style: info.from_style,
             span: span_to_pair(info.span),
             source_span: span_to_pair(info.source_span),
@@ -272,6 +258,7 @@ impl From<CachedImportInfo> for ImportInfo {
             imported_name: info.imported_name,
             local_name: info.local_name,
             is_type_only: info.is_type_only,
+            is_type_only_star: info.is_type_only_star,
             from_style: info.from_style,
             span: pair_to_span(info.span),
             source_span: pair_to_span(info.source_span),
@@ -339,6 +326,8 @@ pub struct CachedResolvedModule {
     re_exports: Vec<CachedResolvedReExport>,
     /// Dynamic import pattern targets, aligned with current extracted patterns.
     resolved_dynamic_pattern_targets: Vec<Vec<StableFileKey>>,
+    /// Missing `exports` paths of unresolved bare specifiers.
+    missing_export_targets: Vec<MissingExportTarget>,
 }
 
 impl CachedResolvedModule {
@@ -373,6 +362,7 @@ impl CachedResolvedModule {
                         .collect::<Option<Vec<_>>>()
                 })
                 .collect::<Option<Vec<_>>>()?,
+            missing_export_targets: module.missing_export_targets.clone(),
         })
     }
 }
@@ -472,6 +462,7 @@ pub fn restore_resolved_project(
     Some(ResolvedProject {
         modules: resolved_modules,
         replaced_module_targets,
+        work: crate::resolve::ResolveWork::default(),
     })
 }
 
@@ -569,6 +560,7 @@ fn restore_cached_resolved_module(
             &module.exported_factory_return_object_shapes,
         ),
         type_member_types: Arc::clone(&module.type_member_types),
+        missing_export_targets: entry.missing_export_targets.clone(),
     })
 }
 
@@ -683,6 +675,7 @@ pub(crate) mod member_serde {
                 decorator_names: cached.decorator_names,
                 is_instance_returning_static: cached.is_instance_returning_static,
                 is_self_returning: cached.is_self_returning,
+                override_base: None,
             }
         }
     }
@@ -746,22 +739,28 @@ pub struct GraphCacheFile {
     /// edges through stable keys, a changed assignment must miss rather than
     /// trust a graph whose `modules[file_id]` indexes point at different files.
     pub file_id: FileId,
-    /// Metadata fingerprint for cache invalidation.
-    pub fingerprint: SourceFingerprint,
+    /// xxh3 hash of the parsed source content.
+    ///
+    /// Content, not `(mtime, size)`: the metadata pair is writer-controlled and
+    /// a same-length rewrite with a restored mtime leaves it unchanged, so a
+    /// metadata-keyed manifest can hand back the previous run's graph for a
+    /// tree that no longer matches it. The hash is free here because the parse
+    /// stage already computed it, and unlike a ctime it survives `cp -Rp` and
+    /// CI cache restores, which is what makes a warm graph reusable across
+    /// checkouts at all.
+    ///
+    /// `0` when the run produced no module for the file (an unreadable source).
+    pub content_hash: u64,
 }
 
 impl GraphCacheFile {
-    /// Build a graph-cache file row from a discovered file and fingerprint.
+    /// Build a graph-cache file row from a discovered file and content hash.
     #[must_use]
-    fn from_discovered_file(
-        root: &Path,
-        file: &DiscoveredFile,
-        fingerprint: SourceFingerprint,
-    ) -> Self {
+    fn from_discovered_file(root: &Path, file: &DiscoveredFile, content_hash: u64) -> Self {
         Self {
             key: StableFileKey::from_root_relative(root, &file.path),
             file_id: file.id,
-            fingerprint,
+            content_hash,
         }
     }
 }
@@ -769,6 +768,8 @@ impl GraphCacheFile {
 /// Manifest inputs required to trust a persisted graph cache entry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphCacheManifest {
+    /// Root anchoring the absolute paths retained in the graph and resolver payload.
+    pub root: PathBuf,
     /// Schema version used by the persisted graph-cache entry.
     pub version: u32,
     /// Graph-affecting option dimensions.
@@ -780,29 +781,30 @@ pub struct GraphCacheManifest {
 impl GraphCacheManifest {
     /// Build a manifest and sort files by stable key for deterministic compare.
     #[must_use]
-    fn new(mode: GraphCacheMode, mut files: Vec<GraphCacheFile>) -> Self {
+    fn new(root: &Path, mode: GraphCacheMode, mut files: Vec<GraphCacheFile>) -> Self {
         sort_files(&mut files);
         Self {
+            root: root.to_path_buf(),
             version: GRAPH_CACHE_VERSION,
             mode,
             files,
         }
     }
 
-    /// Build a manifest from discovered files plus a fingerprint provider.
+    /// Build a manifest from discovered files plus a content-hash provider.
     pub fn from_discovered_files(
         root: &Path,
         files: &[DiscoveredFile],
         mode: GraphCacheMode,
-        mut fingerprint_for_path: impl FnMut(&Path) -> SourceFingerprint,
+        mut content_hash_for_file: impl FnMut(&DiscoveredFile) -> u64,
     ) -> Self {
         let rows = files
             .iter()
             .map(|file| {
-                GraphCacheFile::from_discovered_file(root, file, fingerprint_for_path(&file.path))
+                GraphCacheFile::from_discovered_file(root, file, content_hash_for_file(file))
             })
             .collect();
-        Self::new(mode, rows)
+        Self::new(root, mode, rows)
     }
 
     /// True when a persisted manifest matches the current graph inputs.
@@ -810,29 +812,43 @@ impl GraphCacheManifest {
     pub fn matches_inputs(&self, current: &Self) -> bool {
         self.version == GRAPH_CACHE_VERSION
             && current.version == GRAPH_CACHE_VERSION
+            && self.root == current.root
             && self.mode == current.mode
             && self.files == current.files
     }
 
-    /// True when a persisted resolver payload can be remapped to current FileIds.
+    /// Name the first input dimension that differs from the current run, for
+    /// a manifest whose resolution inputs may differ from the current run.
     ///
-    /// Unlike [`Self::matches_inputs`], this intentionally ignores each row's
-    /// `file_id`. It is not sufficient to trust the persisted `ModuleGraph`, but
-    /// it is sufficient to reuse stable-keyed resolver output and rebuild the
-    /// graph with current FileIds.
+    /// The caller decides graph reuse after a successful, fully paid load, so
+    /// this is the most expensive refusal in the pipeline and used to be the
+    /// only silent one. `None` means the resolution inputs actually match and
+    /// the caller should not be asking.
     #[must_use]
-    pub fn matches_resolution_inputs(&self, current: &Self) -> bool {
-        self.version == GRAPH_CACHE_VERSION
-            && current.version == GRAPH_CACHE_VERSION
-            && self.mode == current.mode
-            && self.files.len() == current.files.len()
-            && self
+    pub fn classify_resolution_mismatch(&self, current: &Self) -> Option<CacheRejection> {
+        if self.version != GRAPH_CACHE_VERSION || current.version != GRAPH_CACHE_VERSION {
+            return Some(CacheRejection::VersionMismatch);
+        }
+        if self.root != current.root {
+            return Some(CacheRejection::RootMismatch);
+        }
+        if self.mode != current.mode {
+            return Some(CacheRejection::ModeMismatch);
+        }
+        if self.files.len() != current.files.len()
+            || self
                 .files
                 .iter()
                 .zip(current.files.iter())
-                .all(|(cached, current)| {
-                    cached.key == current.key && cached.fingerprint == current.fingerprint
-                })
+                .any(|(cached, current)| cached.key != current.key)
+        {
+            return Some(CacheRejection::FileSetChanged);
+        }
+        self.files
+            .iter()
+            .zip(current.files.iter())
+            .any(|(cached, current)| cached.content_hash != current.content_hash)
+            .then_some(CacheRejection::FingerprintChanged)
     }
 }
 
@@ -845,6 +861,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use fallow_types::discover::FileId;
+    use fallow_types::extract::{DynamicImportPattern, ModuleInfo, ModuleLoadMechanism};
     use rustc_hash::FxHashMap;
 
     use super::*;
@@ -861,20 +878,20 @@ mod tests {
         GraphCacheMode::new(1, 2, 3)
     }
 
-    fn fingerprints(pairs: &[(&str, SourceFingerprint)]) -> FxHashMap<PathBuf, SourceFingerprint> {
+    fn content_hashes(pairs: &[(&str, u64)]) -> FxHashMap<PathBuf, u64> {
         pairs
             .iter()
-            .map(|(path, fingerprint)| (PathBuf::from(path), *fingerprint))
+            .map(|(path, hash)| (PathBuf::from(path), *hash))
             .collect()
     }
 
     fn manifest(
         files: &[DiscoveredFile],
         mode: GraphCacheMode,
-        map: &FxHashMap<PathBuf, SourceFingerprint>,
+        map: &FxHashMap<PathBuf, u64>,
     ) -> GraphCacheManifest {
-        GraphCacheManifest::from_discovered_files(Path::new("/project"), files, mode, |path| {
-            *map.get(path).unwrap()
+        GraphCacheManifest::from_discovered_files(Path::new("/project"), files, mode, |file| {
+            *map.get(&file.path).unwrap()
         })
     }
 
@@ -884,6 +901,7 @@ mod tests {
             imported_name: fallow_types::extract::ImportedName::SideEffect,
             local_name: String::new(),
             is_type_only: false,
+            is_type_only_star: false,
             from_style: false,
             span: Span::new(0, 0),
             source_span: Span::new(0, 0),
@@ -891,12 +909,31 @@ mod tests {
     }
 
     #[test]
+    fn cached_import_info_round_trip_keeps_every_field() {
+        // The resolver payload is replayed into a fresh graph build, so any
+        // field the mirror drops silently changes analysis behaviour behind a
+        // cache hit. Compare the debug rendering so a future field that is not
+        // mirrored fails here instead of in a warm-only output diff.
+        let original = ImportInfo {
+            source: "./impl".to_string(),
+            imported_name: fallow_types::extract::ImportedName::Namespace,
+            local_name: "ns".to_string(),
+            is_type_only: true,
+            is_type_only_star: true,
+            from_style: true,
+            span: Span::new(3, 41),
+            source_span: Span::new(17, 25),
+        };
+
+        let restored = ImportInfo::from(CachedImportInfo::from(&original));
+
+        assert_eq!(format!("{restored:?}"), format!("{original:?}"));
+    }
+
+    #[test]
     fn manifest_sorts_by_stable_file_key() {
         let files = vec![file(0, "/project/src/z.ts"), file(1, "/project/src/a.ts")];
-        let map = fingerprints(&[
-            ("/project/src/z.ts", SourceFingerprint::new(10, 1)),
-            ("/project/src/a.ts", SourceFingerprint::new(20, 1)),
-        ]);
+        let map = content_hashes(&[("/project/src/z.ts", 10), ("/project/src/a.ts", 20)]);
 
         let manifest = manifest(&files, mode(), &map);
 
@@ -912,10 +949,7 @@ mod tests {
     fn manifest_misses_on_file_id_shift_until_graph_remap_exists() {
         let before = vec![file(0, "/project/src/a.ts"), file(1, "/project/src/c.ts")];
         let after = vec![file(9, "/project/src/c.ts"), file(2, "/project/src/a.ts")];
-        let map = fingerprints(&[
-            ("/project/src/a.ts", SourceFingerprint::new(10, 1)),
-            ("/project/src/c.ts", SourceFingerprint::new(20, 1)),
-        ]);
+        let map = content_hashes(&[("/project/src/a.ts", 10), ("/project/src/c.ts", 20)]);
 
         let cached = manifest(&before, mode(), &map);
         let current = manifest(&after, mode(), &map);
@@ -924,8 +958,9 @@ mod tests {
             !cached.matches_inputs(&current),
             "the persisted graph is still FileId-keyed, so FileId shifts cannot trust it"
         );
-        assert!(
-            cached.matches_resolution_inputs(&current),
+        assert_eq!(
+            cached.classify_resolution_mismatch(&current),
+            None,
             "stable-keyed resolver payloads may be remapped across FileId shifts"
         );
     }
@@ -1023,11 +1058,133 @@ mod tests {
         let project = ResolvedProject {
             modules: vec![module],
             replaced_module_targets: Vec::new(),
+            ..ResolvedProject::default()
         };
 
         let cached = cache_resolved_project(Path::new("/project"), &files, &project);
 
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn cached_graph_restores_current_factory_property_sources() {
+        use fallow_types::extract::{
+            FactoryPropertySource, FactoryReturnObjectPropertySourceFact, SemanticFact,
+        };
+        let files = vec![file(0, "/project/src/app.ts")];
+        let project = ResolvedProject {
+            modules: vec![ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/src/app.ts"),
+                ..ResolvedModule::default()
+            }],
+            ..ResolvedProject::default()
+        };
+        let cached = cache_resolved_project(Path::new("/project"), &files, &project)
+            .expect("stable graph cache");
+        let fact = SemanticFact::FactoryReturnObjectPropertySource(Box::new(
+            FactoryReturnObjectPropertySourceFact {
+                factory_export_name: "createUi".into(),
+                property_path: "page".into(),
+                source: FactoryPropertySource::FunctionReturn {
+                    callee_name: "make".into(),
+                },
+            },
+        ));
+        let callback_source = SemanticFact::FactoryReturnObjectPropertySource(Box::new(
+            FactoryReturnObjectPropertySourceFact {
+                factory_export_name: "wrap".into(),
+                property_path: "value".into(),
+                source: FactoryPropertySource::CallbackParameterReturn { parameter_index: 0 },
+            },
+        ));
+        let callback_access = SemanticFact::CallbackFactoryPropertyAccess(Box::new(
+            fallow_types::extract::CallbackFactoryPropertyAccessFact {
+                callee_name: "wrap".into(),
+                callee_member: None,
+                property_path: "value".into(),
+                member: "go".into(),
+                vue_only: false,
+                assigned_class: Some("Assigned".into()),
+                arguments: vec![fallow_types::extract::CallbackFactoryArgument {
+                    parameter_index: 0,
+                    class_local_name: "C".into(),
+                    getter: true,
+                    lazy_safe: true,
+                }],
+            },
+        ));
+        for current in [vec![fact, callback_source, callback_access], Vec::new()] {
+            let module = ModuleInfo {
+                semantic_facts: current.clone().into(),
+                ..ModuleInfo::empty(FileId(0))
+            };
+            let restored =
+                restore_resolved_project(Path::new("/project"), &[module], &files, &cached)
+                    .expect("current parsed facts with cached resolution");
+            assert_eq!(
+                restored.modules[0].semantic_facts.as_ref(),
+                current.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn cached_dynamic_pattern_targets_preserve_empty_rows() {
+        let files = vec![file(0, "/project/src/app.ts")];
+        let pattern = DynamicImportPattern {
+            prefix: "./missing/".into(),
+            suffix: Some(".ts".into()),
+            span: Span::new(0, 1),
+            mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
+        };
+        let module = ModuleInfo {
+            dynamic_import_patterns: vec![pattern.clone()],
+            ..ModuleInfo::empty(FileId(0))
+        };
+        let resolved = ResolvedProject {
+            modules: vec![ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/src/app.ts"),
+                resolved_dynamic_patterns: vec![(pattern, Vec::new())],
+                ..ResolvedModule::default()
+            }],
+            replaced_module_targets: Vec::new(),
+            ..ResolvedProject::default()
+        };
+
+        let cached = cache_resolved_project(Path::new("/project"), &files, &resolved)
+            .expect("all dynamic pattern targets should have stable keys");
+        let restored = restore_resolved_project(
+            Path::new("/project"),
+            std::slice::from_ref(&module),
+            &files,
+            &cached,
+        )
+        .expect("cached dynamic pattern rows should align with extracted patterns");
+
+        assert_eq!(restored.modules[0].resolved_dynamic_patterns.len(), 1);
+        assert!(
+            restored.modules[0].resolved_dynamic_patterns[0]
+                .1
+                .is_empty()
+        );
+
+        let mut sparse_cached = cached;
+        sparse_cached.modules[0]
+            .resolved_dynamic_pattern_targets
+            .clear();
+        assert!(
+            restore_resolved_project(
+                Path::new("/project"),
+                std::slice::from_ref(&module),
+                &files,
+                &sparse_cached,
+            )
+            .is_none(),
+            "version-50 sparse rows must take the safe cache-miss path"
+        );
     }
 
     #[test]
@@ -1078,6 +1235,7 @@ mod tests {
                 source_file: FileId(0),
                 target_file: FileId(1),
             }],
+            ..ResolvedProject::default()
         };
 
         let cached = cache_resolved_project(Path::new("/project"), &files, &project);
@@ -1086,10 +1244,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_misses_on_fingerprint_change() {
+    fn manifest_misses_on_content_change() {
         let files = vec![file(0, "/project/src/a.ts")];
-        let cached_map = fingerprints(&[("/project/src/a.ts", SourceFingerprint::new(10, 1))]);
-        let current_map = fingerprints(&[("/project/src/a.ts", SourceFingerprint::new(11, 1))]);
+        let cached_map = content_hashes(&[("/project/src/a.ts", 10)]);
+        let current_map = content_hashes(&[("/project/src/a.ts", 11)]);
 
         let cached = manifest(&files, mode(), &cached_map);
         let current = manifest(&files, mode(), &current_map);
@@ -1104,10 +1262,7 @@ mod tests {
             file(1, "/project/src/deleted.ts"),
         ];
         let after = vec![file(0, "/project/src/a.ts")];
-        let map = fingerprints(&[
-            ("/project/src/a.ts", SourceFingerprint::new(10, 1)),
-            ("/project/src/deleted.ts", SourceFingerprint::new(20, 1)),
-        ]);
+        let map = content_hashes(&[("/project/src/a.ts", 10), ("/project/src/deleted.ts", 20)]);
 
         let cached = manifest(&before, mode(), &map);
         let current = manifest(&after, mode(), &map);
@@ -1116,13 +1271,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_misses_on_file_rename_with_same_fingerprint() {
+    fn manifest_misses_on_file_rename_with_same_content() {
         let before = vec![file(0, "/project/src/old.ts")];
         let after = vec![file(0, "/project/src/new.ts")];
-        let map = fingerprints(&[
-            ("/project/src/old.ts", SourceFingerprint::new(10, 1)),
-            ("/project/src/new.ts", SourceFingerprint::new(10, 1)),
-        ]);
+        let map = content_hashes(&[("/project/src/old.ts", 10), ("/project/src/new.ts", 10)]);
 
         let cached = manifest(&before, mode(), &map);
         let current = manifest(&after, mode(), &map);
@@ -1137,28 +1289,25 @@ mod tests {
             file(1, "/project/packages/shared/src/index.ts"),
         ];
         let workspace_scoped = vec![file(0, "/project/packages/app/src/index.ts")];
-        let map = fingerprints(&[
-            (
-                "/project/packages/app/src/index.ts",
-                SourceFingerprint::new(10, 1),
-            ),
-            (
-                "/project/packages/shared/src/index.ts",
-                SourceFingerprint::new(20, 1),
-            ),
+        let map = content_hashes(&[
+            ("/project/packages/app/src/index.ts", 10),
+            ("/project/packages/shared/src/index.ts", 20),
         ]);
 
         let cached = manifest(&full_project, mode(), &map);
         let current = manifest(&workspace_scoped, mode(), &map);
 
         assert!(!cached.matches_inputs(&current));
-        assert!(!cached.matches_resolution_inputs(&current));
+        assert_eq!(
+            cached.classify_resolution_mismatch(&current),
+            Some(CacheRejection::FileSetChanged)
+        );
     }
 
     #[test]
     fn manifest_misses_on_mode_change() {
         let files = vec![file(0, "/project/src/a.ts")];
-        let map = fingerprints(&[("/project/src/a.ts", SourceFingerprint::new(10, 1))]);
+        let map = content_hashes(&[("/project/src/a.ts", 10)]);
 
         let cached = manifest(&files, mode(), &map);
         let current = manifest(&files, GraphCacheMode::new(1, 99, 3), &map);
@@ -1169,7 +1318,7 @@ mod tests {
     #[test]
     fn manifest_misses_on_version_change() {
         let files = vec![file(0, "/project/src/a.ts")];
-        let map = fingerprints(&[("/project/src/a.ts", SourceFingerprint::new(10, 1))]);
+        let map = content_hashes(&[("/project/src/a.ts", 10)]);
         let mut cached = manifest(&files, mode(), &map);
         let current = manifest(&files, mode(), &map);
 

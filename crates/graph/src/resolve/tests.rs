@@ -39,20 +39,22 @@ fn dummy_span() -> Span {
 /// (via `rustix`) which Miri does not support.
 #[cfg(not(miri))]
 fn with_empty_ctx<F: FnOnce(&ResolveContext)>(f: F) {
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let root = PathBuf::from("/project");
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let style_resolver = specifier::create_resolver(&root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let path_to_id = FxHashMap::default();
     let raw_path_to_id = FxHashMap::default();
     let workspace_roots = FxHashMap::default();
     let package_manifests = Vec::new();
     let condition_names = react_native::build_condition_names(&[], &[]);
-    let root = PathBuf::from("/project");
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -64,6 +66,7 @@ fn with_empty_ctx<F: FnOnce(&ResolveContext)>(f: F) {
         path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root: &root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,
@@ -82,6 +85,7 @@ fn make_import(source: &str, imported: ImportedName, local: &str) -> ImportInfo 
         imported_name: imported,
         local_name: local.to_string(),
         is_type_only: false,
+        is_type_only_star: false,
         from_style: false,
         span: dummy_span(),
         source_span: Span::default(),
@@ -133,6 +137,7 @@ fn make_dynamic(
         destructured_names: destructured.into_iter().map(String::from).collect(),
         local_name: local_name.map(String::from),
         is_speculative: false,
+        value_escapes: false,
     }
 }
 
@@ -147,6 +152,7 @@ fn make_require(
         destructured_names: destructured.into_iter().map(String::from).collect(),
         local_name: local_name.map(String::from),
         source_span: oxc_span::Span::default(),
+        is_type_only: false,
     }
 }
 
@@ -177,6 +183,7 @@ fn make_resolved_module(
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }
 }
 
@@ -209,8 +216,8 @@ fn vitest_mock_operations_resolve_canonical_targets_and_abstain_on_missing() {
     )
     .expect("write tsconfig");
 
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let style_resolver = specifier::create_resolver(&root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let path_to_id = FxHashMap::from_iter([
         (test_file.as_path(), FileId(0)),
@@ -223,8 +230,10 @@ fn vitest_mock_operations_resolve_canonical_targets_and_abstain_on_missing() {
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -236,6 +245,7 @@ fn vitest_mock_operations_resolve_canonical_targets_and_abstain_on_missing() {
         path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root: &root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,
@@ -308,8 +318,8 @@ fn cross_tsconfig_bare_alias_upgrades_replacement_target() {
     std::fs::write(&test_file, "").expect("write test source");
     std::fs::write(&dependency_file, "export const value = 1;").expect("write dependency");
 
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let style_resolver = specifier::create_resolver(&root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let path_to_id = FxHashMap::from_iter([
         (aliased_source.as_path(), FileId(0)),
@@ -323,8 +333,10 @@ fn cross_tsconfig_bare_alias_upgrades_replacement_target() {
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -336,6 +348,7 @@ fn cross_tsconfig_bare_alias_upgrades_replacement_target() {
         path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root: &root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,
@@ -474,6 +487,7 @@ fn static_imports_preserves_type_only() {
             imported_name: ImportedName::Named("FC".into()),
             local_name: "FC".into(),
             is_type_only: true,
+            is_type_only_star: false,
             from_style: false,
             span: dummy_span(),
             source_span: Span::default(),
@@ -545,6 +559,25 @@ fn dynamic_import_side_effect() {
 }
 
 #[test]
+fn escaping_unbound_dynamic_import_is_whole_module_namespace() {
+    with_empty_ctx(|ctx| {
+        let imp = DynamicImportInfo {
+            value_escapes: true,
+            ..make_dynamic("./adapter", vec![], None)
+        };
+        let file = Path::new("/project/src/app.ts");
+        let result = resolve_single_dynamic_import(ctx, file, &imp);
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0].info.imported_name,
+            ImportedName::Namespace
+        ));
+        assert_eq!(result[0].info.local_name, "");
+    });
+}
+
+#[test]
 fn dynamic_import_destructured_takes_priority_over_local_name() {
     with_empty_ctx(|ctx| {
         let imp = DynamicImportInfo {
@@ -553,6 +586,7 @@ fn dynamic_import_destructured_takes_priority_over_local_name() {
             destructured_names: vec!["a".into()],
             local_name: Some("mod".into()),
             is_speculative: false,
+            value_escapes: false,
         };
         let file = Path::new("/project/src/app.ts");
         let result = resolve_single_dynamic_import(ctx, file, &imp);
@@ -1058,6 +1092,7 @@ fn dynamic_patterns_matches_files_in_dir() {
         suffix: Some(".json".into()),
         span: dummy_span(),
         mechanism: ModuleLoadMechanism::EsModule,
+        excludes: Vec::new(),
     }];
     let canonical_paths = vec![
         PathBuf::from("/project/src/locales/en.json"),
@@ -1084,6 +1119,7 @@ fn dynamic_patterns_matches_files_in_dir() {
 
     let result = resolve_dynamic_patterns(
         &GlobMatcherCache::default(),
+        Path::new("/project"),
         from_dir,
         &patterns,
         &canonical_paths,
@@ -1097,14 +1133,24 @@ fn dynamic_patterns_matches_files_in_dir() {
 }
 
 #[test]
-fn dynamic_patterns_no_matches_returns_empty() {
+fn dynamic_patterns_no_matches_preserves_empty_target_row() {
     let from_dir = Path::new("/project/src");
-    let patterns = vec![DynamicImportPattern {
-        prefix: "./locales/".into(),
-        suffix: Some(".json".into()),
-        span: dummy_span(),
-        mechanism: ModuleLoadMechanism::EsModule,
-    }];
+    let patterns = vec![
+        DynamicImportPattern {
+            prefix: "./locales/".into(),
+            suffix: Some(".json".into()),
+            span: dummy_span(),
+            mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
+        },
+        DynamicImportPattern {
+            prefix: "./[".into(),
+            suffix: None,
+            span: dummy_span(),
+            mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
+        },
+    ];
     let canonical_paths = vec![PathBuf::from("/project/src/utils.ts")];
     let files = vec![DiscoveredFile {
         id: FileId(0),
@@ -1114,13 +1160,16 @@ fn dynamic_patterns_no_matches_returns_empty() {
 
     let result = resolve_dynamic_patterns(
         &GlobMatcherCache::default(),
+        Path::new("/project"),
         from_dir,
         &patterns,
         &canonical_paths,
         &files,
     );
 
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 2);
+    assert!(result[0].1.is_empty());
+    assert!(result[1].1.is_empty());
 }
 
 #[test]
@@ -1135,12 +1184,62 @@ fn dynamic_patterns_empty_patterns_list() {
 
     let result = resolve_dynamic_patterns(
         &GlobMatcherCache::default(),
+        Path::new("/project"),
         from_dir,
         &[],
         &canonical_paths,
         &files,
     );
     assert!(result.is_empty());
+}
+
+#[test]
+fn dynamic_patterns_apply_excludes_and_escaped_literals() {
+    let from_dir = Path::new("/project/src");
+    let paths = [
+        "/project/src/pages/home.js",
+        "/project/src/pages/skip.js",
+        "/project/src/pages/draft.js",
+        "/project/src/[id]/view.js",
+        "/project/src/i/view.js",
+    ];
+    let files: Vec<DiscoveredFile> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| DiscoveredFile {
+            id: FileId(u32::try_from(index).expect("small index")),
+            path: PathBuf::from(path),
+            size_bytes: 100,
+        })
+        .collect();
+    let patterns = vec![
+        DynamicImportPattern {
+            prefix: "./pages/*.js".into(),
+            suffix: None,
+            span: dummy_span(),
+            mechanism: ModuleLoadMechanism::EsModule,
+            excludes: vec!["./pages/skip.js".into(), "**/draft.js".into()],
+        },
+        DynamicImportPattern {
+            prefix: "./[[]id[]]/".into(),
+            suffix: Some(".js".into()),
+            span: dummy_span(),
+            mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
+        },
+    ];
+
+    let result = resolve_dynamic_patterns(
+        &GlobMatcherCache::default(),
+        Path::new("/project"),
+        from_dir,
+        &patterns,
+        &[],
+        &files,
+    );
+
+    assert_eq!(result[0].1, vec![FileId(0)]);
+    assert_eq!(result[1].1, vec![FileId(3)]);
 }
 
 #[test]
@@ -1151,6 +1250,7 @@ fn dynamic_patterns_glob_prefix_passthrough() {
         suffix: None,
         span: dummy_span(),
         mechanism: ModuleLoadMechanism::EsModule,
+        excludes: Vec::new(),
     }];
     let canonical_paths = vec![
         PathBuf::from("/project/src/utils.ts"),
@@ -1171,6 +1271,7 @@ fn dynamic_patterns_glob_prefix_passthrough() {
 
     let result = resolve_dynamic_patterns(
         &GlobMatcherCache::default(),
+        Path::new("/project"),
         from_dir,
         &patterns,
         &canonical_paths,
@@ -1360,6 +1461,7 @@ fn dynamic_patterns_prefix_without_suffix() {
         suffix: None,
         span: dummy_span(),
         mechanism: ModuleLoadMechanism::EsModule,
+        excludes: Vec::new(),
     }];
     let canonical_paths = vec![
         PathBuf::from("/project/src/pages/Home.tsx"),
@@ -1386,6 +1488,7 @@ fn dynamic_patterns_prefix_without_suffix() {
 
     let result = resolve_dynamic_patterns(
         &GlobMatcherCache::default(),
+        Path::new("/project"),
         from_dir,
         &patterns,
         &canonical_paths,
@@ -1406,11 +1509,140 @@ fn dynamic_patterns_empty_canonical_paths() {
         suffix: Some(".json".into()),
         span: dummy_span(),
         mechanism: ModuleLoadMechanism::EsModule,
+        excludes: Vec::new(),
     }];
 
-    let result =
-        resolve_dynamic_patterns(&GlobMatcherCache::default(), from_dir, &patterns, &[], &[]);
-    assert!(result.is_empty());
+    let result = resolve_dynamic_patterns(
+        &GlobMatcherCache::default(),
+        Path::new("/project"),
+        from_dir,
+        &patterns,
+        &[],
+        &[],
+    );
+    assert_eq!(result.len(), 1);
+    assert!(result[0].1.is_empty());
+}
+
+fn parent_pattern_files(paths: &[&str]) -> Vec<DiscoveredFile> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| DiscoveredFile {
+            id: FileId(u32::try_from(idx).expect("small fixture")),
+            path: PathBuf::from(path),
+            size_bytes: 100,
+        })
+        .collect()
+}
+
+fn parent_pattern(prefix: &str, excludes: &[&str]) -> DynamicImportPattern {
+    DynamicImportPattern {
+        prefix: prefix.into(),
+        suffix: None,
+        span: dummy_span(),
+        mechanism: ModuleLoadMechanism::EsModule,
+        excludes: excludes
+            .iter()
+            .map(|exclude| (*exclude).to_string())
+            .collect(),
+    }
+}
+
+#[test]
+fn dynamic_patterns_parent_steps_match_relative_to_the_importer() {
+    let files = parent_pattern_files(&[
+        "/project/src/components/button.js",
+        "/project/src/components/skip.js",
+        "/project/src/[id]/local.js",
+        "/project/src/[id]/kept.js",
+        "/project/lib/util.js",
+    ]);
+    let patterns = vec![
+        parent_pattern("../components/*.js", &["../components/skip.js"]),
+        parent_pattern("../../src/*/*.js", &["./local.js", "../components/**"]),
+    ];
+
+    let result = resolve_dynamic_patterns(
+        &GlobMatcherCache::default(),
+        Path::new("/project"),
+        Path::new("/project/src/[id]"),
+        &patterns,
+        &[],
+        &files,
+    );
+
+    assert_eq!(result[0].1, vec![FileId(0)]);
+    assert_eq!(result[1].1, vec![FileId(3)]);
+}
+
+#[test]
+fn dynamic_patterns_parent_steps_stay_inside_the_root() {
+    let files = parent_pattern_files(&["/project/src/a.js", "/other/b.js"]);
+    let patterns = vec![
+        parent_pattern("../../*.js", &[]),
+        parent_pattern("../../other/*.js", &[]),
+        parent_pattern("../../../../../*.js", &[]),
+    ];
+
+    let result = resolve_dynamic_patterns(
+        &GlobMatcherCache::default(),
+        Path::new("/project"),
+        Path::new("/project/src"),
+        &patterns,
+        &[],
+        &files,
+    );
+
+    assert_eq!(result.len(), 3);
+    assert!(result.iter().all(|(_, matched)| matched.is_empty()));
+}
+
+#[test]
+fn dynamic_patterns_parent_steps_match_canonical_paths() {
+    let files = parent_pattern_files(&[
+        "/link/src/a/x.js",
+        "/link/src/b/y.js",
+        "/link/src/b/skip.js",
+    ]);
+    let canonical_paths = vec![
+        PathBuf::from("/real/src/a/x.js"),
+        PathBuf::from("/real/src/b/y.js"),
+        PathBuf::from("/real/src/b/skip.js"),
+    ];
+    let patterns = vec![
+        parent_pattern("./../../src/*/*.js", &["../b/skip.js"]),
+        parent_pattern("../b/*.js", &[]),
+    ];
+
+    let result = resolve_dynamic_patterns(
+        &GlobMatcherCache::default(),
+        Path::new("/real"),
+        Path::new("/real/src/a"),
+        &patterns,
+        &canonical_paths,
+        &files,
+    );
+
+    assert_eq!(result[0].1, vec![FileId(0), FileId(1)]);
+    assert_eq!(result[1].1, vec![FileId(1), FileId(2)]);
+}
+
+#[test]
+fn dynamic_patterns_exclude_above_the_base_removes_no_file() {
+    let files = parent_pattern_files(&["/project/src/pages/a.js"]);
+    let patterns = vec![parent_pattern("./*.js", &["../pages/a.js"])];
+
+    let result = resolve_dynamic_patterns(
+        &GlobMatcherCache::default(),
+        Path::new("/project"),
+        Path::new("/project/src/pages"),
+        &patterns,
+        &[],
+        &files,
+    );
+
+    assert_eq!(result[0].1, vec![FileId(0)]);
 }
 
 #[test]
@@ -1422,6 +1654,7 @@ fn require_destructured_empty_names_uses_namespace() {
             destructured_names: vec![],
             local_name: None,
             source_span: oxc_span::Span::default(),
+            is_type_only: false,
         };
         let file = Path::new("/project/src/app.js");
         let result = resolve_single_require(ctx, file, &req);
@@ -1443,6 +1676,7 @@ fn dynamic_import_empty_destructured_and_no_local_is_side_effect() {
             destructured_names: vec![],
             local_name: None,
             is_speculative: false,
+            value_escapes: false,
         };
         let file = Path::new("/project/src/app.ts");
         let result = resolve_single_dynamic_import(ctx, file, &imp);
@@ -1465,6 +1699,7 @@ fn speculative_dynamic_import_drops_when_unresolvable() {
             destructured_names: vec![],
             local_name: Some(String::new()),
             is_speculative: true,
+            value_escapes: false,
         };
         let file = Path::new("/project/src/app.test.ts");
         let result = resolve_single_dynamic_import(ctx, file, &imp);
@@ -1472,6 +1707,48 @@ fn speculative_dynamic_import_drops_when_unresolvable() {
             result.is_empty(),
             "speculative imports whose target is Unresolvable must be dropped, got: {result:?}"
         );
+    });
+}
+
+#[test]
+fn speculative_dynamic_import_drops_when_package_space() {
+    with_empty_ctx(|ctx| {
+        // `jest.mock('@bacons/apple-targets')` synthesizes the sibling
+        // candidate `@bacons/__mocks__/apple-targets`. Bare specifiers are
+        // never Unresolvable, so without the package-space drop this would
+        // surface as phantom package `@bacons/__mocks__` (issue #2213).
+        let imp = DynamicImportInfo {
+            source: "@bacons/__mocks__/apple-targets".into(),
+            span: dummy_span(),
+            destructured_names: vec![],
+            local_name: Some(String::new()),
+            is_speculative: true,
+            value_escapes: false,
+        };
+        let file = Path::new("/project/src/app.test.ts");
+        let result = resolve_single_dynamic_import(ctx, file, &imp);
+        assert!(
+            result.is_empty(),
+            "speculative imports landing in package space must be dropped, got: {result:?}"
+        );
+    });
+}
+
+#[test]
+fn non_speculative_dynamic_import_keeps_package_entry() {
+    with_empty_ctx(|ctx| {
+        let imp = DynamicImportInfo {
+            source: "@bacons/apple-targets".into(),
+            span: dummy_span(),
+            destructured_names: vec![],
+            local_name: None,
+            is_speculative: false,
+            value_escapes: false,
+        };
+        let file = Path::new("/project/src/app.test.ts");
+        let result = resolve_single_dynamic_import(ctx, file, &imp);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].target, ResolveResult::NpmPackage(_)));
     });
 }
 
@@ -1484,6 +1761,7 @@ fn non_speculative_dynamic_import_keeps_unresolvable_entry() {
             destructured_names: vec![],
             local_name: None,
             is_speculative: false,
+            value_escapes: false,
         };
         let file = Path::new("/project/src/app.ts");
         let result = resolve_single_dynamic_import(ctx, file, &imp);
@@ -1501,6 +1779,7 @@ fn dynamic_import_preserves_source_span() {
             destructured_names: vec!["x".into()],
             local_name: None,
             is_speculative: false,
+            value_escapes: false,
         };
         let file = Path::new("/project/src/app.ts");
         let result = resolve_single_dynamic_import(ctx, file, &imp);
@@ -1672,8 +1951,8 @@ fn pnpm_package_source_alias_preserves_declared_import_name() {
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(&source_pkg, root.join("node_modules/unstorage")).unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
+    let style_resolver = specifier::create_resolver(root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let path_to_id = FxHashMap::default();
     let raw_path_to_id = FxHashMap::default();
@@ -1683,8 +1962,10 @@ fn pnpm_package_source_alias_preserves_declared_import_name() {
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -1696,6 +1977,7 @@ fn pnpm_package_source_alias_preserves_declared_import_name() {
         path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,
@@ -1734,8 +2016,8 @@ fn pnpm_jsr_package_source_alias_preserves_declared_import_name() {
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(&source_pkg, root.join("node_modules/@std/csv")).unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
+    let style_resolver = specifier::create_resolver(root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let path_to_id = FxHashMap::default();
     let raw_path_to_id = FxHashMap::default();
@@ -1745,8 +2027,10 @@ fn pnpm_jsr_package_source_alias_preserves_declared_import_name() {
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -1758,6 +2042,7 @@ fn pnpm_jsr_package_source_alias_preserves_declared_import_name() {
         path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,
@@ -1770,72 +2055,6 @@ fn pnpm_jsr_package_source_alias_preserves_declared_import_name() {
     assert!(
         matches!(result, ResolveResult::NpmPackage(ref name) if name == "@std/csv"),
         "expected package usage to preserve declared import name, got {result:?}"
-    );
-}
-
-#[test]
-fn package_usage_name_prefers_declared_name_for_bare_specifiers() {
-    // pnpm source alias: declared `unstorage` resolved into a `.pnpm` store dir
-    // whose inner package is `unstorage-nightly`. Credit the declared name.
-    let resolved =
-        Path::new("/p/node_modules/.pnpm/unstorage-nightly@2.0.0/node_modules/unstorage-nightly");
-    assert_eq!(
-        specifier::package_usage_name_for_resolved_package("unstorage", resolved),
-        Some("unstorage".to_string()),
-    );
-
-    // Scoped subpath bare specifier reduces to the package name.
-    let resolved_scoped =
-        Path::new("/p/node_modules/.pnpm/@jsr+std__csv@1.0.6/node_modules/@jsr/std__csv");
-    assert_eq!(
-        specifier::package_usage_name_for_resolved_package("@std/csv/stringify", resolved_scoped),
-        Some("@std/csv".to_string()),
-    );
-
-    // Common case (declared name == source name) is unchanged.
-    let resolved_plain = Path::new("/p/node_modules/lodash");
-    assert_eq!(
-        specifier::package_usage_name_for_resolved_package("lodash", resolved_plain),
-        Some("lodash".to_string()),
-    );
-
-    // Path aliases that are bare (Node.js `#imports`) must NOT be credited as the
-    // package name: they can map to an external package whose real name is only on
-    // the resolved path. Keep the resolved-package name instead.
-    let resolved_import_map = Path::new("/p/node_modules/polyfill-pkg/index.js");
-    assert_eq!(
-        specifier::package_usage_name_for_resolved_package("#polyfill", resolved_import_map),
-        Some("polyfill-pkg".to_string()),
-    );
-
-    // Not under node_modules: no package-usage credit.
-    assert_eq!(
-        specifier::package_usage_name_for_resolved_package("unstorage", Path::new("/p/src/x.ts")),
-        None,
-    );
-}
-
-#[test]
-fn external_bare_specifier_package_usage_credits_declared_package() {
-    assert_eq!(
-        specifier::package_usage_name_for_external_bare_specifier("@mre/shared"),
-        Some("@mre/shared".to_string()),
-    );
-    assert_eq!(
-        specifier::package_usage_name_for_external_bare_specifier("@mre/shared/subpath"),
-        Some("@mre/shared".to_string()),
-    );
-    assert_eq!(
-        specifier::package_usage_name_for_external_bare_specifier("@mre"),
-        None,
-    );
-    assert_eq!(
-        specifier::package_usage_name_for_external_bare_specifier("#polyfill"),
-        None,
-    );
-    assert_eq!(
-        specifier::package_usage_name_for_external_bare_specifier("@/shared"),
-        None,
     );
 }
 
@@ -1933,21 +2152,23 @@ fn specifier_pascal_scope_alias_returns_unresolvable() {
 #[test]
 #[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
 fn specifier_plugin_alias_match_returns_unresolvable() {
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let root = PathBuf::from("/project");
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let style_resolver = specifier::create_resolver(&root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let path_to_id = FxHashMap::default();
     let raw_path_to_id = FxHashMap::default();
     let workspace_roots = FxHashMap::default();
     let package_manifests = Vec::new();
     let condition_names = react_native::build_condition_names(&[], &[]);
-    let root = PathBuf::from("/project");
     let aliases = vec![("$lib/".to_string(), "src/lib/".to_string())];
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -1959,6 +2180,7 @@ fn specifier_plugin_alias_match_returns_unresolvable() {
         path_aliases: &aliases,
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root: &root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,
@@ -2069,42 +2291,141 @@ fn specifier_at_at_slash_returns_unresolvable() {
     });
 }
 
-#[test]
-#[cfg_attr(miri, ignore)]
-fn create_resolver_without_plugins() {
-    let _resolver = specifier::create_resolver(&[], &[]);
+/// Write a minimal inlined Yarn PnP manifest at `root` that maps the bare
+/// package `foo@npm:1.0.0` to an unplugged (unzipped) install directory, plus
+/// `src/app.ts` as an issuer, and return the package directory. Mirrors the
+/// shape Yarn 4 writes: a `null` top-level entry, one workspace at `./`, and
+/// per-package `packageLocation` values relative to the manifest.
+fn write_yarn_pnp_fixture(root: &Path) -> PathBuf {
+    let package_dir = root.join(".yarn/unplugged/foo-npm-1.0.0-0123456789/node_modules/foo");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0","main":"index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(package_dir.join("index.js"), "module.exports = 'foo';\n").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/app.ts"), "import foo from 'foo';\n").unwrap();
+
+    let manifest = concat!(
+        "#!/usr/bin/env node\n",
+        "/* eslint-disable */\n",
+        "\"use strict\";\n",
+        "\n",
+        "const RAW_RUNTIME_STATE =\n",
+        "'{\"dependencyTreeRoots\":[{\"name\":\"app\",\"reference\":\"workspace:.\"}],",
+        "\"enableTopLevelFallback\":true,",
+        "\"ignorePatternData\":null,",
+        "\"fallbackExclusionList\":[[\"app\",[\"workspace:.\"]]],",
+        "\"fallbackPool\":[],",
+        "\"packageRegistryData\":[",
+        "[null,[[null,{\"packageLocation\":\"./\",\"packageDependencies\":[],",
+        "\"linkType\":\"SOFT\"}]]],",
+        "[\"app\",[[\"workspace:.\",{\"packageLocation\":\"./\",",
+        "\"packageDependencies\":[[\"app\",\"workspace:.\"],[\"foo\",\"npm:1.0.0\"]],",
+        "\"linkType\":\"SOFT\"}]]],",
+        "[\"foo\",[[\"npm:1.0.0\",{\"packageLocation\":",
+        "\"./.yarn/unplugged/foo-npm-1.0.0-0123456789/node_modules/foo/\",",
+        "\"packageDependencies\":[[\"foo\",\"npm:1.0.0\"]],\"linkType\":\"HARD\"}]]]",
+        "]}';\n",
+        "\n",
+        "function $$SETUP_STATE(hydrateRuntimeState, basePath) {\n",
+        "  return hydrateRuntimeState(JSON.parse(RAW_RUNTIME_STATE), ",
+        "{basePath: basePath || __dirname});\n",
+        "}\n",
+    );
+    std::fs::write(root.join(".pnp.cjs"), manifest).unwrap();
+    package_dir
 }
 
+/// Yarn PnP projects have no `node_modules`; bare specifiers go through the
+/// inlined `.pnp.cjs` manifest instead. oxc locates that manifest from the
+/// resolver's `cwd` (falling back to the process working directory) and fallow
+/// never chdirs, so the resolver must anchor it to the project itself. The
+/// test therefore runs with the process cwd elsewhere and must not chdir.
 #[test]
-#[cfg_attr(miri, ignore)]
-fn create_resolver_with_react_native_plugin() {
-    let plugins = vec!["react-native".to_string()];
-    let _resolver = specifier::create_resolver(&plugins, &[]);
+#[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
+fn yarn_pnp_bare_specifier_resolves_through_the_manifest_without_chdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let package_dir = write_yarn_pnp_fixture(&root);
+    assert_ne!(
+        std::env::current_dir().ok().as_deref(),
+        Some(root.as_path()),
+        "the test must exercise cwd-independent manifest discovery"
+    );
+
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let resolved = resolver
+        .resolve_file(root.join("src/app.ts"), "foo")
+        .expect("foo resolves through .pnp.cjs");
+
+    assert_eq!(resolved.full_path(), package_dir.join("index.js"));
 }
 
+/// Yarn writes the manifest only at the workspace root. Analyzing one package
+/// of a PnP monorepo must still find it and resolve through it.
 #[test]
-#[cfg_attr(miri, ignore)]
-fn create_resolver_with_expo_plugin() {
-    let plugins = vec!["expo".to_string()];
-    let _resolver = specifier::create_resolver(&plugins, &[]);
+#[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
+fn yarn_pnp_sub_package_root_resolves_through_the_workspace_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let package_dir = write_yarn_pnp_fixture(&root);
+    let app_root = root.join("packages/app");
+    std::fs::create_dir_all(app_root.join("src")).unwrap();
+    std::fs::write(app_root.join("src/index.ts"), "import foo from 'foo';\n").unwrap();
+
+    let resolver = specifier::create_resolver(&app_root, &[], &[]);
+    let resolved = resolver
+        .resolve_file(app_root.join("src/index.ts"), "foo")
+        .expect("foo resolves through the ancestor .pnp.cjs");
+
+    assert_eq!(resolved.full_path(), package_dir.join("index.js"));
 }
 
+/// The style resolver is derived from the main one and shares its cache; it
+/// must resolve through the same manifest.
 #[test]
-#[cfg_attr(miri, ignore)]
-fn create_resolver_with_multiple_plugins() {
-    let plugins = vec![
-        "react-native".to_string(),
-        "typescript".to_string(),
-        "jest".to_string(),
-    ];
-    let _resolver = specifier::create_resolver(&plugins, &[]);
+#[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
+fn yarn_pnp_style_resolver_derived_via_clone_with_options_resolves_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let package_dir = write_yarn_pnp_fixture(&root);
+
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let style_resolver = resolver.clone_with_options(specifier::build_resolve_options(
+        &root,
+        &[],
+        &["style".to_string()],
+    ));
+    let resolved = style_resolver
+        .resolve_file(root.join("src/app.ts"), "foo")
+        .expect("foo resolves through .pnp.cjs");
+
+    assert_eq!(resolved.full_path(), package_dir.join("index.js"));
 }
 
+/// Without a manifest the resolver stays on the `node_modules` path: a missing
+/// bare specifier is a plain miss, not a PnP manifest error.
 #[test]
-#[cfg_attr(miri, ignore)]
-fn create_resolver_with_custom_conditions() {
-    let conditions = vec!["worker".to_string(), "edge-light".to_string()];
-    let _resolver = specifier::create_resolver(&[], &conditions);
+#[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
+fn non_pnp_root_reports_missing_bare_specifier_as_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/app.ts"), "import foo from 'foo';\n").unwrap();
+
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let err = resolver
+        .resolve_file(root.join("src/app.ts"), "foo")
+        .expect_err("no node_modules and no manifest");
+
+    assert!(
+        matches!(err, oxc_resolver::ResolveError::NotFound(_)),
+        "expected NotFound, got {err:?}"
+    );
 }
 
 #[test]
@@ -2121,7 +2442,7 @@ fn resolve_prefers_js_over_dts_when_both_exist() {
     .unwrap();
     std::fs::write(root.join("app.ts"), "import { helper } from './utils';").unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
     let from_file = root.join("app.ts");
     let result = resolver.resolve_file(&from_file, "./utils");
 
@@ -2152,7 +2473,7 @@ fn resolve_prefers_ts_over_dts_when_both_exist() {
     .unwrap();
     std::fs::write(root.join("app.ts"), "import { helper } from './utils';").unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
     let from_file = root.join("app.ts");
     let result = resolver.resolve_file(&from_file, "./utils");
 
@@ -2178,7 +2499,7 @@ fn resolve_falls_back_to_dts_when_no_runtime_file() {
     std::fs::write(root.join("types.d.ts"), "export declare const x: number;").unwrap();
     std::fs::write(root.join("app.ts"), "import { x } from './types';").unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
     let from_file = root.join("app.ts");
     let result = resolver.resolve_file(&from_file, "./types");
 
@@ -2208,7 +2529,7 @@ fn resolve_js_specifier_falls_back_to_dts_when_no_runtime_file() {
     .unwrap();
     std::fs::write(root.join("app.ts"), "import { x } from './contract.js';").unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
     let from_file = root.join("app.ts");
     let result = resolver.resolve_file(&from_file, "./contract.js");
 
@@ -2242,7 +2563,7 @@ fn resolve_js_specifier_prefers_runtime_ts_over_dts() {
     .unwrap();
     std::fs::write(root.join("app.ts"), "import { x } from './contract.js';").unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
     let from_file = root.join("app.ts");
     let result = resolver.resolve_file(&from_file, "./contract.js");
 
@@ -2294,7 +2615,7 @@ fn resolve_honors_development_condition_by_default() {
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(root.join("pkg"), root.join("node_modules/pkg")).unwrap();
 
-    let resolver = specifier::create_resolver(&[], &[]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
     let from_file = root.join("app.ts");
     let resolved = resolver
         .resolve_file(&from_file, "pkg")
@@ -2343,7 +2664,7 @@ fn resolve_honors_user_supplied_conditions_before_baseline() {
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(root.join("pkg"), root.join("node_modules/pkg")).unwrap();
 
-    let resolver = specifier::create_resolver(&[], &["worker".to_string()]);
+    let resolver = specifier::create_resolver(root, &[], &["worker".to_string()]);
     let from_file = root.join("app.ts");
     let resolved = resolver
         .resolve_file(&from_file, "pkg")
@@ -2363,22 +2684,24 @@ fn resolve_honors_user_supplied_conditions_before_baseline() {
 #[test]
 #[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
 fn bare_at_alias_does_not_swallow_scoped_npm_packages() {
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let root = PathBuf::from("/project");
+    let resolver = specifier::create_resolver(&root, &[], &[]);
+    let style_resolver = specifier::create_resolver(&root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let path_to_id = FxHashMap::default();
     let raw_path_to_id = FxHashMap::default();
     let workspace_roots = FxHashMap::default();
     let package_manifests = Vec::new();
     let condition_names = react_native::build_condition_names(&[], &[]);
-    let root = PathBuf::from("/project");
     // Register a bare "@" alias pointing to "./src", the problematic case.
     let aliases = vec![("@".to_string(), "src".to_string())];
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -2390,6 +2713,7 @@ fn bare_at_alias_does_not_swallow_scoped_npm_packages() {
         path_aliases: &aliases,
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root: &root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,
@@ -2488,16 +2812,18 @@ fn deno_import_maps_follow_nearest_package_scope_and_declaring_base() {
         active_plugins: &[],
         path_aliases: &[],
         auto_imports: &[],
+        jsx_import_sources: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root,
         extra_conditions: &[],
     };
     let canonical_ws_roots = vec![dunce::canonicalize(&member).unwrap()];
     let package_manifests = super::build_package_manifests(&input, &canonical_ws_roots);
 
-    let resolver = specifier::create_resolver(&[], &[]);
-    let style_resolver = specifier::create_resolver(&[], &["style".to_string()]);
+    let resolver = specifier::create_resolver(root, &[], &[]);
+    let style_resolver = specifier::create_resolver(root, &[], &["style".to_string()]);
     let extensions = react_native::build_extensions(&[]);
     let mut raw_path_to_id = FxHashMap::default();
     raw_path_to_id.insert(root_exact.as_path(), FileId(1));
@@ -2523,8 +2849,10 @@ fn deno_import_maps_follow_nearest_package_scope_and_declaring_base() {
     let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
     let tsconfig_cache = TsconfigCache::default();
     let canonicalize_cache = CanonicalizeCache::default();
+    let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
     let ctx = ResolveContext {
         resolver: &resolver,
+        script_resolver: &script_resolver,
         style_resolver: &style_resolver,
         extensions: &extensions,
         path_to_id: &path_to_id,
@@ -2538,6 +2866,7 @@ fn deno_import_maps_follow_nearest_package_scope_and_declaring_base() {
         path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
         root,
         canonical_fallback: None,
         tsconfig_warned: &tsconfig_warned,

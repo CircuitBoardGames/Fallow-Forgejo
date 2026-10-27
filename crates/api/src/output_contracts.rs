@@ -14,7 +14,7 @@ pub type AuditOutput = fallow_output::AuditOutput<
 /// Concrete combined check + dupes + health envelope for full analyses.
 pub type CombinedOutput = fallow_output::CombinedOutput<
     fallow_output::CheckOutput,
-    crate::DupesReportPayload,
+    crate::CombinedDupesSection,
     fallow_output::HealthReport,
 >;
 
@@ -90,6 +90,8 @@ pub enum TraceOutput {
     Clone(Box<fallow_types::trace::CloneTrace>),
     /// Transitive impact closure for a changed file set.
     ImpactClosure(Box<fallow_types::trace::ImpactClosureTrace>),
+    /// Shortest import path between two modules.
+    ImportPath(Box<fallow_types::trace::ImportPathTrace>),
     /// Symbol-level call chain trace.
     SymbolChain(Box<fallow_types::trace_chain::SymbolChainTrace>),
     /// Type-aware semantic symbol trace.
@@ -126,6 +128,27 @@ pub type ReviewBriefWireOutput = fallow_output::ReviewBriefWireOutput<
     fallow_output::HealthReport,
 >;
 
+/// Raw opt-in semantic similar-code candidate envelope.
+pub type SimilarCodeOutput = fallow_output::SimilarCodeOutput;
+
+/// Bounded exact-candidate handoff for source-grounded inspection.
+pub type SimilarCodeCandidateSnapshot = fallow_output::SimilarCodeCandidateSnapshot;
+
+/// Bounded source-grounded packet for one semantic candidate.
+pub type SimilarCodeInspectOutput = fallow_output::SimilarCodeInspectOutput;
+
+/// Semantic candidates joined with a separate verdict document.
+pub type SimilarCodeReviewOutput = fallow_output::SimilarCodeReviewOutput;
+
+/// Local-provider and pinned-model readiness envelope.
+pub type SimilarCodeStatusOutput = fallow_output::SimilarCodeStatusOutput;
+
+/// Project-local vector-cache clear result.
+pub type SimilarCodeCacheClearOutput = fallow_output::SimilarCodeCacheClearOutput;
+
+/// Versioned verdict document accepted by similar-code review.
+pub type SimilarCodeVerdictInput = fallow_output::SimilarCodeVerdictInput;
+
 /// Concrete root output union covering every fallow command payload; this is
 /// the top-level shape the published JSON schema is generated from.
 #[allow(
@@ -137,6 +160,7 @@ pub type FallowOutput = fallow_output::FallowOutput<
     fallow_output::ExplainOutput,
     fallow_output::InspectOutput,
     TraceOutput,
+    fallow_types::trace_error::ErrorTrace,
     fallow_output::ReviewEnvelopeOutput,
     fallow_output::ReviewReconcileOutput,
     fallow_output::CoverageSetupOutput,
@@ -146,12 +170,14 @@ pub type FallowOutput = fallow_output::FallowOutput<
     fallow_output::HealthOutput<fallow_output::HealthReport, fallow_output::HealthGroup>,
     fallow_output::DupesOutput<crate::DupesReportPayload, crate::DuplicationGroup>,
     fallow_output::CheckGroupedOutput,
+    fallow_output::CheckGroupedOutput,
     ImpactOutput,
     fallow_output::CrossRepoImpactReport,
     SecuritySummaryOutput,
     SecurityOutput,
     fallow_output::SecuritySurvivorsOutput,
     fallow_output::SecurityBlindSpotsOutput,
+    fallow_output::CheckOutput,
     fallow_output::CheckOutput,
     CombinedOutput,
     fallow_output::FeatureFlagsOutput,
@@ -160,5 +186,14 @@ pub type FallowOutput = fallow_output::FallowOutput<
     fallow_output::StandardWalkthroughGuide,
     fallow_output::WalkthroughValidation,
     fallow_output::SuppressionInventoryOutput,
+    fallow_output::DoctorOutput,
     fallow_output::TypeAwareStatusOutput,
+    SimilarCodeOutput,
+    SimilarCodeInspectOutput,
+    SimilarCodeReviewOutput,
+    SimilarCodeStatusOutput,
+    SimilarCodeCacheClearOutput,
+    fallow_output::MutationReport,
+    fallow_output::MutationPlanOutput,
+    fallow_output::MutationInspectOutput,
 >;

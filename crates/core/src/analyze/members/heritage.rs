@@ -171,7 +171,51 @@ pub(super) struct MemberHeritageContext<'a> {
         FxHashMap<FileId, &'a [fallow_types::extract::ClassHeritageInfo]>,
     pub(super) token_to_interface: FxHashMap<ExportKey, &'a str>,
     pub(super) implementers_by_name: FxHashMap<&'a str, Vec<ExportKey>>,
-    pub(super) interface_to_implementers: FxHashMap<ExportKey, Vec<ExportKey>>,
+    pub(super) interface_implementations: InterfaceImplementationContracts,
+}
+
+#[derive(Default)]
+struct RequiredTypeMemberIndex {
+    by_file: FxHashMap<FileId, FxHashMap<String, FxHashSet<String>>>,
+}
+
+pub(super) struct InterfaceImplementationContracts {
+    pub(super) implementers_by_interface: FxHashMap<ExportKey, Vec<ExportKey>>,
+    pub(super) required_members_by_implementer: FxHashMap<ExportKey, FxHashSet<String>>,
+}
+
+impl RequiredTypeMemberIndex {
+    fn insert_module(&mut self, module: &ModuleInfo) {
+        for required in SemanticFactView::new(&module.semantic_facts, &module.member_accesses)
+            .required_type_members()
+        {
+            self.by_file
+                .entry(module.file_id)
+                .or_default()
+                .entry(required.type_name.clone())
+                .or_default()
+                .insert(required.member.clone());
+        }
+    }
+
+    fn get(&self, file_id: FileId, type_name: &str) -> Option<&FxHashSet<String>> {
+        self.by_file.get(&file_id)?.get(type_name)
+    }
+
+    fn get_for_export<'a>(
+        &'a self,
+        indexes: &MemberPassIndexes<'_>,
+        key: &ExportKey,
+    ) -> Option<&'a FxHashSet<String>> {
+        let module = indexes.module_by_id.get(&key.file_id)?;
+        let local_name = module
+            .exports
+            .iter()
+            .find(|export| export.name.matches_str(key.export_name.as_str()))
+            .and_then(|export| export.local_name.as_deref())
+            .unwrap_or(key.export_name.as_str());
+        self.get(key.file_id, local_name)
+    }
 }
 
 pub(super) fn build_member_heritage_context<'a>(
@@ -185,8 +229,10 @@ pub(super) fn build_member_heritage_context<'a>(
     let mut class_heritage_by_file = FxHashMap::default();
     let mut token_to_interface: FxHashMap<ExportKey, &str> = FxHashMap::default();
     let mut implementers_by_name: FxHashMap<&str, Vec<ExportKey>> = FxHashMap::default();
+    let mut required_type_members = RequiredTypeMemberIndex::default();
 
     for module in modules {
+        required_type_members.insert_module(module);
         class_heritage_by_file.insert(module.file_id, module.class_heritage.as_slice());
         class_heritage_by_export.extend(module.class_heritage.iter().map(|heritage| {
             (
@@ -211,15 +257,20 @@ pub(super) fn build_member_heritage_context<'a>(
         }
     }
 
-    let interface_to_implementers =
-        build_interface_to_implementers(graph, resolved_modules, &class_heritage_by_file, indexes);
+    let interface_implementations = build_interface_implementation_contracts(
+        graph,
+        resolved_modules,
+        &class_heritage_by_file,
+        indexes,
+        &required_type_members,
+    );
 
     MemberHeritageContext {
         class_heritage_by_export,
         class_heritage_by_file,
         token_to_interface,
         implementers_by_name,
-        interface_to_implementers,
+        interface_implementations,
     }
 }
 
@@ -388,101 +439,139 @@ pub(super) fn build_parent_to_children(
     parent_to_children
 }
 
+/// Most passes of one closure. A class chain is rarely deeper than a handful of
+/// levels; the bound only stops a cyclic `extends` graph, which the type checker
+/// rejects.
+const MAX_INHERITANCE_PASSES: usize = 64;
+
+type ClassAccesses = FxHashMap<ExportKey, FxHashSet<String>>;
+type FileAccesses = FxHashMap<FileId, FxHashSet<String>>;
+
 /// Propagate member accesses through `extends` chains in both directions.
+///
+/// An access through a child reaches every ancestor: `new Child().start()` uses
+/// `Base.start`. An access that a class makes on itself or through its own type
+/// reaches every descendant, which can override or inherit the member. The two
+/// directions are separate closures. One closure over both would carry an
+/// access from one child up to the parent and then down to a sibling, which
+/// hides a member that nothing calls.
 pub(super) fn propagate_class_inheritance(
     parent_to_children: &FxHashMap<ExportKey, Vec<ExportKey>>,
-    accessed_members: &mut FxHashMap<ExportKey, FxHashSet<String>>,
-    self_accessed_members: &mut FxHashMap<FileId, FxHashSet<String>>,
+    accessed_members: &mut ClassAccesses,
+    self_accessed_members: &mut FileAccesses,
 ) {
     if parent_to_children.is_empty() {
         return;
     }
 
-    let mut propagations: Vec<(FileId, Vec<String>)> = Vec::new();
+    let mut downward_accessed = accessed_members.clone();
+    let mut downward_self = self_accessed_members.clone();
 
-    for (parent_key, children) in parent_to_children {
-        collect_self_access_inheritance_propagations(
-            parent_key,
-            children,
-            self_accessed_members,
-            &mut propagations,
-        );
-        propagate_member_accesses_through_inheritance(parent_key, children, accessed_members);
+    close_upward(parent_to_children, accessed_members, self_accessed_members);
+    close_downward(
+        parent_to_children,
+        &mut downward_accessed,
+        &mut downward_self,
+    );
+
+    for (key, members) in downward_accessed {
+        accessed_members.entry(key).or_default().extend(members);
     }
-
-    for (file_id, members) in propagations {
-        let entry = self_accessed_members.entry(file_id).or_default();
-        for member in members {
-            entry.insert(member);
-        }
-    }
-}
-
-fn collect_self_access_inheritance_propagations(
-    parent_key: &ExportKey,
-    children: &[ExportKey],
-    self_accessed_members: &FxHashMap<FileId, FxHashSet<String>>,
-    propagations: &mut Vec<(FileId, Vec<String>)>,
-) {
-    if let Some(parent_self_accesses) = self_accessed_members.get(&parent_key.file_id) {
-        let accesses: Vec<String> = parent_self_accesses.iter().cloned().collect();
-        for child_key in children {
-            propagations.push((child_key.file_id, accesses.clone()));
-        }
-    }
-
-    let mut child_self_accesses_for_parent: FxHashSet<String> = FxHashSet::default();
-    for child_key in children {
-        if let Some(child_self_accesses) = self_accessed_members.get(&child_key.file_id) {
-            child_self_accesses_for_parent.extend(child_self_accesses.iter().cloned());
-        }
-    }
-    if !child_self_accesses_for_parent.is_empty() {
-        propagations.push((
-            parent_key.file_id,
-            child_self_accesses_for_parent.into_iter().collect(),
-        ));
-    }
-}
-
-fn propagate_member_accesses_through_inheritance(
-    parent_key: &ExportKey,
-    children: &[ExportKey],
-    accessed_members: &mut FxHashMap<ExportKey, FxHashSet<String>>,
-) {
-    let parent_accesses = accessed_members.get(parent_key).cloned();
-    let mut child_accesses_to_propagate: FxHashSet<String> = FxHashSet::default();
-
-    for child_key in children {
-        if let Some(child_accesses) = accessed_members.get(child_key) {
-            child_accesses_to_propagate.extend(child_accesses.iter().cloned());
-        }
-    }
-
-    if let Some(ref parent_acc) = parent_accesses {
-        for child_key in children {
-            accessed_members
-                .entry(child_key.clone())
-                .or_default()
-                .extend(parent_acc.iter().cloned());
-        }
-    }
-
-    if !child_accesses_to_propagate.is_empty() {
-        accessed_members
-            .entry(parent_key.clone())
+    for (file_id, members) in downward_self {
+        self_accessed_members
+            .entry(file_id)
             .or_default()
-            .extend(child_accesses_to_propagate);
+            .extend(members);
     }
 }
 
-fn build_interface_to_implementers(
+fn access_count(accessed: &ClassAccesses, self_accessed: &FileAccesses) -> usize {
+    accessed.values().map(FxHashSet::len).sum::<usize>()
+        + self_accessed.values().map(FxHashSet::len).sum::<usize>()
+}
+
+/// Add the accesses of every child to its parents, until nothing changes.
+fn close_upward(
+    parent_to_children: &FxHashMap<ExportKey, Vec<ExportKey>>,
+    accessed: &mut ClassAccesses,
+    self_accessed: &mut FileAccesses,
+) {
+    for _ in 0..MAX_INHERITANCE_PASSES {
+        let before = access_count(accessed, self_accessed);
+        for (parent, children) in parent_to_children {
+            let mut from_children: FxHashSet<String> = FxHashSet::default();
+            let mut self_from_children: FxHashSet<String> = FxHashSet::default();
+            for child in children {
+                if let Some(members) = accessed.get(child) {
+                    from_children.extend(members.iter().cloned());
+                }
+                if let Some(members) = self_accessed.get(&child.file_id) {
+                    self_from_children.extend(members.iter().cloned());
+                }
+            }
+            if !from_children.is_empty() {
+                accessed
+                    .entry(parent.clone())
+                    .or_default()
+                    .extend(from_children);
+            }
+            if !self_from_children.is_empty() {
+                self_accessed
+                    .entry(parent.file_id)
+                    .or_default()
+                    .extend(self_from_children);
+            }
+        }
+        if access_count(accessed, self_accessed) == before {
+            return;
+        }
+    }
+}
+
+/// Add the accesses of every parent to its children, until nothing changes.
+fn close_downward(
+    parent_to_children: &FxHashMap<ExportKey, Vec<ExportKey>>,
+    accessed: &mut ClassAccesses,
+    self_accessed: &mut FileAccesses,
+) {
+    for _ in 0..MAX_INHERITANCE_PASSES {
+        let before = access_count(accessed, self_accessed);
+        for (parent, children) in parent_to_children {
+            let from_parent = accessed.get(parent).cloned().unwrap_or_default();
+            let self_from_parent = self_accessed
+                .get(&parent.file_id)
+                .cloned()
+                .unwrap_or_default();
+            for child in children {
+                if !from_parent.is_empty() {
+                    accessed
+                        .entry(child.clone())
+                        .or_default()
+                        .extend(from_parent.iter().cloned());
+                }
+                if !self_from_parent.is_empty() {
+                    self_accessed
+                        .entry(child.file_id)
+                        .or_default()
+                        .extend(self_from_parent.iter().cloned());
+                }
+            }
+        }
+        if access_count(accessed, self_accessed) == before {
+            return;
+        }
+    }
+}
+
+fn build_interface_implementation_contracts(
     graph: &ModuleGraph,
     resolved_modules: &[ResolvedModule],
     class_heritage_by_file: &FxHashMap<FileId, &[fallow_types::extract::ClassHeritageInfo]>,
     indexes: &MemberPassIndexes<'_>,
-) -> FxHashMap<ExportKey, Vec<ExportKey>> {
+    required_by_type: &RequiredTypeMemberIndex,
+) -> InterfaceImplementationContracts {
     let mut interface_to_implementers: FxHashMap<ExportKey, Vec<ExportKey>> = FxHashMap::default();
+    let mut required_by_implementer: FxHashMap<ExportKey, FxHashSet<String>> = FxHashMap::default();
     // O(1) dedup across the whole build: a `contains` scan of the growing
     // implementer Vec is O(implementers^2) for a widely-implemented interface
     // (issue #1843 follow-up). Keyed on (interface key, implementer key); the Vec
@@ -504,11 +593,25 @@ fn build_interface_to_implementers(
 
             let implementer_key = ExportKey::new(resolved.file_id, heritage.export_name.clone());
             for interface_name in &heritage.implements {
+                if let Some(required) = required_by_type.get(resolved.file_id, interface_name) {
+                    required_by_implementer
+                        .entry(implementer_key.clone())
+                        .or_default()
+                        .extend(required.iter().cloned());
+                }
                 let Some(interface_keys) = local_to_export_keys.get(interface_name.as_str()) else {
                     continue;
                 };
                 for interface_key in interface_keys {
                     for resolved_interface_key in export_key_with_origins(graph, interface_key) {
+                        if let Some(required) =
+                            required_by_type.get_for_export(indexes, &resolved_interface_key)
+                        {
+                            required_by_implementer
+                                .entry(implementer_key.clone())
+                                .or_default()
+                                .extend(required.iter().cloned());
+                        }
                         if seen_pairs
                             .insert((resolved_interface_key.clone(), implementer_key.clone()))
                         {
@@ -522,5 +625,8 @@ fn build_interface_to_implementers(
             }
         }
     }
-    interface_to_implementers
+    InterfaceImplementationContracts {
+        implementers_by_interface: interface_to_implementers,
+        required_members_by_implementer: required_by_implementer,
+    }
 }

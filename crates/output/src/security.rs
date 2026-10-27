@@ -2,17 +2,21 @@
 
 use std::collections::BTreeMap;
 
-use crate::root_envelopes::{RootEnvelopeMode, attach_telemetry_meta, serialize_named_json_output};
+use crate::root_envelopes::{attach_telemetry_meta, serialize_named_json_output};
 use fallow_types::envelope::{ElapsedMs, Meta, ToolVersion};
 use fallow_types::results::{
     SecurityAttackSurfaceEntry, SecurityFinding, SecurityFindingKind, SecurityRuntimeState,
     SecuritySeverity, TaintConfidence,
 };
-use serde::{Deserialize, Serialize};
+use fallow_types::workspace::WorkspaceDiagnostic;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+/// Current `fallow security --format json` schema version.
+pub const SECURITY_SCHEMA_VERSION: u32 = 8;
 
 /// The `fallow security --format json` schema version. Independently versioned
 /// from the main contract, mirroring `ImpactReportSchemaVersion`.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum SecuritySchemaVersion {
     /// First release of the `fallow security --format json` shape.
@@ -36,12 +40,15 @@ pub enum SecuritySchemaVersion {
     /// Adds the server-only-import category on client-server-leak findings.
     #[serde(rename = "7")]
     V7,
+    /// Expands the required semantic omission reason-code enum.
+    #[serde(rename = "8")]
+    V8,
 }
 
 /// Gate verdict on the wire. `fail` is the CI-state token; human output renders
 /// it as "REVIEW REQUIRED" because these stay unverified candidates, never
 /// confirmed vulnerabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum SecurityGateVerdict {
@@ -53,7 +60,7 @@ pub enum SecurityGateVerdict {
 
 /// The `gate` block on `SecurityOutput`, present only when `--gate <mode>` ran.
 /// Invariant: `verdict == Fail  IFF  exit code 8  IFF  new_count > 0`.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityGate<Mode> {
     /// Gate mode that was selected on the command line.
@@ -65,7 +72,7 @@ pub struct SecurityGate<Mode> {
 }
 
 /// Allowlisted config context for `fallow security --format json`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(
     feature = "schema",
@@ -73,7 +80,10 @@ pub struct SecurityGate<Mode> {
 )]
 pub struct SecurityOutputConfig<Severity> {
     /// Relevant rule severities before and after this command applies its
-    /// default-on behavior for security-only rules.
+    /// default-on behavior for security-only rules. These values come from the
+    /// top-level `rules` only. A matching `overrides` entry can set another
+    /// severity for a path: `off` drops the candidates in that path, and
+    /// `error` makes the run fail, also when the value here is `warn`.
     pub rules: SecurityOutputRulesConfig<Severity>,
     /// `security.categories.include` from config. `null` means unset, `[]`
     /// means explicitly empty.
@@ -84,7 +94,7 @@ pub struct SecurityOutputConfig<Severity> {
 }
 
 /// Per-rule severity context inside [`SecurityOutputConfig::rules`].
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityOutputRulesConfig<Severity> {
     /// Severity context for the client-server-leak rule.
@@ -94,13 +104,16 @@ pub struct SecurityOutputRulesConfig<Severity> {
 }
 
 /// Configured-versus-effective severity for one security rule.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityRuleSeverityConfig<Severity> {
-    /// Severity read from resolved config before the security command applies
-    /// its default-on behavior.
+    /// Top-level severity read from resolved config before the security
+    /// command applies its default-on behavior. Per-path `overrides` are not
+    /// part of this value.
     pub configured: Severity,
-    /// Severity used for this command run.
+    /// Top-level severity used for this command run. A matching `overrides`
+    /// entry can drop a candidate (`off`) or fail the run (`error`) for its
+    /// path, also when this value is `warn`.
     pub effective: Severity,
 }
 
@@ -118,6 +131,24 @@ pub struct SecurityOutput<Config, Gate> {
     pub elapsed_ms: ElapsedMs,
     /// Privacy-safe config context relevant to security candidate generation.
     pub config: Config,
+    /// The verdict of every gate this run evaluated, keyed by name. The CLI
+    /// always emits it, with the command's default exit rule in it also when
+    /// no flag armed a gate, so a CI integration reads the verdict instead of
+    /// guessing from a process status it usually cannot see. A gate fails the
+    /// build when `status` is `fail` AND `enforced` is true. The typed
+    /// programmatic API runs no CLI gate and leaves it absent. See
+    /// [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run RECEIVED, keyed by name,
+    /// absent when it was asked for nothing. An entry whose `status` is not
+    /// `applied` means the run could not do what it was asked and reported
+    /// something WIDER instead, so what follows is a valid report of a scope
+    /// nobody requested. Honoured requests are published too, with
+    /// `status: "applied"`, so an absent object means "nothing was asked for",
+    /// never "nothing failed". See [`crate::RequestOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
     /// Security-specific rule and field metadata, emitted with `--explain`.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
@@ -126,6 +157,9 @@ pub struct SecurityOutput<Config, Gate> {
     /// distinguish "gate ran and passed" from "gate did not run" (absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Gate>,
+    /// Diagnostics owned by this security analysis run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Security candidates. Paths are project-root-relative, forward-slash.
     pub security_findings: Vec<SecurityFinding>,
     /// Opt-in attack-surface inventory from untrusted entry points to reachable
@@ -148,7 +182,7 @@ pub struct SecurityOutput<Config, Gate> {
 }
 
 /// Bounded unresolved-callee diagnostics for `fallow security --format json`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityUnresolvedCalleeDiagnostics {
     /// Deterministic sample rows, capped by `sample_limit`.
@@ -164,7 +198,7 @@ pub struct SecurityUnresolvedCalleeDiagnostics {
 }
 
 /// One sampled unresolved-callee row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityUnresolvedCalleeSample {
     /// File path relative to the analysed root.
@@ -180,7 +214,7 @@ pub struct SecurityUnresolvedCalleeSample {
 }
 
 /// Count of unresolved callees in one file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityUnresolvedCalleeTopFile {
     /// File path relative to the analysed root.
@@ -190,7 +224,7 @@ pub struct SecurityUnresolvedCalleeTopFile {
 }
 
 /// Count of unresolved callees for one reason.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityUnresolvedCalleeReasonCount {
     /// Why the callees could not be resolved.
@@ -213,14 +247,132 @@ pub struct SecuritySummaryOutput<Config, Gate> {
     pub elapsed_ms: ElapsedMs,
     /// Privacy-safe config context relevant to security candidate generation.
     pub config: Config,
+    /// The verdict of every gate this run evaluated, keyed by name. The CLI
+    /// always emits it, with the command's default exit rule in it also when
+    /// no flag armed a gate, so a CI integration reads the verdict instead of
+    /// guessing from a process status it usually cannot see. A gate fails the
+    /// build when `status` is `fail` AND `enforced` is true. The typed
+    /// programmatic API runs no CLI gate and leaves it absent. See
+    /// [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run RECEIVED, keyed by name,
+    /// absent when it was asked for nothing. An entry whose `status` is not
+    /// `applied` means the run could not do what it was asked and reported
+    /// something WIDER instead, so what follows is a valid report of a scope
+    /// nobody requested. Honoured requests are published too, with
+    /// `status: "applied"`, so an absent object means "nothing was asked for",
+    /// never "nothing failed". See [`crate::RequestOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
     /// Security-specific rule and field metadata, emitted with `--explain`.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
     /// Gate verdict, present only when `--gate <mode>` was set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Gate>,
+    /// Diagnostics owned by the full security analysis summarized here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Aggregate security counts after all filters, gates, and scopes.
     pub summary: SecuritySummary,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SavedSecurityGateMode {
+    New,
+    NewlyReachable,
+}
+
+#[derive(Deserialize)]
+struct SavedSecurityEnvelope {
+    #[serde(rename = "version")]
+    _version: String,
+    #[serde(rename = "elapsed_ms")]
+    _elapsed_ms: u64,
+    #[serde(rename = "config")]
+    _config: SecurityOutputConfig<fallow_config::Severity>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<serde_json::Value>,
+    #[serde(rename = "gate", default)]
+    _gate: Option<SecurityGate<SavedSecurityGateMode>>,
+}
+
+#[derive(Deserialize)]
+struct SavedSecurityFullPayload {
+    #[serde(rename = "security_findings")]
+    _security_findings: Vec<SecurityFinding>,
+    #[serde(rename = "attack_surface", default)]
+    _attack_surface: Option<Vec<SecurityAttackSurfaceEntry>>,
+    #[serde(rename = "unresolved_edge_files")]
+    _unresolved_edge_files: usize,
+    #[serde(rename = "unresolved_callee_sites")]
+    _unresolved_callee_sites: usize,
+    #[serde(rename = "unresolved_callee_diagnostics", default)]
+    _unresolved_callee_diagnostics: Option<SecurityUnresolvedCalleeDiagnostics>,
+}
+
+#[derive(Deserialize)]
+struct SavedSecuritySummaryPayload {
+    #[serde(rename = "summary")]
+    _summary: SecuritySummary,
+}
+
+/// Validate a saved security envelope against the current output-owned schema.
+///
+/// Older known schemas remain readable for compatibility. Current envelopes
+/// fail closed when required fields or nested payloads are malformed.
+pub fn validate_saved_security_envelope(value: &serde_json::Value) -> Result<(), String> {
+    let raw_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "saved security envelope is missing a string `schema_version`".to_owned())?;
+    let version = raw_version.parse::<u32>().map_err(|_| {
+        format!("saved security envelope has invalid schema version `{raw_version}`")
+    })?;
+    let current = SECURITY_SCHEMA_VERSION;
+    if version == 0 || version > current {
+        return Err(format!(
+            "unsupported saved security schema version {version}; this Fallow version supports versions 1 through {current}"
+        ));
+    }
+    if version < current {
+        return Ok(());
+    }
+
+    let envelope: SavedSecurityEnvelope = parse_saved_security(value, "envelope")?;
+    if let Some(meta) = envelope.meta {
+        let meta = meta
+            .as_object()
+            .ok_or_else(|| "saved security envelope field `_meta` must be an object".to_owned())?;
+        if let Some(type_aware) = meta.get("type_aware").filter(|value| !value.is_null()) {
+            parse_saved_security::<fallow_types::envelope::TypeAwareMeta>(
+                type_aware,
+                "type-aware metadata",
+            )?;
+        }
+    }
+
+    if value.get("security_findings").is_some() {
+        parse_saved_security::<SavedSecurityFullPayload>(value, "full payload")?;
+    } else if value.get("summary").is_some() {
+        parse_saved_security::<SavedSecuritySummaryPayload>(value, "summary payload")?;
+    } else {
+        return Err(
+            "saved security envelope is missing `security_findings` or `summary`".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn parse_saved_security<T: DeserializeOwned>(
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<T, String> {
+    T::deserialize(value).map_err(|error| {
+        format!("saved security {label} is incompatible with this Fallow version: {error}")
+    })
 }
 
 /// Build the compact aggregate payload for `fallow security --summary --format json`.
@@ -337,14 +489,13 @@ fn record_security_runtime_state(
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_security_json_output<Config, Gate>(
     output: SecurityOutput<Config, Gate>,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error>
 where
     Config: Serialize,
     Gate: Serialize,
 {
-    let mut value = serialize_named_json_output(output, "security", mode)?;
+    let mut value = serialize_named_json_output(output, "security")?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -356,7 +507,6 @@ where
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_security_summary_json_output<Config, Gate>(
     output: &SecurityOutput<Config, Gate>,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error>
 where
@@ -368,11 +518,14 @@ where
         version: output.version.clone(),
         elapsed_ms: output.elapsed_ms,
         config: output.config.clone(),
+        gate_outcomes: output.gate_outcomes.clone(),
+        request_outcomes: output.request_outcomes.clone(),
         meta: output.meta.clone(),
         gate: output.gate,
+        workspace_diagnostics: output.workspace_diagnostics.clone(),
         summary: build_security_summary(output),
     };
-    let mut value = serialize_named_json_output(summary, "security", mode)?;
+    let mut value = serialize_named_json_output(summary, "security")?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -384,9 +537,8 @@ where
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_security_survivors_json_output(
     output: SecuritySurvivorsOutput,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_named_json_output(output, "security-survivors", mode)
+    serialize_named_json_output(output, "security-survivors")
 }
 
 /// Serialize the `fallow security blind-spots --format json` envelope.
@@ -396,13 +548,12 @@ pub fn serialize_security_survivors_json_output(
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_security_blind_spots_json_output(
     output: SecurityBlindSpotsOutput,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_named_json_output(output, "security-blind-spots", mode)
+    serialize_named_json_output(output, "security-blind-spots")
 }
 
 /// Aggregate counts for `fallow security --summary --format json`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecuritySummary {
     /// Number of security candidates after all filters, gates, and scopes.
@@ -425,7 +576,7 @@ pub struct SecuritySummary {
 }
 
 /// Fixed severity counters for summary JSON.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecuritySeverityCounts {
     /// High-severity candidates.
@@ -437,7 +588,7 @@ pub struct SecuritySeverityCounts {
 }
 
 /// Fixed reachability counters for summary JSON.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityReachabilityCounts {
     /// Candidates reachable from an entry point.
@@ -455,7 +606,7 @@ pub struct SecurityReachabilityCounts {
 }
 
 /// Fixed runtime coverage counters for summary JSON.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityRuntimeStateCounts {
     /// Candidates on frequently executed runtime paths.
@@ -533,6 +684,9 @@ pub struct SecuritySurvivorsOutput {
     pub version: ToolVersion,
     /// Wall-clock milliseconds spent producing the report.
     pub elapsed_ms: ElapsedMs,
+    /// Diagnostics preserved from the candidate security report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Aggregate verdict counts.
     pub summary: SecuritySurvivorsSummary,
     /// Verifier-retained candidates keyed by finding id.
@@ -606,6 +760,9 @@ pub struct SecurityBlindSpotsOutput {
     pub version: ToolVersion,
     /// Wall-clock milliseconds spent producing the report.
     pub elapsed_ms: ElapsedMs,
+    /// Diagnostics owned by the security analysis used for this view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Aggregate blind-spot counts from the security analysis.
     pub summary: SecurityBlindSpotsSummary,
     /// Grouped unresolved callee diagnostics, derived from existing samples.
@@ -655,15 +812,47 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn current_security_envelope() -> serde_json::Value {
+        json!({
+            "schema_version": "8",
+            "version": "test",
+            "elapsed_ms": 1,
+            "config": {
+                "rules": {
+                    "security_client_server_leak": {
+                        "configured": "warn",
+                        "effective": "warn"
+                    },
+                    "security_sink": {
+                        "configured": "warn",
+                        "effective": "warn"
+                    }
+                },
+                "categories_include": null,
+                "categories_exclude": null
+            },
+            "security_findings": [],
+            "unresolved_edge_files": 0,
+            "unresolved_callee_sites": 0
+        })
+    }
+
     #[test]
     fn security_summary_json_output_uses_security_root_contract() {
         let output = SecurityOutput {
-            schema_version: SecuritySchemaVersion::V7,
+            gate_outcomes: None,
+            request_outcomes: None,
+            schema_version: SecuritySchemaVersion::V8,
             version: ToolVersion("test".to_string()),
             elapsed_ms: ElapsedMs(12),
             config: json!({"rules": {}}),
             meta: None,
             gate: None::<()>,
+            workspace_diagnostics: vec![WorkspaceDiagnostic::new(
+                std::path::Path::new("/project"),
+                std::path::PathBuf::from("package.json"),
+                fallow_types::workspace::WorkspaceDiagnosticKind::UndeclaredWorkspace,
+            )],
             security_findings: Vec::new(),
             attack_surface: None,
             unresolved_edge_files: 2,
@@ -671,14 +860,204 @@ mod tests {
             unresolved_callee_diagnostics: None,
         };
 
-        let value = serialize_security_summary_json_output(&output, RootEnvelopeMode::Tagged, None)
+        let value = serialize_security_summary_json_output(&output, None)
             .expect("security summary should serialize");
 
         assert_eq!(value["kind"], "security");
-        assert_eq!(value["schema_version"], "7");
+        assert_eq!(value["schema_version"], "8");
         assert_eq!(value["summary"]["security_findings"], 0);
         assert_eq!(value["summary"]["unresolved_edge_files"], 2);
         assert_eq!(value["summary"]["unresolved_callee_sites"], 3);
+        assert_eq!(value["workspace_diagnostics"][0]["path"], "package.json");
         assert!(value.get("security_findings").is_none());
+    }
+
+    #[test]
+    fn saved_security_validator_accepts_current_full_and_summary_payloads() {
+        let full = current_security_envelope();
+        validate_saved_security_envelope(&full).expect("current full security envelope");
+
+        let mut summary = current_security_envelope();
+        summary
+            .as_object_mut()
+            .expect("security envelope")
+            .remove("security_findings");
+        summary
+            .as_object_mut()
+            .expect("security envelope")
+            .remove("unresolved_edge_files");
+        summary
+            .as_object_mut()
+            .expect("security envelope")
+            .remove("unresolved_callee_sites");
+        summary["summary"] = serde_json::to_value(SecuritySummary {
+            security_findings: 0,
+            by_severity: SecuritySeverityCounts::default(),
+            by_category: BTreeMap::new(),
+            by_reachability: SecurityReachabilityCounts::default(),
+            by_runtime_state: SecurityRuntimeStateCounts::default(),
+            unresolved_edge_files: 0,
+            unresolved_callee_sites: 0,
+            attack_surface_entries: 0,
+        })
+        .expect("security summary");
+        validate_saved_security_envelope(&summary).expect("current summary security envelope");
+    }
+
+    #[test]
+    fn saved_security_validator_accepts_legacy_v7_type_aware_payload() {
+        let mut envelope = current_security_envelope();
+        envelope["schema_version"] = json!("7");
+        envelope["_meta"] = json!({
+            "type_aware": {
+                "executed": true,
+                "protocol_version": 6,
+                "sidecar_version": "0.6.0",
+                "backend": "typescript-go",
+                "backend_version": "7.0.0-dev",
+                "selected_tsconfigs": ["tsconfig.json"],
+                "candidate_count": 1,
+                "confirmed_used_count": 0,
+                "contract_preserved_count": 0,
+                "no_static_references_count": 1,
+                "fix_eligible_count": 0,
+                "unresolved_count": 0,
+                "abstained_count": 0,
+                "abstention_reasons": {
+                    "no_project": 0,
+                    "ambiguous_project": 0,
+                    "blocking_diagnostics": 0,
+                    "svelte_virtual_module_exports": 0,
+                    "unknown_symbol": 0,
+                    "unsupported_syntax": 0,
+                    "capacity": 0
+                },
+                "projects": [],
+                "warning_count": 0,
+                "warnings": [],
+                "elapsed_ms": 4,
+                "phase_timings_ms": {
+                    "project_setup": 1,
+                    "diagnostics": 1,
+                    "symbol_scan": 2
+                }
+            }
+        });
+
+        validate_saved_security_envelope(&envelope)
+            .expect("legacy schema 7 type-aware metadata stays readable");
+    }
+
+    #[test]
+    fn saved_security_validator_rejects_malformed_current_payloads() {
+        let mut findings = current_security_envelope();
+        findings["security_findings"] = json!("not-an-array");
+        assert!(validate_saved_security_envelope(&findings).is_err());
+
+        let mut type_aware = current_security_envelope();
+        type_aware["_meta"] = json!({"type_aware": {"queries": "not-an-array"}});
+        assert!(validate_saved_security_envelope(&type_aware).is_err());
+    }
+
+    #[test]
+    fn saved_security_validator_accepts_legacy_and_rejects_future_schema() {
+        validate_saved_security_envelope(&json!({"schema_version": "7"}))
+            .expect("known legacy security schema");
+        let error = validate_saved_security_envelope(&json!({"schema_version": "9"}))
+            .expect_err("future security schema must fail closed");
+        assert!(error.contains("unsupported saved security schema version 9"));
+    }
+
+    fn assert_saved_security_parse_parity<T: DeserializeOwned>(
+        value: &serde_json::Value,
+        label: &str,
+        valid: bool,
+    ) {
+        let owned = serde_json::from_value::<T>(value.clone())
+            .map(|_| ())
+            .map_err(|error| {
+                format!("saved security {label} is incompatible with this Fallow version: {error}")
+            });
+        let borrowed = parse_saved_security::<T>(value, label).map(|_| ());
+        assert_eq!(borrowed.is_ok(), valid, "{label}: {borrowed:?}");
+        assert_eq!(
+            borrowed, owned,
+            "{label} must retain exact validation errors"
+        );
+    }
+
+    #[test]
+    fn saved_security_parsing_preserves_owned_value_contract() {
+        let mut full = current_security_envelope();
+        full["security_findings"] = json!([{
+            "finding_id": "security-fixture",
+            "kind": "tainted-sink",
+            "path": "src/[route]/café.ts",
+            "line": 12,
+            "col": 3,
+            "evidence": "quoted \"value\" and unicode café",
+            "severity": "low",
+            "trace": [],
+            "actions": [],
+            "candidate": fallow_types::results::SecurityCandidate::default()
+        }]);
+        full["future_field"] = json!({"nested": ["ignored", {"value": null}]});
+        assert_saved_security_parse_parity::<SavedSecurityEnvelope>(&full, "envelope", true);
+        assert_saved_security_parse_parity::<SavedSecurityFullPayload>(&full, "full payload", true);
+        validate_saved_security_envelope(&full).expect("nonempty current payload remains valid");
+
+        for (field, invalid) in [
+            ("line", json!(-1)),
+            ("severity", json!("invalid")),
+            ("candidate", json!([])),
+        ] {
+            let mut malformed = full.clone();
+            malformed["security_findings"][0][field] = invalid;
+            assert_saved_security_parse_parity::<SavedSecurityFullPayload>(
+                &malformed,
+                "full payload",
+                false,
+            );
+            assert!(validate_saved_security_envelope(&malformed).is_err());
+        }
+        for malformed in [
+            serde_json::Value::Null,
+            json!({}),
+            json!({"security_findings": "not-an-array"}),
+        ] {
+            assert_saved_security_parse_parity::<SavedSecurityFullPayload>(
+                &malformed,
+                "full payload",
+                false,
+            );
+        }
+        let mut invalid_header = full.clone();
+        invalid_header["elapsed_ms"] = json!("invalid");
+        assert_saved_security_parse_parity::<SavedSecurityEnvelope>(
+            &invalid_header,
+            "envelope",
+            false,
+        );
+
+        let summary = json!({"summary": {
+            "security_findings": 1,
+            "by_severity": {"high": 0, "medium": 0, "low": 1},
+            "by_category": {"dangerous-html": 1},
+            "by_reachability": SecurityReachabilityCounts::default(),
+            "by_runtime_state": SecurityRuntimeStateCounts::default(),
+            "unresolved_edge_files": 0,
+            "unresolved_callee_sites": 0,
+            "attack_surface_entries": 0
+        }});
+        assert_saved_security_parse_parity::<SavedSecuritySummaryPayload>(
+            &summary,
+            "summary payload",
+            true,
+        );
+        assert_saved_security_parse_parity::<SavedSecuritySummaryPayload>(
+            &json!({"summary": false}),
+            "summary payload",
+            false,
+        );
     }
 }

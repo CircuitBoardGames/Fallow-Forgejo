@@ -9,8 +9,8 @@ use crate::{
     AnalysisOptions, AuditOptions, DecisionSurfaceOptions, DecisionSurfaceProgrammaticOutput,
     ProgrammaticError,
     analysis_context::{
-        ProgrammaticAnalysisContext, changed_files_for_run,
-        resolve_programmatic_analysis_context_deferred_workspace, workspace_roots_for_session,
+        ProgrammaticAnalysisContext, changed_files_for_run, resolve_programmatic_analysis_context,
+        workspace_roots_for_session,
     },
     decision_surface::{
         BoundaryAnchor, CoordinationAnchor, DEFAULT_DECISION_CAP, DecisionInputs,
@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-use super::{ProgrammaticResult, root_envelope_mode};
+use super::ProgrammaticResult;
 
 /// Run changed-code decision-surface analysis through the typed programmatic API.
 ///
@@ -36,26 +36,38 @@ pub fn run_decision_surface(
         changed_since: Some(resolved_base.git_ref.clone()),
         ..options.analysis.clone()
     };
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&analysis)?;
     let changed_files = changed_files_for_run(&resolved)?.unwrap_or_default();
     if changed_files.is_empty() {
         return Ok(DecisionSurfaceProgrammaticOutput {
             surface: fallow_output::DecisionSurface::default(),
             elapsed: start.elapsed(),
-            envelope_mode: root_envelope_mode(),
             telemetry_analysis_run_id: None,
         });
     }
 
-    let head = run_decision_analysis(&resolved, Some(&changed_files))?;
-    let base = compute_base_decision_snapshot(options, &resolved.root, &resolved_base.git_ref)?;
-    let deltas = build_decision_deltas(&head, &base);
-    let surface = build_surface(options, &head, &deltas);
+    // The caller can be a 2 MiB Tokio blocking thread. Parse on the worker
+    // stack of the analysis pool instead.
+    let head = resolved.install(|| run_decision_analysis(&resolved, Some(&changed_files), None))?;
+    let manifests = changed_manifests(&resolved.root, &changed_files);
+    let base = compute_base_decision_snapshot(
+        options,
+        &resolved.root,
+        &resolved_base.git_ref,
+        &manifests,
+        &head.config,
+    )?;
+    let manifest_pairs = manifest_pairs(&resolved.root, &manifests, &base);
+    let dependency_anchors = crate::dependency_deltas::dependency_anchors_from_manifests(
+        &manifest_pairs,
+        head.package_importers.as_ref(),
+    );
+    let deltas = build_decision_deltas(&head, &base, &dependency_anchors);
+    let surface = build_surface(options, &head, &deltas, &dependency_anchors);
 
     Ok(DecisionSurfaceProgrammaticOutput {
         surface,
         elapsed: start.elapsed(),
-        envelope_mode: root_envelope_mode(),
         telemetry_analysis_run_id: None,
     })
 }
@@ -68,14 +80,18 @@ fn audit_options_for_decision_surface(options: &DecisionSurfaceOptions) -> Audit
     }
 }
 
-struct DecisionAnalysis {
+pub(super) struct DecisionAnalysis {
     root: PathBuf,
-    results: fallow_types::results::AnalysisResults,
+    pub(super) results: fallow_types::results::AnalysisResults,
     public_api: FxHashSet<String>,
     impact_closure: Option<fallow_engine::module_graph::ImpactClosurePaths>,
     export_lines: Option<FxHashMap<String, Vec<(String, u32)>>>,
     internal_consumers: Option<FxHashMap<String, u64>>,
+    package_importers: Option<FxHashMap<String, fallow_engine::module_graph::PackageImporters>>,
     routing: fallow_output::RoutingFacts,
+    /// The configuration the analysis session loaded, kept so the base
+    /// snapshot can resolve rule severity against the head configuration.
+    pub(super) config: fallow_config::ResolvedConfig,
 }
 
 struct DecisionGraphSignals {
@@ -83,11 +99,51 @@ struct DecisionGraphSignals {
     impact_closure: Option<fallow_engine::module_graph::ImpactClosurePaths>,
     export_lines: Option<FxHashMap<String, Vec<(String, u32)>>>,
     internal_consumers: Option<FxHashMap<String, u64>>,
+    package_importers: Option<FxHashMap<String, fallow_engine::module_graph::PackageImporters>>,
 }
 
-fn run_decision_analysis(
+/// Root-relative, forward-slashed paths of the changed `package.json`
+/// manifests, sorted.
+fn changed_manifests(root: &Path, changed_files: &FxHashSet<PathBuf>) -> Vec<String> {
+    let mut manifests: Vec<String> = changed_files
+        .iter()
+        .filter_map(|abs| abs.strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .filter(|rel| crate::dependency_deltas::is_manifest_path(rel))
+        .collect();
+    manifests.sort();
+    manifests
+}
+
+/// Pair each changed manifest's head text with the base text captured from the
+/// base worktree. A manifest unreadable at head is skipped; one absent at base
+/// reads as new.
+fn manifest_pairs(
+    root: &Path,
+    manifests: &[String],
+    base: &DecisionSnapshot,
+) -> Vec<crate::dependency_deltas::ManifestPair> {
+    manifests
+        .iter()
+        .filter_map(|manifest| {
+            let head = std::fs::read_to_string(root.join(manifest)).ok()?;
+            Some(crate::dependency_deltas::ManifestPair {
+                manifest: manifest.clone(),
+                base: base.manifests.get(manifest).cloned(),
+                head,
+            })
+        })
+        .collect()
+}
+
+/// Analyze one revision for the decision surface. `severity_config` resolves
+/// rule severity in place of the session's own configuration; the base
+/// snapshot passes the head configuration so both revisions are judged by the
+/// rules under review, as the CLI's base worktree pass already does.
+pub(super) fn run_decision_analysis(
     resolved: &ProgrammaticAnalysisContext,
     changed_files: Option<&FxHashSet<PathBuf>>,
+    severity_config: Option<&fallow_config::ResolvedConfig>,
 ) -> ProgrammaticResult<DecisionAnalysis> {
     let session = super::dead_code::load_dead_code_session(
         &super::dead_code::default_dead_code_options_for_context(resolved),
@@ -107,6 +163,12 @@ fn run_decision_analysis(
         ..
     } = artifacts;
     let changed_files = changed_files.as_ref();
+
+    // Rule severity is resolved before anything is framed as a decision, so a
+    // rule or a per-path override that turns a finding off also removes the
+    // decision built from it. The CLI reaches the same state through `check`.
+    let severity = severity_config.unwrap_or_else(|| session.config());
+    fallow_engine::dead_code::apply_rule_severities(&mut output.results, severity);
 
     let workspace_roots = workspace_roots_for_session(resolved, session.workspaces())?;
     filter_decision_results(
@@ -128,7 +190,9 @@ fn run_decision_analysis(
         impact_closure: graph_signals.impact_closure,
         export_lines: graph_signals.export_lines,
         internal_consumers: graph_signals.internal_consumers,
+        package_importers: graph_signals.package_importers,
         routing,
+        config: session.config().clone(),
     })
 }
 
@@ -161,12 +225,18 @@ fn decision_graph_signals(
             fallow_engine::module_graph::internal_consumers_for_changed_paths(graph, root, files)
         })
     });
+    let package_importers = graph.and_then(|graph| {
+        changed_files.and_then(|files| {
+            fallow_engine::module_graph::package_importers_for_changed_paths(graph, files)
+        })
+    });
 
     DecisionGraphSignals {
         public_api,
         impact_closure,
         export_lines,
         internal_consumers,
+        package_importers,
     }
 }
 
@@ -187,13 +257,33 @@ fn compute_base_decision_snapshot(
     options: &DecisionSurfaceOptions,
     current_root: &Path,
     base_ref: &str,
+    manifests: &[String],
+    head_config: &fallow_config::ResolvedConfig,
 ) -> ProgrammaticResult<DecisionSnapshot> {
-    let worktree = TemporaryBaseWorktree::create(current_root, base_ref).map_err(|err| {
-        ProgrammaticError::new(err.to_string(), 2)
-            .with_code("FALLOW_DECISION_SURFACE_FAILED")
-            .with_context("decisionSurface.base")
-    })?;
-    let base_root = repo_refs::base_analysis_root(current_root, worktree.path());
+    let worktree =
+        TemporaryBaseWorktree::create(current_root, base_ref, &head_config.workspace_patterns)
+            .map_err(|err| {
+                ProgrammaticError::new(err.to_string(), 2)
+                    .with_code("FALLOW_DECISION_SURFACE_FAILED")
+                    .with_context("decisionSurface.base")
+            })?;
+    let base_root = match repo_refs::resolve_base_analysis_root(current_root, worktree.path()) {
+        repo_refs::BaseAnalysisRoot::Present(root) => root,
+        // A root the base commit does not contain has an empty base snapshot:
+        // no boundary edges, no cycles, no public API and no manifests, so the
+        // whole surface reads as new in this change.
+        repo_refs::BaseAnalysisRoot::NewInHead(_) => return Ok(DecisionSnapshot::default()),
+    };
+    // The base manifests are read while the worktree still exists; a manifest
+    // absent at base stays absent (it is new in this change).
+    let base_manifests: FxHashMap<String, String> = manifests
+        .iter()
+        .filter_map(|manifest| {
+            std::fs::read_to_string(base_root.join(manifest))
+                .ok()
+                .map(|text| (manifest.clone(), text))
+        })
+        .collect();
     let base_analysis = AnalysisOptions {
         root: Some(base_root),
         config_path: options.analysis.config_path.clone(),
@@ -201,9 +291,11 @@ fn compute_base_decision_snapshot(
         explain: false,
         ..options.analysis.clone()
     };
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&base_analysis)?;
-    let base = run_decision_analysis(&resolved, None)?;
-    Ok(snapshot_from_decision_analysis(&base))
+    let resolved = resolve_programmatic_analysis_context(&base_analysis)?;
+    let base = resolved.install(|| run_decision_analysis(&resolved, None, Some(head_config)))?;
+    let mut snapshot = snapshot_from_decision_analysis(&base);
+    snapshot.manifests = base_manifests;
+    Ok(snapshot)
 }
 
 #[derive(Default)]
@@ -211,6 +303,8 @@ struct DecisionSnapshot {
     boundary_edges: FxHashSet<String>,
     cycles: FxHashSet<String>,
     public_api: FxHashSet<String>,
+    /// Base text of each changed manifest, keyed by root-relative path.
+    manifests: FxHashMap<String, String>,
 }
 
 fn snapshot_from_decision_analysis(analysis: &DecisionAnalysis) -> DecisionSnapshot {
@@ -223,12 +317,17 @@ fn snapshot_from_decision_analysis(analysis: &DecisionAnalysis) -> DecisionSnaps
             &analysis.root,
         ),
         public_api: analysis.public_api.clone(),
+        manifests: FxHashMap::default(),
     }
 }
 
-fn build_decision_deltas(head: &DecisionAnalysis, base: &DecisionSnapshot) -> ReviewDeltas {
+fn build_decision_deltas(
+    head: &DecisionAnalysis,
+    base: &DecisionSnapshot,
+    dependency_anchors: &[crate::decision_surface::DependencyAnchor],
+) -> ReviewDeltas {
     let head_snapshot = snapshot_from_decision_analysis(head);
-    fallow_output::ReviewDeltas {
+    let mut deltas = fallow_output::ReviewDeltas {
         boundary_introduced: crate::review_deltas::introduced_keys(
             &head_snapshot.boundary_edges,
             &base.boundary_edges,
@@ -241,13 +340,18 @@ fn build_decision_deltas(head: &DecisionAnalysis, base: &DecisionSnapshot) -> Re
             &head_snapshot.public_api,
             &base.public_api,
         ),
-    }
+        dependency_added: Vec::new(),
+        dependency_major_bumped: Vec::new(),
+    };
+    crate::dependency_deltas::fill_dependency_delta_keys(&mut deltas, dependency_anchors);
+    deltas
 }
 
 fn build_surface(
     options: &DecisionSurfaceOptions,
     head: &DecisionAnalysis,
     deltas: &ReviewDeltas,
+    dependency_anchors: &[crate::decision_surface::DependencyAnchor],
 ) -> fallow_output::DecisionSurface {
     let boundary_anchors = boundary_anchors(head, deltas);
     let mut coordination = coordination_anchors(head.impact_closure.as_ref());
@@ -279,6 +383,7 @@ fn build_surface(
         deltas,
         boundary_anchors: &boundary_anchors,
         coordination: &coordination,
+        dependency_anchors,
         public_api_anchor_line,
         affected_not_shown,
         routing: &head.routing,
@@ -356,5 +461,106 @@ fn export_line_resolver(
             .find(|(name, _)| symbols.iter().any(|symbol| name == symbol))
             .or_else(|| exports.first())
             .map_or(0, |(_, line)| *line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::process::Command;
+
+    use crate::{AnalysisOptions, DecisionSurfaceOptions};
+
+    const STACK_PROBE_ENV: &str = "FALLOW_DECISION_SURFACE_STACK_PROBE_CHILD";
+    const STACK_PROBE_TEST: &str =
+        "runtime::decision_surface::tests::decision_surface_parses_on_the_worker_stack";
+    /// Deep enough to overflow a 2 MiB thread in a release build and to fit
+    /// the 16 MiB worker stack in a debug build. An assignment chain has no
+    /// brackets, so the pre-parse bracket guard does not stop it.
+    const ASSIGNMENT_CHAIN_DEPTH: usize = 4_000;
+
+    // A stack overflow aborts the process, so the probe re-runs this test
+    // binary as a child without RUST_MIN_STACK (pinned to 16 MiB in
+    // .cargo/config.toml). The child test thread then has the 2 MiB default
+    // stack of an MCP blocking thread.
+    #[test]
+    fn decision_surface_parses_on_the_worker_stack() {
+        if std::env::var_os(STACK_PROBE_ENV).is_some() {
+            run_stack_probe_child();
+            return;
+        }
+
+        let current_exe = std::env::current_exe().expect("current test binary should be known");
+        let output = Command::new(current_exe)
+            .arg("--exact")
+            .arg(STACK_PROBE_TEST)
+            .arg("--nocapture")
+            .env(STACK_PROBE_ENV, "1")
+            .env_remove("RUST_MIN_STACK")
+            .output()
+            .expect("stack probe child should start");
+
+        assert!(
+            output.status.success(),
+            "stack probe child failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_stack_probe_child() {
+        let project = tempfile::tempdir().expect("temp dir");
+        let root = project.path();
+        std::fs::write(root.join("index.ts"), "export const used = 1;\n").expect("write entry");
+        git(root, &["init", "-b", "main"]);
+        git(root, &["add", "."]);
+        commit(root, "initial");
+        git(root, &["checkout", "-b", "feature"]);
+        let deep = format!(
+            "export let a = 0;\n{}1;\n",
+            "a=".repeat(ASSIGNMENT_CHAIN_DEPTH)
+        );
+        std::fs::write(root.join("deep.ts"), deep).expect("write deep file");
+        git(root, &["add", "."]);
+        commit(root, "deep");
+
+        let options = DecisionSurfaceOptions {
+            analysis: AnalysisOptions {
+                root: Some(root.to_path_buf()),
+                threads: Some(1),
+                no_cache: true,
+                ..AnalysisOptions::default()
+            },
+            base: Some("main".to_owned()),
+            max_decisions: None,
+        };
+        super::super::run_decision_surface(&options).expect("decision surface should run");
+    }
+
+    fn commit(root: &Path, message: &str) {
+        git(
+            root,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {args:?} failed");
     }
 }

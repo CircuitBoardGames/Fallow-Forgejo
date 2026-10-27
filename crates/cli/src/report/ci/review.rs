@@ -1,15 +1,41 @@
 use std::process::ExitCode;
 
 use fallow_output::CodeClimateIssue;
-use serde_json::Value;
 
 use super::diff_filter::DiffIndex;
 use crate::report::emit_json;
+use fallow_output::PrDecisionConclusion;
 use fallow_output::{
-    CiIssue, CiProvider as Provider, ReviewEnvelopeOutput, ReviewEnvelopeRenderInput,
-    ReviewEnvelopeTruncation, ReviewGitlabDiffRefs as GitlabDiffRefs, ReviewId,
-    issues_from_codeclimate_issues,
+    CiIssue, CiProvider as Provider, ReviewCheckConclusion, ReviewEnvelopeOutput,
+    ReviewEnvelopeRenderInput, ReviewEnvelopeTruncation, ReviewGitlabDiffRefs as GitlabDiffRefs,
+    ReviewId, issues_from_codeclimate_issues,
 };
+
+/// The text a review summary body carries beside its inline-comment line.
+///
+/// The same two parts the sticky comment carries, so a setup that posts
+/// only the review (`FALLOW_REVIEW=true`, `FALLOW_COMMENT=false`) sees them
+/// when it posts a review. The review does not carry the gate rows: a review
+/// is a point-in-time record, and the gate result travels on
+/// `meta.check_conclusion`.
+#[derive(Clone, Copy, Default)]
+pub struct ReviewSummaryNotes<'a> {
+    /// The blockquote note: the type-aware message, the baseline advisory,
+    /// the gate inventory, or any combination.
+    pub message: Option<&'a str>,
+    /// The run diagnostics. The unmatched config patterns among them become
+    /// a Markdown section, as in `--format markdown` and the sticky comment.
+    pub config_patterns: &'a [fallow_config::WorkspaceDiagnostic],
+}
+
+impl<'a> From<super::pr_comment::PrCommentStatus<'a>> for ReviewSummaryNotes<'a> {
+    fn from(status: super::pr_comment::PrCommentStatus<'a>) -> Self {
+        Self {
+            message: status.message,
+            config_patterns: status.config_patterns,
+        }
+    }
+}
 
 #[must_use]
 pub fn render_review_envelope(
@@ -23,6 +49,8 @@ pub fn render_review_envelope(
         issues,
         super::diff_filter::shared_diff_index(),
         None,
+        None,
+        ReviewSummaryNotes::default(),
     )
 }
 
@@ -31,12 +59,18 @@ pub fn render_review_envelope(
 /// cache (which is `OnceLock`-bounded and not reentrant under cargo test's
 /// parallel runner).
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the private render seam keeps test-injected diff and optional gate state explicit"
+)]
 fn render_review_envelope_with_diff(
     command: &str,
     provider: Provider,
     issues: &[CiIssue],
     diff_index: Option<&DiffIndex>,
     review_id: Option<&ReviewId>,
+    conclusion: Option<ReviewCheckConclusion>,
+    notes: ReviewSummaryNotes<'_>,
 ) -> ReviewEnvelopeOutput {
     let max = std::env::var("FALLOW_MAX_COMMENTS")
         .ok()
@@ -46,6 +80,9 @@ fn render_review_envelope_with_diff(
         .then(gitlab_diff_refs_from_env)
         .flatten();
     let include_guidance = review_guidance_enabled();
+    let config_section =
+        crate::report::config_pattern_text::markdown_section(notes.config_patterns);
+    let status_message = notes.message;
 
     let input = ReviewEnvelopeRenderInput {
         command,
@@ -58,10 +95,26 @@ fn render_review_envelope_with_diff(
         include_guidance,
         suggestion_block: &super::suggestion::suggestion_block,
         guidance_block: &review_guidance_block,
+        trailing_section: config_section.as_deref(),
     };
-    let rendered = match review_id {
-        Some(review_id) => fallow_output::render_scoped_review_envelope(&input, review_id),
-        None => fallow_output::render_review_envelope(&input),
+    let rendered = match (review_id, conclusion) {
+        (Some(review_id), Some(conclusion)) => {
+            fallow_output::render_scoped_review_envelope_with_conclusion(
+                &input,
+                review_id,
+                conclusion,
+                status_message,
+            )
+        }
+        (Some(review_id), None) => {
+            fallow_output::render_scoped_review_envelope(&input, review_id, status_message)
+        }
+        (None, Some(conclusion)) => fallow_output::render_review_envelope_with_conclusion(
+            &input,
+            conclusion,
+            status_message,
+        ),
+        (None, None) => fallow_output::render_review_envelope(&input, status_message),
     };
     note_review_truncation(rendered.truncation);
     rendered.envelope
@@ -88,26 +141,34 @@ fn note_review_truncation(truncation: ReviewEnvelopeTruncation) {
 }
 
 #[must_use]
-pub(crate) fn print_review_envelope(
-    command: &str,
-    provider: Provider,
-    codeclimate: &Value,
-) -> ExitCode {
-    let issues = super::diff_filter::filter_issues_from_env(
-        super::pr_comment::issues_from_codeclimate(codeclimate),
-    );
-    print_review_envelope_from_ci_issues(command, provider, &issues)
-}
-
-#[must_use]
 pub(crate) fn print_review_envelope_from_codeclimate_issues(
     command: &str,
     provider: Provider,
     codeclimate: &[CodeClimateIssue],
+    notes: ReviewSummaryNotes<'_>,
 ) -> ExitCode {
     let issues =
         super::diff_filter::filter_issues_from_env(issues_from_codeclimate_issues(codeclimate));
-    print_review_envelope_from_ci_issues(command, provider, &issues)
+    print_review_envelope_from_ci_issues(command, provider, &issues, None, notes)
+}
+
+#[must_use]
+pub(crate) fn print_review_envelope_from_codeclimate_issues_with_conclusion(
+    command: &str,
+    provider: Provider,
+    codeclimate: &[CodeClimateIssue],
+    conclusion: PrDecisionConclusion,
+    notes: ReviewSummaryNotes<'_>,
+) -> ExitCode {
+    let issues =
+        super::diff_filter::filter_issues_from_env(issues_from_codeclimate_issues(codeclimate));
+    print_review_envelope_from_ci_issues(
+        command,
+        provider,
+        &issues,
+        Some(review_conclusion(conclusion)),
+        notes,
+    )
 }
 
 #[must_use]
@@ -115,6 +176,8 @@ fn print_review_envelope_from_ci_issues(
     command: &str,
     provider: Provider,
     issues: &[CiIssue],
+    conclusion: Option<ReviewCheckConclusion>,
+    notes: ReviewSummaryNotes<'_>,
 ) -> ExitCode {
     let review_id = match review_id_from_env() {
         Ok(review_id) => review_id,
@@ -129,19 +192,18 @@ fn print_review_envelope_from_ci_issues(
         issues,
         super::diff_filter::shared_diff_index(),
         review_id.as_ref(),
+        conclusion,
+        notes,
     );
-    let mode = crate::output_runtime::current_root_envelope_mode();
     let analysis_run_id = crate::output_runtime::telemetry_analysis_run_id();
     let value = match review_id.as_ref() {
         Some(review_id) => fallow_output::serialize_scoped_review_envelope_json_output(
             &envelope,
             review_id,
-            mode,
             analysis_run_id.as_deref(),
         ),
         None => fallow_output::serialize_review_envelope_json_output(
             envelope,
-            mode,
             analysis_run_id.as_deref(),
         )
         .map_err(|error| error.to_string()),
@@ -154,6 +216,19 @@ fn print_review_envelope_from_ci_issues(
         }
     };
     emit_json(&value, "review envelope")
+}
+
+/// Translate a gate conclusion into the review/check vocabulary. Shared with
+/// the sticky comment renderer so both surfaces phrase one gate outcome the
+/// same way.
+pub(crate) const fn review_conclusion(conclusion: PrDecisionConclusion) -> ReviewCheckConclusion {
+    match conclusion {
+        PrDecisionConclusion::Success => ReviewCheckConclusion::Success,
+        PrDecisionConclusion::Failure => ReviewCheckConclusion::Failure,
+        PrDecisionConclusion::Neutral | PrDecisionConclusion::Skipped => {
+            ReviewCheckConclusion::Neutral
+        }
+    }
 }
 
 fn review_id_from_env() -> Result<Option<ReviewId>, String> {
@@ -237,8 +312,9 @@ fn group_by_path_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fallow_output::{MARKER_PREFIX_V2, MARKER_SUFFIX_V2, MAX_COMMENT_BODY_BYTES};
-    use fallow_output::{MARKER_REGEX_V2, ReviewComment};
+    use fallow_output::{MARKER_PREFIX_V3, MARKER_SUFFIX_V3, MAX_COMMENT_BODY_BYTES};
+    use fallow_output::{MARKER_REGEX_V3, ReviewComment};
+    use serde_json::Value;
 
     fn to_value(envelope: &ReviewEnvelopeOutput) -> Value {
         serde_json::to_value(envelope).expect("ReviewEnvelopeOutput serializes infallibly")
@@ -255,7 +331,10 @@ mod tests {
             severity: sev.into(),
             path: path.into(),
             line,
+            end_line: None,
+            other_locations: Vec::new(),
             fingerprint: fp.into(),
+            legacy_fingerprint: None,
         }
     }
 
@@ -273,7 +352,10 @@ mod tests {
             severity: sev.into(),
             path: path.into(),
             line,
+            end_line: None,
+            other_locations: Vec::new(),
             fingerprint: fp.into(),
+            legacy_fingerprint: None,
         }
     }
 
@@ -293,12 +375,11 @@ mod tests {
             &[issue],
             None,
             Some(&review_id),
+            None,
+            ReviewSummaryNotes::default(),
         );
         let envelope = fallow_output::serialize_scoped_review_envelope_json_output(
-            &envelope,
-            &review_id,
-            crate::output_runtime::current_root_envelope_mode(),
-            None,
+            &envelope, &review_id, None,
         )
         .unwrap();
 
@@ -328,18 +409,18 @@ mod tests {
         )];
         let envelope = to_value(&render_review_envelope("check", Provider::Github, &issues));
         assert_eq!(envelope["event"], "COMMENT");
-        assert_eq!(envelope["meta"]["schema"], "fallow-review-envelope/v2");
+        assert_eq!(envelope["meta"]["schema"], "fallow-review-envelope/v3");
         assert_eq!(envelope["comments"][0]["path"], "src/a.ts");
         assert!(
             envelope["comments"][0]["body"]
                 .as_str()
                 .unwrap()
-                .contains("fallow-fingerprint:v2:")
+                .contains("fallow-fingerprint:v3:")
         );
     }
 
     #[test]
-    fn review_summary_body_leads_with_decision() {
+    fn review_summary_body_points_at_the_inline_comments() {
         let issues = vec![issue(
             "fallow/unused-file",
             "major",
@@ -354,9 +435,54 @@ mod tests {
         ));
         let body = envelope["body"].as_str().expect("body is string");
 
-        assert!(body.contains("Quality gate failed"), "{body}");
-        assert!(body.contains("1 inline finding selected"), "{body}");
+        assert!(!body.contains("Quality gate"), "{body}");
+        assert!(
+            body.contains(
+                "1 inline comment on the changed lines. Open the Files changed tab to review."
+            ),
+            "{body}"
+        );
         assert!(body.contains("<!-- fallow-review -->"), "{body}");
+        assert_eq!(
+            envelope["meta"]["check_conclusion"], "failure",
+            "{envelope}"
+        );
+    }
+
+    #[test]
+    fn review_summary_body_lists_unmatched_config_patterns_before_the_markers() {
+        let root = std::path::Path::new("/project");
+        let diagnostics = [fallow_config::WorkspaceDiagnostic::new(
+            root,
+            root.to_path_buf(),
+            fallow_config::WorkspaceDiagnosticKind::IgnoreDependenciesGlobUnmatched {
+                pattern: "@typo/*".to_owned(),
+            },
+        )];
+        let envelope = to_value(&render_review_envelope_with_diff(
+            "dead-code",
+            Provider::Gitlab,
+            &[],
+            None,
+            None,
+            None,
+            ReviewSummaryNotes {
+                message: Some("Baseline advisory."),
+                config_patterns: &diagnostics,
+            },
+        ));
+        let body = envelope["body"].as_str().expect("body is string");
+        let note = body.find("> Baseline advisory.").expect("status note");
+        let section = body
+            .find("## Unmatched config patterns")
+            .expect("config pattern section");
+        let marker = body.find("<!-- fallow-review -->").expect("marker");
+        assert!(note < section && section < marker, "{body}");
+        assert!(
+            body.contains("- `ignoreDependencies`: `@typo/*` matched nothing in this run"),
+            "{body}"
+        );
+        assert_eq!(envelope["summary"]["body"], envelope["body"]);
     }
 
     #[test]
@@ -458,7 +584,7 @@ mod tests {
         assert!(body.contains("For function findings"));
         assert!(body.contains("[Read the rule docs]("));
         assert!(
-            body.find("</details>").unwrap() < body.find("fallow-fingerprint:v2:").unwrap(),
+            body.find("</details>").unwrap() < body.find("fallow-fingerprint:v3:").unwrap(),
             "guidance should render before the marker"
         );
     }
@@ -489,7 +615,7 @@ mod tests {
         let issues = vec![issue("fallow/unused-file", "minor", "src/a.ts", 1, "abc")];
         let env = to_value(&render_review_envelope("check", Provider::Github, &issues));
         let regex = env["marker_regex"].as_str().expect("marker_regex present");
-        assert_eq!(regex, MARKER_REGEX_V2);
+        assert_eq!(regex, MARKER_REGEX_V3);
         assert!(regex.contains("[0-9a-f]{16}"));
         assert!(regex.starts_with('^'));
         assert!(regex.ends_with("\\s*$"));
@@ -510,7 +636,7 @@ mod tests {
         assert_eq!(summary_fp.len(), 16);
         assert!(summary_fp.chars().all(|c| c.is_ascii_hexdigit()));
         let body_str = env["body"].as_str().unwrap();
-        let marker_line = format!("{MARKER_PREFIX_V2}{summary_fp}{MARKER_SUFFIX_V2}");
+        let marker_line = format!("{MARKER_PREFIX_V3}{summary_fp}{MARKER_SUFFIX_V3}");
         assert!(
             body_str.contains(&marker_line),
             "body must carry summary marker:\nbody={body_str}\nmarker={marker_line}"
@@ -538,7 +664,7 @@ mod tests {
         assert!(body.contains("fallow/unused-export"));
         assert!(body.contains("fallow/duplicate-export"));
         assert_eq!(
-            body.matches("fallow-fingerprint:v2:").count(),
+            body.matches("fallow-fingerprint:v3:").count(),
             1,
             "merged body must carry exactly one fingerprint marker"
         );
@@ -641,6 +767,8 @@ rename to src/new.ts
             &[issue],
             Some(&diff_index),
             None,
+            None,
+            ReviewSummaryNotes::default(),
         ));
         let position = &envelope["comments"][0]["position"];
         assert_eq!(position["old_path"], "src/old.ts");
@@ -656,6 +784,8 @@ rename to src/new.ts
             &[issue],
             None,
             None,
+            None,
+            ReviewSummaryNotes::default(),
         ));
         let position = &envelope["comments"][0]["position"];
         assert_eq!(position["old_path"], "src/edit.ts");
@@ -671,7 +801,10 @@ rename to src/new.ts
             severity: "minor".into(),
             path: "src/a.ts".into(),
             line: 1,
+            end_line: None,
+            other_locations: Vec::new(),
             fingerprint: "abc1234567890def".into(),
+            legacy_fingerprint: None,
         };
         let comment = comment_to_value(&render_merged_comment(
             Provider::Github,
@@ -687,7 +820,7 @@ rename to src/new.ts
             body.len()
         );
         assert!(
-            body.contains("fallow-fingerprint:v2:"),
+            body.contains("fallow-fingerprint:v3:"),
             "marker must be preserved under truncation"
         );
         assert!(body.contains("<!-- fallow-truncated -->"));
@@ -716,20 +849,23 @@ rename to src/new.ts
         let body = comment["body"].as_str().unwrap();
         assert!(body.len() <= MAX_COMMENT_BODY_BYTES);
         assert!(body.contains("<!-- fallow-truncated -->"));
-        assert!(body.contains("fallow-fingerprint:v2:"));
+        assert!(body.contains("fallow-fingerprint:v3:"));
         assert_eq!(comment["truncated"], true);
     }
 
     #[test]
     fn multibyte_body_truncates_at_char_boundary() {
-        let huge_desc: String = "あ".repeat(MAX_COMMENT_BODY_BYTES);
+        let huge_desc = "あ".repeat(MAX_COMMENT_BODY_BYTES);
         let issue = CiIssue {
             rule_id: "fallow/unused-export".into(),
             description: huge_desc,
             severity: "minor".into(),
             path: "src/a.ts".into(),
             line: 1,
+            end_line: None,
+            other_locations: Vec::new(),
             fingerprint: "abc1234567890def".into(),
+            legacy_fingerprint: None,
         };
         let comment = comment_to_value(&render_merged_comment(
             Provider::Github,

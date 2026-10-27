@@ -45,7 +45,7 @@ pub(super) struct MarkupCssCandidateInput<'a> {
     pub(super) css_deep: bool,
     pub(super) ws_roots: Option<&'a [std::path::PathBuf]>,
     pub(super) styling_artifacts: Option<&'a StylingAnalysisArtifacts>,
-    pub(super) token_candidates: &'a [ComparableThemeTokenCandidate],
+    pub(super) token_candidates: &'a StylingTokenCandidateCache<'a>,
     pub(super) summary: &'a mut fallow_output::CssAnalyticsSummary,
 }
 
@@ -89,11 +89,19 @@ fn scan_markup_reference_candidates(
     input: &mut MarkupCssCandidateInput<'_>,
 ) -> MarkupReferenceCandidates {
     let ctx = markup_scan_ctx(input);
+    let fallback_class_inventory;
+    let class_inventory = if let Some(artifacts) = input.styling_artifacts {
+        &artifacts.class_inventory
+    } else {
+        fallback_class_inventory = css_class_inventory(input.files, input.config, input.ignore_set);
+        &fallback_class_inventory
+    };
     MarkupReferenceCandidates {
         unresolved_class_references: scan_unresolved_class_references(
             input.files,
             ctx,
             input.summary,
+            Some(class_inventory),
         ),
         unreferenced_css_classes: scan_unreferenced_css_classes(
             input.files,
@@ -102,9 +110,7 @@ fn scan_markup_reference_candidates(
             input
                 .styling_artifacts
                 .map(|artifacts| &artifacts.reference_surface),
-            input
-                .styling_artifacts
-                .map(|artifacts| &artifacts.class_inventory),
+            Some(class_inventory),
         ),
     }
 }
@@ -164,33 +170,6 @@ fn markup_scan_ctx<'a>(input: &MarkupCssCandidateInput<'a>) -> HealthScanCtx<'a>
     }
 }
 
-pub(super) fn project_uses_css_in_js(root: &std::path::Path) -> bool {
-    const CSS_IN_JS_DEPS: &[&str] = &[
-        "styled-components",
-        "@emotion/styled",
-        "@emotion/react",
-        "@emotion/css",
-        "@linaria/core",
-        "@linaria/react",
-        "@vanilla-extract/css",
-        "@pandacss/dev",
-        "@stylexjs/stylex",
-    ];
-    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    ["dependencies", "devDependencies", "peerDependencies"]
-        .iter()
-        .any(|key| {
-            json.get(key)
-                .and_then(serde_json::Value::as_object)
-                .is_some_and(|deps| deps.keys().any(|k| CSS_IN_JS_DEPS.contains(&k.as_str())))
-        })
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CssScanKind {
     Css,
@@ -202,7 +181,6 @@ pub(super) enum CssScanKind {
 pub(super) fn css_report_scan_target<'a>(
     file: &'a fallow_types::discover::DiscoveredFile,
     ctx: HealthScanCtx<'_>,
-    css_in_js: bool,
 ) -> Option<(&'a std::path::Path, CssScanKind)> {
     let HealthScanCtx {
         config,
@@ -217,10 +195,8 @@ pub(super) fn css_report_scan_target<'a>(
     let kind = match extension {
         Some("css") => CssScanKind::Css,
         Some("scss" | "sass" | "less") => CssScanKind::Preprocessor,
-        Some("vue") | Some("svelte") => CssScanKind::Sfc,
-        Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts") if css_in_js => {
-            CssScanKind::CssInJs
-        }
+        Some("vue" | "svelte") => CssScanKind::Sfc,
+        Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts") => CssScanKind::CssInJs,
         _ => return None,
     };
 
@@ -271,8 +247,22 @@ pub(super) enum GradePolicy {
 
 pub(super) struct CssScanItem<'a> {
     pub(super) source: std::borrow::Cow<'a, str>,
+    /// Further stylesheets of the same source whose analytics merge into
+    /// `source`'s (hoisted Sass parent-suffix rules).
+    pub(super) layers: Vec<String>,
     pub(super) policy: GradePolicy,
     pub(super) report_notable: bool,
+}
+
+impl<'a> CssScanItem<'a> {
+    fn new(source: std::borrow::Cow<'a, str>, policy: GradePolicy, report_notable: bool) -> Self {
+        Self {
+            source,
+            layers: Vec::new(),
+            policy,
+            report_notable,
+        }
+    }
 }
 
 pub(super) fn css_report_scan_items<'a>(
@@ -282,23 +272,23 @@ pub(super) fn css_report_scan_items<'a>(
 ) -> Vec<CssScanItem<'a>> {
     use std::borrow::Cow;
     match kind {
-        CssScanKind::Css => vec![CssScanItem {
-            source: Cow::Borrowed(source),
-            policy: GradePolicy::Structural,
-            report_notable: true,
-        }],
-        CssScanKind::Preprocessor => preprocessor_virtual_stylesheet(source)
-            .map(|virtual_css| {
-                vec![CssScanItem {
-                    source: Cow::Owned(virtual_css),
-                    policy: GradePolicy::Structural,
-                    report_notable: true,
-                }]
-            })
-            .unwrap_or_default(),
+        CssScanKind::Css => vec![CssScanItem::new(
+            Cow::Borrowed(source),
+            GradePolicy::Structural,
+            true,
+        )],
+        CssScanKind::Preprocessor => preprocessor_scan_item(source).into_iter().collect(),
         CssScanKind::Sfc => sfc_css_scan_items(source),
         CssScanKind::CssInJs => css_in_js_scan_items(source, path),
     }
+}
+
+fn preprocessor_scan_item(source: &str) -> Option<CssScanItem<'static>> {
+    let mut layers = preprocessor_virtual_stylesheets(source).into_iter();
+    let main = layers.next()?;
+    let mut item = CssScanItem::new(std::borrow::Cow::Owned(main), GradePolicy::Structural, true);
+    item.layers = layers.collect();
+    Some(item)
 }
 
 fn sfc_css_scan_items(source: &str) -> Vec<CssScanItem<'_>> {
@@ -306,20 +296,16 @@ fn sfc_css_scan_items(source: &str) -> Vec<CssScanItem<'_>> {
 
     let mut items = Vec::new();
     if let Some(virtual_css) = crate::css::sfc_virtual_stylesheet(source) {
-        items.push(CssScanItem {
-            source: Cow::Owned(virtual_css),
-            policy: GradePolicy::Structural,
-            report_notable: true,
-        });
+        items.push(CssScanItem::new(
+            Cow::Owned(virtual_css),
+            GradePolicy::Structural,
+            true,
+        ));
     }
     if let Some(preprocessor_source) = crate::css::sfc_preprocessor_virtual_stylesheet(source)
-        && let Some(virtual_css) = preprocessor_virtual_stylesheet(&preprocessor_source)
+        && let Some(item) = preprocessor_scan_item(&preprocessor_source)
     {
-        items.push(CssScanItem {
-            source: Cow::Owned(virtual_css),
-            policy: GradePolicy::Structural,
-            report_notable: true,
-        });
+        items.push(item);
     }
     items
 }
@@ -327,35 +313,76 @@ fn sfc_css_scan_items(source: &str) -> Vec<CssScanItem<'_>> {
 fn css_in_js_scan_items<'a>(source: &'a str, path: &std::path::Path) -> Vec<CssScanItem<'a>> {
     use std::borrow::Cow;
 
+    if !source_may_import_css_in_js(source) {
+        return Vec::new();
+    }
     let mut items = Vec::new();
     if let Some(virtual_css) = crate::css::css_in_js_virtual_stylesheet(source) {
-        items.push(CssScanItem {
-            source: Cow::Owned(virtual_css),
-            policy: GradePolicy::Structural,
-            report_notable: true,
-        });
+        items.push(CssScanItem::new(
+            Cow::Owned(virtual_css),
+            GradePolicy::Structural,
+            true,
+        ));
     }
     let sheets = crate::css::css_in_js_object_sheets(source, path);
     if let Some(structural) = sheets.structural {
-        items.push(CssScanItem {
-            source: Cow::Owned(structural),
-            policy: GradePolicy::Structural,
-            report_notable: false,
-        });
+        items.push(CssScanItem::new(
+            Cow::Owned(structural),
+            GradePolicy::Structural,
+            false,
+        ));
     }
     if let Some(partial) = sheets.structural_partial {
-        items.push(CssScanItem {
-            source: Cow::Owned(partial),
-            policy: GradePolicy::StructuralNoDedup,
-            report_notable: false,
-        });
+        items.push(CssScanItem::new(
+            Cow::Owned(partial),
+            GradePolicy::StructuralNoDedup,
+            false,
+        ));
     }
     if let Some(atomic) = sheets.atomic {
-        items.push(CssScanItem {
-            source: Cow::Owned(atomic),
-            policy: GradePolicy::Atomic,
-            report_notable: false,
-        });
+        items.push(CssScanItem::new(
+            Cow::Owned(atomic),
+            GradePolicy::Atomic,
+            false,
+        ));
     }
     items
+}
+
+fn source_may_import_css_in_js(source: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "styled-components",
+        "@emotion/styled",
+        "@emotion/react",
+        "@emotion/css",
+        "@linaria/core",
+        "@linaria/react",
+        "@vanilla-extract/css",
+        "@vanilla-extract/recipes",
+        "@pandacss/dev",
+        "@stylexjs/stylex",
+        "styled-system",
+    ];
+    MARKERS.iter().any(|marker| source.contains(marker))
+        || source.contains("'stylex'")
+        || source.contains("\"stylex\"")
+}
+
+pub(super) fn is_css_in_js_style_source(specifier: &str) -> bool {
+    matches!(
+        specifier,
+        "styled-components"
+            | "@emotion/styled"
+            | "@emotion/react"
+            | "@emotion/css"
+            | "@linaria/core"
+            | "@linaria/react"
+            | "@vanilla-extract/css"
+            | "@vanilla-extract/recipes"
+            | "@pandacss/dev"
+            | "@stylexjs/stylex"
+            | "stylex"
+    ) || specifier
+        .split(['/', '\\'])
+        .any(|segment| segment == "styled-system")
 }

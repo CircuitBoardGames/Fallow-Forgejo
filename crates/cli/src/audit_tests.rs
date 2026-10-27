@@ -1,4 +1,85 @@
 use super::*;
+use std::fmt::Write as _;
+
+/// Write the review-benchmark fixture, build its corpus, and remove the
+/// fixture so the timed path cannot read the file system.
+fn audit_review_benchmark_corpus(temp: &tempfile::TempDir) -> AuditReviewBenchmarkCorpus {
+    let root = temp.path().join("audit-review-benchmark");
+    fs::create_dir_all(root.join("src/changed")).expect("fixture directory should be created");
+    fs::create_dir_all(root.join("src/consumers")).expect("fixture directory should be created");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-review-benchmark","type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("package fixture should be written");
+
+    let mut changed_files = Vec::new();
+    let mut index_source = String::new();
+    for index in 0..8 {
+        let relative = format!("src/changed/module{index}.ts");
+        let changed = root.join(&relative);
+        fs::write(
+            &changed,
+            format!("export const used{index} = {index};\nexport const unused{index} = {index};\n"),
+        )
+        .expect("changed fixture should be written");
+        fs::write(
+            root.join(format!("src/consumers/consumer{index}.ts")),
+            format!(
+                "import {{ used{index} }} from \"../changed/module{index}\";\nexport const result{index} = used{index};\n"
+            ),
+        )
+        .expect("consumer fixture should be written");
+        write!(
+            &mut index_source,
+            "import {{ result{index} }} from \"./consumers/consumer{index}\";\nconsole.log(result{index});\n"
+        )
+        .expect("entry fixture should be formatted");
+        changed_files.push(changed);
+    }
+    fs::write(root.join("src/index.ts"), index_source).expect("entry fixture should be written");
+
+    let corpus = create_audit_review_benchmark_corpus(&root, &changed_files, 2)
+        .expect("benchmark corpus should be created");
+    fs::remove_dir_all(&root).expect("fixture should be removable before the timed path");
+    corpus
+}
+
+#[test]
+fn audit_review_benchmark_reuses_production_assembly_without_ambient_io() {
+    let temp = tempfile::TempDir::new().expect("temp dir should be created");
+    let mut corpus = audit_review_benchmark_corpus(&temp);
+
+    let result = benchmark_audit_review_brief_many_changed_files_json(&mut corpus)
+        .expect("benchmark assembly should not read the removed fixture");
+    assert_eq!(result.introduced_count, 4);
+    assert_eq!(result.inherited_count, 4);
+    assert_eq!(result.public_api_added_count, 8);
+    assert_eq!(result.decision_count, 4);
+    assert!(result.rendered_bytes > 0);
+
+    let repeated = benchmark_audit_review_brief_many_changed_files_json(&mut corpus)
+        .expect("reused benchmark corpus should preserve production behavior");
+    assert_eq!(repeated, result);
+}
+
+/// A slow run under a loaded test machine must render the same bytes as a
+/// fast run. The wall-clock `elapsed_ms` once leaked into the rendered brief.
+#[test]
+fn audit_review_benchmark_rendered_bytes_ignore_wall_clock() {
+    let temp = tempfile::TempDir::new().expect("temp dir should be created");
+    let mut corpus = audit_review_benchmark_corpus(&temp);
+    let slow_start = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .expect("monotonic clock should reach ten seconds back");
+
+    let slow = benchmark_audit_review_brief_started_at(&mut corpus, slow_start)
+        .expect("slow benchmark run should succeed");
+    let fast = benchmark_audit_review_brief_started_at(&mut corpus, Instant::now())
+        .expect("fast benchmark run should succeed");
+
+    assert_eq!(slow, fast);
+}
 
 #[test]
 fn completeness_gate_uses_effective_metadata_requirement() {
@@ -23,16 +104,17 @@ fn completeness_gate_uses_effective_metadata_requirement() {
     assert!(type_aware_meta_completeness_failed(Some(&meta)));
 }
 use crate::base_worktree::{
-    canonical_root_hash, legacy_reusable_audit_worktree_path, remove_reusable_audit_caches,
+    CacheMaxAgeSource, SweepDecision, SweepDisposition, SweepMode, SweepPass, SweepSizes,
+    canonical_root_hash, legacy_reusable_audit_worktree_path, reclaim_orphan_cache_entry,
+    remove_reusable_audit_caches, resolve_cache_max_age_with_source, sweep_old_reusable_caches_in,
+    sweep_reusable_caches_with_report,
 };
 use std::{fs, process::Command};
 
 fn git(dir: &std::path::Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
         .args(args)
         .current_dir(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "test")
@@ -105,195 +187,6 @@ fn commit_file(repo: &std::path::Path, name: &str, body: &str) -> String {
     git_rev_parse(repo, "HEAD").expect("HEAD should resolve")
 }
 
-#[test]
-fn auto_detect_base_ref_resolves_origin_default_to_merge_base() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = init_throwaway_repo(tmp.path(), "repo");
-    let head = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
-    git(&repo, &["branch", "trunk"]);
-    git(&repo, &["update-ref", "refs/remotes/origin/trunk", "trunk"]);
-    git(
-        &repo,
-        &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/trunk",
-        ],
-    );
-
-    let detected = auto_detect_base_ref(&repo).expect("base should be detected");
-    // trunk == HEAD, so the merge-base is HEAD's own SHA (the bare branch
-    // name `trunk` is no longer returned: it would resolve to a local ref).
-    assert_eq!(detected.git_ref, head);
-    assert_eq!(detected.description, "merge-base with origin/trunk");
-}
-
-/// Regression for issue #1168: a worktree checkout whose local `main` is
-/// stale relative to a fresh `origin/main`. The base must be the fork point
-/// (merge-base with `origin/main`), NOT the stale local-`main` commit that
-/// the old bare-name resolution diffed against.
-#[test]
-fn auto_detect_base_ref_ignores_stale_local_main() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = init_throwaway_repo(tmp.path(), "repo");
-    let stale = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
-
-    // origin/main starts at the first commit, then a teammate advances it.
-    git(&repo, &["update-ref", "refs/remotes/origin/main", "main"]);
-    git(
-        &repo,
-        &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-        ],
-    );
-    let fork_point = commit_file(&repo, "teammate.txt", "merged work\n");
-    git(&repo, &["update-ref", "refs/remotes/origin/main", "main"]);
-
-    // Cut a feature branch from the fresh origin tip using the raw SHA (no
-    // upstream tracking), then leave local `main` behind at the stale commit.
-    git(&repo, &["checkout", "-b", "feature", &fork_point]);
-    commit_file(&repo, "feature.txt", "my change\n");
-    git(&repo, &["branch", "-f", "main", &stale]);
-
-    let detected = auto_detect_base_ref(&repo).expect("base should be detected");
-    assert_eq!(
-        detected.git_ref, fork_point,
-        "base must be the fork point (origin/main), not stale local main"
-    );
-    assert_ne!(
-        detected.git_ref, stale,
-        "must not diff against stale local main"
-    );
-    assert_eq!(detected.description, "merge-base with origin/main");
-}
-
-#[test]
-fn auto_detect_base_ref_prefers_configured_upstream() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = init_throwaway_repo(tmp.path(), "repo");
-    let fork_point = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
-    // Configure `origin` so refs/remotes/origin/* are recognized as tracking
-    // refs and `--set-upstream-to` is accepted.
-    git(&repo, &["remote", "add", "origin", &repo.to_string_lossy()]);
-    git(&repo, &["update-ref", "refs/remotes/origin/main", "main"]);
-
-    git(&repo, &["checkout", "-b", "feature"]);
-    git(
-        &repo,
-        &["branch", "--set-upstream-to=origin/main", "feature"],
-    );
-    commit_file(&repo, "feature.txt", "my change\n");
-
-    let detected = auto_detect_base_ref(&repo).expect("base should be detected");
-    assert_eq!(detected.git_ref, fork_point);
-    assert_eq!(detected.description, "merge-base with origin/main");
-}
-
-#[test]
-fn auto_detect_base_ref_falls_back_to_local_main_without_remote() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = init_throwaway_repo(tmp.path(), "repo");
-
-    let detected = auto_detect_base_ref(&repo).expect("base should be detected");
-    assert_eq!(detected.git_ref, "main");
-    assert_eq!(detected.description, "local main");
-}
-
-#[test]
-fn auto_detect_base_ref_falls_back_to_local_master_without_remote() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = tmp.path().join("repo");
-    fs::create_dir_all(&repo).expect("repo root should be created");
-    fs::write(repo.join("README.md"), "seed\n").expect("seed file should be written");
-    git(&repo, &["init", "-b", "master"]);
-    git(&repo, &["add", "."]);
-    git(
-        &repo,
-        &["-c", "commit.gpgsign=false", "commit", "-m", "initial"],
-    );
-
-    let detected = auto_detect_base_ref(&repo).expect("base should be detected");
-    assert_eq!(detected.git_ref, "master");
-    assert_eq!(detected.description, "local master");
-}
-
-#[test]
-fn auto_detect_base_ref_returns_none_outside_git_repo() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-
-    assert!(auto_detect_base_ref(tmp.path()).is_none());
-}
-
-#[test]
-fn parse_audit_base_override_trims_and_rejects_empty() {
-    assert_eq!(parse_audit_base_override(None), None);
-    assert_eq!(parse_audit_base_override(Some(String::new())), None);
-    assert_eq!(parse_audit_base_override(Some("   ".to_string())), None);
-    assert_eq!(
-        parse_audit_base_override(Some("  origin/main  ".to_string())),
-        Some("origin/main".to_string())
-    );
-}
-
-/// When the remote default shares no history with HEAD (the merge-base
-/// failure case a shallow clone also hits), auto-detect falls back to the
-/// remote-tracking ref tip rather than failing detection.
-#[test]
-fn auto_detect_base_ref_falls_back_to_remote_tip_without_common_ancestor() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = init_throwaway_repo(tmp.path(), "repo");
-    // Build an unrelated-history commit and point origin/main at it, so
-    // merge-base(origin/main, HEAD) has no common ancestor.
-    git(&repo, &["checkout", "--orphan", "unrelated"]);
-    commit_file(&repo, "unrelated.txt", "no shared history\n");
-    let unrelated = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
-    git(
-        &repo,
-        &["update-ref", "refs/remotes/origin/main", &unrelated],
-    );
-    git(
-        &repo,
-        &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-        ],
-    );
-    git(&repo, &["checkout", "main"]);
-
-    let detected = auto_detect_base_ref(&repo).expect("base should be detected");
-    assert_eq!(detected.git_ref, "origin/main");
-    assert_eq!(detected.description, "origin/main (tip)");
-}
-
-#[test]
-fn get_head_sha_returns_short_head_for_git_repo() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = init_throwaway_repo(tmp.path(), "repo");
-    let output = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&repo)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .expect("git rev-parse should run");
-    assert!(output.status.success());
-
-    assert_eq!(
-        get_head_sha(&repo),
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    );
-}
-
-#[test]
-fn get_head_sha_returns_none_outside_git_repo() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-
-    assert_eq!(get_head_sha(tmp.path()), None);
-}
-
 fn worktree_is_registered_with_git(repo_root: &std::path::Path, worktree_path: &Path) -> bool {
     list_audit_worktrees(repo_root)
         .is_some_and(|paths| paths.iter().any(|p| paths_equal(p, worktree_path)))
@@ -311,11 +204,9 @@ fn registered_fallow_worktree_count(repo_root: &std::path::Path) -> usize {
 /// not filter to fallow-owned entries, so it can assert a user's own worktree
 /// stays registered.
 fn git_worktree_list_contains(repo_root: &std::path::Path, path: &Path) -> bool {
-    let output = Command::new("git")
+    let output = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .output()
         .expect("git worktree list should run");
     String::from_utf8_lossy(&output.stdout)
@@ -506,6 +397,28 @@ fn create_unregistered_reusable_cache(repo: &Path) -> PathBuf {
     path
 }
 
+/// Materialize an unregistered reusable cache for `repo` under `scan_root`
+/// instead of the shared temp dir. The cross-repo GC pass only sees entries
+/// under its injected scan root, so foreign-entry fixtures built here are
+/// visible ONLY to this test's own sweep, never to a concurrently running
+/// test's or developer process's sweep (and vice versa).
+fn create_unregistered_foreign_cache(repo: &Path, scan_root: &Path) -> PathBuf {
+    let name = reusable_audit_worktree_path(repo)
+        .file_name()
+        .expect("cache path should have a file name")
+        .to_os_string();
+    let path = scan_root.join(name);
+    fs::create_dir_all(&path).expect("reusable cache dir should be created");
+    fs::write(path.join(".git"), "gitdir: fallow-audit-unregistered\n")
+        .expect("stub .git should be written");
+    fs::write(
+        reusable_worktree_sha_path(&path),
+        format!("{TEST_BASE_SHA}\n"),
+    )
+    .expect(".sha sidecar should be written");
+    path
+}
+
 /// Register a worktree with the parent repo at `path` checked out at HEAD.
 /// Simulates a pre-#1815 cache entry (left registered) for the legacy
 /// migration / GC deregistration tests.
@@ -631,7 +544,7 @@ fn reusable_cache_gc_removes_old_entry_with_backdated_sidecar() {
     let worktree_path = create_unregistered_reusable_cache(&repo);
     write_sidecar_with_age(&worktree_path, Duration::from_hours(31 * 24));
 
-    sweep_old_reusable_caches(&repo, Some(Duration::from_hours(30 * 24)), true);
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
 
     assert!(
         !worktree_path.exists(),
@@ -660,7 +573,7 @@ fn reusable_cache_gc_keeps_fresh_entry() {
     let worktree_path = create_unregistered_reusable_cache(&repo);
     write_sidecar_with_age(&worktree_path, Duration::from_mins(1));
 
-    sweep_old_reusable_caches(&repo, Some(Duration::from_hours(30 * 24)), true);
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
 
     assert!(
         worktree_path.is_dir(),
@@ -674,12 +587,14 @@ fn reusable_cache_gc_skips_locked_entry() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-gc-locked");
     let worktree_path = create_unregistered_reusable_cache(&repo);
+    // Lock BEFORE aging the sidecar: the fixture lives in the shared temp
+    // dir, and an aged ownerless entry is fair game for any concurrent
+    // process's cross-repo GC pass in the window before the lock is held.
+    let lock = ReusableWorktreeLock::try_acquire(&worktree_path, "test")
+        .expect("test should acquire the lock first");
     write_sidecar_with_age(&worktree_path, Duration::from_hours(31 * 24));
 
-    let lock = ReusableWorktreeLock::try_acquire(&worktree_path)
-        .expect("test should acquire the lock first");
-
-    sweep_old_reusable_caches(&repo, Some(Duration::from_hours(30 * 24)), true);
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
 
     assert!(
         worktree_path.is_dir(),
@@ -703,7 +618,7 @@ fn reusable_cache_gc_grace_when_sidecar_absent() {
         "test pre-condition: sidecar should not exist",
     );
 
-    sweep_old_reusable_caches(&repo, Some(Duration::from_hours(30 * 24)), true);
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
 
     assert!(
         worktree_path.is_dir(),
@@ -749,7 +664,7 @@ fn reusable_cache_gc_reclaims_sidecar_orphan_when_dir_missing() {
         "test pre-condition: sidecars survive a dir-only reaper",
     );
 
-    sweep_old_reusable_caches(&repo, Some(Duration::from_hours(30 * 24)), true);
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
 
     assert!(
         !last_used.exists(),
@@ -778,7 +693,7 @@ fn reusable_cache_gc_reclaims_sidecar_orphan_even_when_age_gc_disabled() {
 
     // `None` = age-based GC disabled (`cacheMaxAgeDays = 0`). Sidecar-orphan
     // reclaim must still run so dead sidecars do not accumulate forever.
-    sweep_old_reusable_caches(&repo, None, true);
+    sweep_old_reusable_caches_in(&repo, None, true, tmp.path());
 
     assert!(
         !last_used.exists(),
@@ -798,13 +713,16 @@ fn reusable_cache_gc_preserves_lock_file_after_removal() {
     let worktree_path = create_unregistered_reusable_cache(&repo);
     write_sidecar_with_age(&worktree_path, Duration::from_hours(31 * 24));
     let lock_path = reusable_worktree_lock_path(&worktree_path);
-    drop(ReusableWorktreeLock::try_acquire(&worktree_path).expect("test should acquire the lock"));
+    drop(
+        ReusableWorktreeLock::try_acquire(&worktree_path, "test")
+            .expect("test should acquire the lock"),
+    );
     assert!(
         lock_path.exists(),
         "test pre-condition: lock file should exist before sweep",
     );
 
-    sweep_old_reusable_caches(&repo, Some(Duration::from_hours(30 * 24)), true);
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
 
     assert!(
         !worktree_path.exists(),
@@ -819,23 +737,492 @@ fn reusable_cache_gc_preserves_lock_file_after_removal() {
 }
 
 #[test]
-fn reusable_cache_gc_ignores_other_repo_hash_entries() {
+fn reusable_cache_gc_keeps_foreign_entry_with_live_owner() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-gc-scope-self");
     let other_repo = init_throwaway_repo(tmp.path(), "repo-gc-scope-other");
-    // An aged-out cache belonging to a DIFFERENT repo. `repo`'s sweep is
-    // scoped to `repo`'s hash prefix, so it must not touch this entry (which
-    // would let one repo defeat another's `cacheMaxAgeDays = 0`).
-    let other_path = create_unregistered_reusable_cache(&other_repo);
+    // An aged-out cache belonging to a DIFFERENT repo whose root still
+    // exists. `repo`'s cross-repo pass must leave it to `other_repo`'s own
+    // sweep (which would otherwise let one repo defeat another's
+    // `cacheMaxAgeDays = 0`).
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    record_last_used(&other_path, &other_repo);
     write_sidecar_with_age(&other_path, Duration::from_hours(31 * 24));
 
-    sweep_old_reusable_caches(&repo, Some(Duration::from_hours(30 * 24)), true);
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
 
     assert!(
         other_path.is_dir(),
-        "a repo's sweep must not reclaim another repo's aged cache entry",
+        "a repo's sweep must not reclaim another repo's aged cache entry while its owner root exists",
     );
     cleanup_reusable_worktree(&other_repo, &other_path);
+}
+
+#[test]
+fn reusable_cache_gc_reclaims_abandoned_foreign_entry() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-abandoned-self");
+    let other_repo = init_throwaway_repo(tmp.path(), "repo-gc-abandoned-other");
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    record_last_used(&other_path, &other_repo);
+    write_sidecar_with_age(&other_path, Duration::from_hours(31 * 24));
+    // Delete the owning repo: nothing will ever sweep this hash again, which
+    // is exactly the multi-worktree / deleted-repo leak from issue #2169.
+    fs::remove_dir_all(&other_repo).expect("owner repo should be removable");
+
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
+
+    assert!(
+        !other_path.exists(),
+        "an aged cache whose owner root is gone must be reclaimed by any repo's sweep",
+    );
+    assert!(
+        !reusable_worktree_last_used_path(&other_path).exists(),
+        "the abandoned entry's `.last-used` sidecar must be reclaimed with it",
+    );
+    assert!(
+        !reusable_worktree_sha_path(&other_path).exists(),
+        "the abandoned entry's `.sha` sidecar must be reclaimed with it",
+    );
+    cleanup_reusable_worktree(&repo, &other_path);
+}
+
+/// `--max-age-days 0` / `cacheMaxAgeDays = 0` documents that it still reclaims
+/// entries whose recorded owner root is gone. Such an entry is abandoned:
+/// nothing will ever sweep it under its own hash again, so letting the
+/// switched-off age gate keep it stranded it on disk forever.
+#[test]
+fn reusable_cache_gc_reclaims_abandoned_foreign_entry_with_age_gc_disabled() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-abandoned-nogc-self");
+    let other_repo = init_throwaway_repo(tmp.path(), "repo-gc-abandoned-nogc-other");
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    record_last_used(&other_path, &other_repo);
+    fs::remove_dir_all(&other_repo).expect("owner repo should be removable");
+
+    sweep_old_reusable_caches_in(&repo, None, true, tmp.path());
+
+    assert!(
+        !other_path.exists(),
+        "age-gc-disabled must still reclaim an entry whose owner root is gone",
+    );
+    assert!(
+        !reusable_worktree_last_used_path(&other_path).exists(),
+        "the abandoned entry's `.last-used` sidecar must be reclaimed with it",
+    );
+    cleanup_reusable_worktree(&repo, &other_path);
+}
+
+/// The `0` escape hatch must not become a cross-repo delete: a foreign entry
+/// whose owner root is still on disk stays under that repo's own policy.
+#[test]
+fn reusable_cache_gc_keeps_live_owner_foreign_entry_with_age_gc_disabled() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-live-nogc-self");
+    let other_repo = init_throwaway_repo(tmp.path(), "repo-gc-live-nogc-other");
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    record_last_used(&other_path, &other_repo);
+
+    sweep_old_reusable_caches_in(&repo, None, true, tmp.path());
+
+    assert!(
+        other_path.is_dir(),
+        "age-gc-disabled must not reclaim a foreign entry whose owner root still exists",
+    );
+    cleanup_reusable_worktree(&other_repo, &other_path);
+}
+
+#[test]
+fn reusable_cache_gc_reclaims_aged_foreign_entry_without_recorded_owner() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-ownerless-self");
+    let other_repo = init_throwaway_repo(tmp.path(), "repo-gc-ownerless-other");
+    // Pre-#2169 sidecars are empty (mtime-only), so the owner is unknown.
+    // Aged ownerless entries must still age out: they are indistinguishable
+    // from abandoned ones and are the reporter's 19-month accumulation.
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    write_sidecar_with_age(&other_path, Duration::from_hours(31 * 24));
+
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
+
+    assert!(
+        !other_path.exists(),
+        "an aged cache with no recorded owner must be reclaimed by the cross-repo pass",
+    );
+    cleanup_reusable_worktree(&other_repo, &other_path);
+}
+
+#[test]
+fn reusable_cache_gc_grace_seeds_foreign_entry_without_sidecar() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-foreign-grace-self");
+    let other_repo = init_throwaway_repo(tmp.path(), "repo-gc-foreign-grace-other");
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    let sidecar = reusable_worktree_last_used_path(&other_path);
+    assert!(
+        !sidecar.exists(),
+        "test pre-condition: sidecar should not exist",
+    );
+
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
+
+    assert!(
+        other_path.is_dir(),
+        "a sidecar-less foreign entry must get the pre-upgrade grace, not removal",
+    );
+    assert!(
+        sidecar.exists(),
+        "the cross-repo pass must seed a sidecar so the entry can age from now on",
+    );
+    cleanup_reusable_worktree(&other_repo, &other_path);
+}
+
+#[test]
+fn sweep_report_classifies_aged_owned_entry() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-report-aged");
+    let worktree_path = create_unregistered_reusable_cache(&repo);
+    // Recording the owner keeps a concurrent external cross-repo sweep away
+    // from this aged shared-temp fixture while the test runs.
+    record_last_used(&worktree_path, &repo);
+    write_sidecar_with_age(&worktree_path, Duration::from_hours(31 * 24));
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::Apply,
+        SweepSizes::Skip,
+    );
+
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == worktree_path)
+        .expect("sweep report should list the aged entry");
+    assert_eq!(entry.disposition, SweepDisposition::ReclaimedAged);
+    assert_eq!(entry.pass, SweepPass::Owned);
+    assert_eq!(entry.disposition.decision(), SweepDecision::Removed);
+    assert_eq!(entry.disposition.reason(), "aged-out");
+    assert_eq!(entry.age_days, Some(31));
+    assert_eq!(
+        entry.size_bytes, None,
+        "the per-audit sweep must never measure sizes",
+    );
+    assert_eq!(report.removed, 1);
+    assert!(!worktree_path.exists());
+    cleanup_reusable_worktree(&repo, &worktree_path);
+}
+
+#[test]
+fn sweep_report_dry_run_previews_aged_entry_without_mutation() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-report-dryrun");
+    let worktree_path = create_unregistered_reusable_cache(&repo);
+    record_last_used(&worktree_path, &repo);
+    write_sidecar_with_age(&worktree_path, Duration::from_hours(31 * 24));
+    let lock_path = reusable_worktree_lock_path(&worktree_path);
+    let _ = fs::remove_file(&lock_path);
+    let sidecar = reusable_worktree_last_used_path(&worktree_path);
+    let sidecar_mtime_before = fs::metadata(&sidecar)
+        .and_then(|metadata| metadata.modified())
+        .expect("sidecar mtime should be readable");
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::DryRun,
+        SweepSizes::Measure,
+    );
+
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == worktree_path)
+        .expect("dry-run report should list the aged entry");
+    assert_eq!(entry.disposition, SweepDisposition::ReclaimedAged);
+    assert!(
+        entry.size_bytes.is_some_and(|size| size > 0),
+        "prune-style dry run should measure the entry size",
+    );
+    assert!(
+        worktree_path.is_dir(),
+        "dry run must not remove the entry directory",
+    );
+    assert!(
+        !lock_path.exists(),
+        "dry run must not create a `.lock` sidecar",
+    );
+    let sidecar_mtime_after = fs::metadata(&sidecar)
+        .and_then(|metadata| metadata.modified())
+        .expect("sidecar mtime should stay readable");
+    assert_eq!(
+        sidecar_mtime_before, sidecar_mtime_after,
+        "dry run must not touch the `.last-used` sidecar",
+    );
+    cleanup_reusable_worktree(&repo, &worktree_path);
+}
+
+#[test]
+fn sweep_report_dry_run_lists_legacy_registered_without_deregistering() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-report-legacy-dryrun");
+    let cache_path = reusable_audit_worktree_path(&repo);
+    register_reusable_worktree(&repo, &cache_path);
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::DryRun,
+        SweepSizes::Skip,
+    );
+
+    assert!(
+        report.entries.iter().any(|entry| {
+            paths_equal(&entry.path, &cache_path)
+                && entry.disposition == SweepDisposition::KeptLegacyDeregistered
+        }),
+        "dry run must report the still-registered current path as deregistered-but-kept",
+    );
+    assert!(
+        worktree_is_registered_with_git(&repo, &cache_path),
+        "dry run must not deregister the legacy entry",
+    );
+    assert!(
+        !reusable_worktree_lock_path(&cache_path).exists(),
+        "dry run must not create a `.lock` sidecar for the legacy pass",
+    );
+    assert!(
+        !reusable_worktree_last_used_path(&cache_path).exists(),
+        "dry run must not seed a grace sidecar",
+    );
+    cleanup_reusable_worktree(&repo, &cache_path);
+}
+
+/// Pre-#1815 upgrade edge: a mixed-version registration at the CURRENT cache
+/// path is only deregistered and stays warm on disk, so it must report as
+/// kept (`legacy-deregistered`), while a released SHA-keyed registration is
+/// genuinely removed and stays a `legacy-registered` reclaim.
+#[test]
+fn sweep_report_apply_keeps_deregistered_current_path_and_removes_released_sha() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-report-legacy-apply");
+    let current_path = reusable_audit_worktree_path(&repo);
+    let released_path = legacy_reusable_audit_worktree_path(&repo, TEST_BASE_SHA)
+        .expect("legacy SHA path should resolve");
+    register_reusable_worktree(&repo, &current_path);
+    register_reusable_worktree(&repo, &released_path);
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::Apply,
+        SweepSizes::Measure,
+    );
+
+    // Match by entry NAME: the report echoes the canonical paths git prints,
+    // while a removed entry can no longer be canonicalized for `paths_equal`.
+    let find = |path: &Path| {
+        let name = path.file_name().expect("cache path should have a name");
+        report
+            .entries
+            .iter()
+            .find(|entry| entry.path.file_name() == Some(name))
+            .unwrap_or_else(|| panic!("entry for {} should be reported", path.display()))
+    };
+    let current = find(&current_path);
+    assert_eq!(
+        current.disposition,
+        SweepDisposition::KeptLegacyDeregistered
+    );
+    assert_eq!(current.disposition.decision(), SweepDecision::Kept);
+    assert_eq!(current.disposition.reason(), "legacy-deregistered");
+    assert!(
+        current.size_bytes.is_some_and(|size| size > 0),
+        "the kept-warm entry still reports what it occupies",
+    );
+    let released = find(&released_path);
+    assert_eq!(
+        released.disposition,
+        SweepDisposition::ReclaimedLegacyRegistered
+    );
+    assert_eq!(released.disposition.decision(), SweepDecision::Removed);
+
+    assert!(
+        current_path.is_dir(),
+        "the current-path cache must stay warm on disk",
+    );
+    assert!(
+        !worktree_is_registered_with_git(&repo, &current_path),
+        "the current-path cache must be deregistered from git",
+    );
+    assert!(
+        !released_path.is_dir(),
+        "the released SHA-keyed cache must be removed",
+    );
+    assert_eq!(
+        report.removed, 0,
+        "neither legacy outcome feeds the per-audit stderr summary counter",
+    );
+    cleanup_reusable_worktree(&repo, &current_path);
+    cleanup_reusable_worktree(&repo, &released_path);
+}
+
+#[test]
+fn sweep_report_counts_bare_lock_sidecar_as_lock_only() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-report-lock-only");
+    let cache_path = tmp
+        .path()
+        .join("fallow-audit-base-cache-0123456789abcdef-root-fedcba9876543210");
+    let lock_path = reusable_worktree_lock_path(&cache_path);
+    fs::write(&lock_path, "").expect("bare lock sidecar should be written");
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::Apply,
+        SweepSizes::Skip,
+    );
+
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == cache_path)
+        .expect("a bare lock sidecar must fold back into a reported candidate");
+    assert_eq!(entry.disposition, SweepDisposition::KeptLockOnly);
+    assert_eq!(entry.pass, SweepPass::Foreign);
+    assert_eq!(entry.disposition.reason(), "lock-only");
+    assert_eq!(report.removed, 0);
+    assert!(
+        lock_path.exists(),
+        "the `.lock` sidecar must never be deleted",
+    );
+}
+
+#[test]
+fn reclaim_orphan_entry_reports_recreated_directory_under_lock() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-report-recreated");
+    // The caller observed `!path.exists()`; the directory existing again at
+    // the lock-guarded re-check is exactly the concurrent-rebuild race.
+    let worktree_path = create_unregistered_reusable_cache(&repo);
+
+    assert_eq!(
+        reclaim_orphan_cache_entry(&repo, &worktree_path),
+        SweepDisposition::KeptRecreated,
+    );
+    assert!(
+        worktree_path.is_dir(),
+        "a recreated directory must be preserved",
+    );
+    cleanup_reusable_worktree(&repo, &worktree_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn foreign_owner_behind_dangling_symlink_is_dead() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-owner-dangling-self");
+    let other_repo = init_throwaway_repo(tmp.path(), "repo-owner-dangling-other");
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    let dangling_owner = tmp.path().join("dangling-owner");
+    std::os::unix::fs::symlink(tmp.path().join("missing-target"), &dangling_owner)
+        .expect("dangling symlink should be created");
+    record_last_used(&other_path, &dangling_owner);
+    write_sidecar_with_age(&other_path, Duration::from_hours(31 * 24));
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::Apply,
+        SweepSizes::Skip,
+    );
+
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == other_path)
+        .expect("report should list the foreign entry");
+    assert_eq!(
+        entry.disposition,
+        SweepDisposition::ReclaimedAged,
+        "a dangling-symlink owner root must classify dead, matching Path::exists()",
+    );
+    assert!(!other_path.exists());
+    cleanup_reusable_worktree(&other_repo, &other_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn foreign_owner_with_unprobeable_root_is_kept_unverifiable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if rustix::process::geteuid().as_raw() == 0 {
+        // chmod 000 does not stop root from probing; the scenario cannot be
+        // reproduced.
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-owner-unverifiable-self");
+    let other_repo = init_throwaway_repo(tmp.path(), "repo-owner-unverifiable-other");
+    let other_path = create_unregistered_foreign_cache(&other_repo, tmp.path());
+    let guarded_parent = tmp.path().join("guarded");
+    let owner = guarded_parent.join("repo");
+    fs::create_dir_all(&owner).expect("guarded owner root should be created");
+    record_last_used(&other_path, &owner);
+    write_sidecar_with_age(&other_path, Duration::from_hours(31 * 24));
+    fs::set_permissions(&guarded_parent, fs::Permissions::from_mode(0o000))
+        .expect("guarded parent should become unreadable");
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::Apply,
+        SweepSizes::Skip,
+    );
+
+    fs::set_permissions(&guarded_parent, fs::Permissions::from_mode(0o755))
+        .expect("guarded parent should be restored");
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == other_path)
+        .expect("report should list the foreign entry");
+    assert_eq!(
+        entry.disposition,
+        SweepDisposition::KeptOwnerUnverifiable(std::io::ErrorKind::PermissionDenied),
+        "a probe error must keep the entry instead of reading as a dead owner",
+    );
+    assert!(
+        other_path.is_dir(),
+        "an unverifiable owner must never lose its cache entry",
+    );
+    cleanup_reusable_worktree(&other_repo, &other_path);
+}
+
+#[test]
+fn cache_max_age_flag_wins_and_reports_source() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+
+    let flagged = resolve_cache_max_age_with_source(tmp.path(), None, false, Some(0));
+    assert_eq!(flagged.max_age, None);
+    assert_eq!(flagged.days, 0);
+    assert_eq!(flagged.source, CacheMaxAgeSource::Flag);
+    assert_eq!(flagged.source.as_str(), "flag");
+
+    if std::env::var("FALLOW_AUDIT_CACHE_MAX_AGE_DAYS").is_err() {
+        let defaulted = resolve_cache_max_age_with_source(tmp.path(), None, false, None);
+        assert_eq!(defaulted.days, 30);
+        assert_eq!(defaulted.source, CacheMaxAgeSource::Default);
+        assert!(defaulted.max_age.is_some());
+    }
 }
 
 #[test]
@@ -844,7 +1231,7 @@ fn reuse_or_create_stamps_sidecar_on_fresh_create() {
     let repo = init_throwaway_repo(tmp.path(), "repo-fresh-create-stamp");
     let base_sha = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
 
-    let worktree = BaseWorktree::reuse_or_create(&repo, &base_sha)
+    let worktree = BaseWorktree::reuse_or_create(&repo, &base_sha, &[])
         .expect("fresh reuse_or_create should succeed on a clean repo");
     let cache_path = worktree.path().to_path_buf();
     let sidecar = reusable_worktree_last_used_path(&cache_path);
@@ -893,7 +1280,7 @@ fn base_worktree_reusable_create_leaves_no_registered_entry() {
     let repo = init_throwaway_repo(tmp.path(), "repo-1815-headline");
     let base_sha = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
 
-    let first = BaseWorktree::create(&repo, "HEAD", Some(&base_sha))
+    let first = BaseWorktree::create(&repo, "HEAD", Some(&base_sha), &[])
         .expect("persistent base worktree should be created");
     let cache_path = first.path().to_path_buf();
     assert!(cache_path.is_dir(), "cache directory should exist on disk");
@@ -910,7 +1297,7 @@ fn base_worktree_reusable_create_leaves_no_registered_entry() {
     fs::write(&marker, "keep").expect("marker should be written");
     drop(first);
 
-    let second = BaseWorktree::create(&repo, "HEAD", Some(&base_sha))
+    let second = BaseWorktree::create(&repo, "HEAD", Some(&base_sha), &[])
         .expect("second create should reuse the cache");
     assert_eq!(
         second.path(),
@@ -937,7 +1324,7 @@ fn base_worktree_non_reusable_create_leaves_no_registered_entry() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-1815-nonreusable");
 
-    let worktree = BaseWorktree::create(&repo, "HEAD", None)
+    let worktree = BaseWorktree::create(&repo, "HEAD", None, &[])
         .expect("non-reusable base worktree should be created");
     let path = worktree.path().to_path_buf();
     assert!(path.is_dir());
@@ -971,7 +1358,7 @@ fn reusable_cache_reuses_on_sha_match_rebuilds_on_mismatch_or_missing() {
     let repo = init_throwaway_repo(tmp.path(), "repo-sha-readiness");
     let base_sha = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
 
-    let first = BaseWorktree::reuse_or_create(&repo, &base_sha)
+    let first = BaseWorktree::reuse_or_create(&repo, &base_sha, &[])
         .expect("fresh reusable worktree should be created");
     let cache_path = first.path().to_path_buf();
     let sha_path = reusable_worktree_sha_path(&cache_path);
@@ -981,15 +1368,15 @@ fn reusable_cache_reuses_on_sha_match_rebuilds_on_mismatch_or_missing() {
 
     // Matching .sha reuses (marker survives).
     let reused =
-        BaseWorktree::reuse_or_create(&repo, &base_sha).expect("matching .sha should reuse");
+        BaseWorktree::reuse_or_create(&repo, &base_sha, &[]).expect("matching .sha should reuse");
     assert_eq!(reused.path(), cache_path);
     assert!(marker.is_file(), "matching .sha must reuse without rebuild");
     drop(reused);
 
     // Mismatched .sha -> rebuild wipes the marker and rewrites the sidecar.
     fs::write(&sha_path, "ffffffffffffffff\n").expect("sha should be overwritable");
-    let rebuilt =
-        BaseWorktree::reuse_or_create(&repo, &base_sha).expect("mismatched .sha should rebuild");
+    let rebuilt = BaseWorktree::reuse_or_create(&repo, &base_sha, &[])
+        .expect("mismatched .sha should rebuild");
     assert_eq!(rebuilt.path(), cache_path);
     assert!(
         !marker.exists(),
@@ -1006,7 +1393,7 @@ fn reusable_cache_reuses_on_sha_match_rebuilds_on_mismatch_or_missing() {
     // Missing .sha -> rebuild wipes the marker.
     fs::remove_file(&sha_path).expect("sha removable");
     let rebuilt2 =
-        BaseWorktree::reuse_or_create(&repo, &base_sha).expect("missing .sha should rebuild");
+        BaseWorktree::reuse_or_create(&repo, &base_sha, &[]).expect("missing .sha should rebuild");
     assert!(!marker.exists(), "missing .sha must force a rebuild");
     drop(rebuilt2);
     cleanup_reusable_worktree(&repo, &cache_path);
@@ -1018,7 +1405,7 @@ fn reusable_cache_rebuilds_same_path_for_a_new_sha_and_publishes_new_content() {
     let repo = init_throwaway_repo(tmp.path(), "repo-root-cache-rebuild");
     let first_sha = git_rev_parse(&repo, "HEAD").expect("initial HEAD should resolve");
 
-    let first = BaseWorktree::reuse_or_create(&repo, &first_sha)
+    let first = BaseWorktree::reuse_or_create(&repo, &first_sha, &[])
         .expect("first reusable worktree should materialize");
     let cache_path = first.path().to_path_buf();
     assert_eq!(
@@ -1028,7 +1415,7 @@ fn reusable_cache_rebuilds_same_path_for_a_new_sha_and_publishes_new_content() {
     drop(first);
 
     let second_sha = commit_file(&repo, "README.md", "second snapshot\n");
-    let second = BaseWorktree::reuse_or_create(&repo, &second_sha)
+    let second = BaseWorktree::reuse_or_create(&repo, &second_sha, &[])
         .expect("second reusable worktree should rebuild");
     assert_eq!(second.path(), cache_path, "both SHAs must share one path");
     assert_eq!(
@@ -1051,7 +1438,7 @@ fn failed_reusable_cache_rebuild_leaves_no_matching_readiness() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-failed-cache-rebuild");
     let base_sha = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
-    let initial = BaseWorktree::reuse_or_create(&repo, &base_sha)
+    let initial = BaseWorktree::reuse_or_create(&repo, &base_sha, &[])
         .expect("initial reusable worktree should materialize");
     let cache_path = initial.path().to_path_buf();
     let sha_path = reusable_worktree_sha_path(&cache_path);
@@ -1059,7 +1446,7 @@ fn failed_reusable_cache_rebuild_leaves_no_matching_readiness() {
 
     let missing_sha = "0000000000000000000000000000000000000000";
     assert!(
-        BaseWorktree::reuse_or_create(&repo, missing_sha).is_none(),
+        BaseWorktree::reuse_or_create(&repo, missing_sha, &[]).is_none(),
         "a missing git object must fail materialization",
     );
     assert!(
@@ -1074,7 +1461,7 @@ fn retained_reusable_lock_makes_remove_skip_then_succeed_and_preserve_lock() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-remove-retained-lock");
     let base_sha = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
-    let worktree = BaseWorktree::reuse_or_create(&repo, &base_sha)
+    let worktree = BaseWorktree::reuse_or_create(&repo, &base_sha, &[])
         .expect("reusable worktree should materialize");
     let cache_path = worktree.path().to_path_buf();
     let lock_path = reusable_worktree_lock_path(&cache_path);
@@ -1160,6 +1547,11 @@ fn removal_on_repo_without_caches_reports_zero() {
 fn removal_surfaces_filesystem_errors() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if rustix::process::geteuid().as_raw() == 0 {
+        // A read-only directory does not stop root from unlinking its
+        // entries; the scenario cannot be reproduced.
+        return;
+    }
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-remove-eacces");
     let cache_path = reusable_audit_worktree_path(&repo);
@@ -1240,7 +1632,7 @@ fn reusable_cache_rejects_world_readable_preseed() {
     .expect("preseeded readiness should be written");
     fs::write(cache_path.join("POISONED"), "untrusted\n").expect("poison marker should be written");
 
-    let worktree = BaseWorktree::reuse_or_create(&repo, &base_sha)
+    let worktree = BaseWorktree::reuse_or_create(&repo, &base_sha, &[])
         .expect("unsafe preseed should be rebuilt safely");
 
     assert!(
@@ -1281,7 +1673,8 @@ fn root_removal_reclaims_legacy_sha_siblings_without_touching_unrelated_root() {
         .expect("legacy readiness should be written");
         fs::write(reusable_worktree_last_used_path(path), "").expect("last-used should be written");
     }
-    let held_lock = ReusableWorktreeLock::try_acquire(&first).expect("first legacy lock acquired");
+    let held_lock =
+        ReusableWorktreeLock::try_acquire(&first, "test").expect("first legacy lock acquired");
     let first_lock_path = reusable_worktree_lock_path(&first);
     let second_lock_path = reusable_worktree_lock_path(&second);
 
@@ -1329,14 +1722,15 @@ fn reusable_cache_stub_git_repaired_on_cache_hit() {
     let repo = init_throwaway_repo(tmp.path(), "repo-stub-repair");
     let base_sha = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
     let first =
-        BaseWorktree::reuse_or_create(&repo, &base_sha).expect("fresh create should succeed");
+        BaseWorktree::reuse_or_create(&repo, &base_sha, &[]).expect("fresh create should succeed");
     let cache_path = first.path().to_path_buf();
     let git_stub = cache_path.join(".git");
     assert!(git_stub.is_file(), "fresh create writes a .git stub");
     drop(first);
     fs::remove_file(&git_stub).expect("stub removable");
 
-    let reused = BaseWorktree::reuse_or_create(&repo, &base_sha).expect("cache hit should succeed");
+    let reused =
+        BaseWorktree::reuse_or_create(&repo, &base_sha, &[]).expect("cache hit should succeed");
     assert_eq!(reused.path(), cache_path);
     assert!(
         git_stub.is_file(),
@@ -1370,7 +1764,7 @@ fn base_snapshot_discovery_honors_gitignore_via_stub_git() {
     );
     let base_sha = git_rev_parse(&root, "HEAD").expect("HEAD should resolve");
 
-    let worktree = BaseWorktree::create(&root, "HEAD", Some(&base_sha))
+    let worktree = BaseWorktree::create(&root, "HEAD", Some(&base_sha), &[])
         .expect("base worktree should be created");
     let cache_path = worktree.path().to_path_buf();
     assert!(
@@ -1465,7 +1859,7 @@ fn registered_current_cache_is_deregistered_and_reused_warm() {
     let marker = cache_path.join(".fallow-reuse-marker");
     fs::write(&marker, "warm").expect("marker should be written");
 
-    let migrated = BaseWorktree::reuse_or_create(&repo, &base_sha)
+    let migrated = BaseWorktree::reuse_or_create(&repo, &base_sha, &[])
         .expect("legacy cache should migrate and reuse");
     assert_eq!(migrated.path(), cache_path);
     assert!(
@@ -1498,7 +1892,7 @@ fn released_sha_keyed_registered_cache_is_deregistered_and_removed() {
         .expect("released legacy cache should materialize");
     assert!(worktree_is_registered_with_git(&repo, &legacy_path));
 
-    sweep_old_reusable_caches(&repo, None, true);
+    sweep_old_reusable_caches_in(&repo, None, true, tmp.path());
 
     assert!(
         !legacy_path.exists(),
@@ -1585,32 +1979,16 @@ fn reusable_worktree_lock_excludes_concurrent_acquires() {
     let reusable = tmp.path().join("fallow-audit-base-cache-deadbeef-0000");
     let lock_path = reusable_worktree_lock_path(&reusable);
 
-    let first = ReusableWorktreeLock::try_acquire(&reusable)
+    let first = ReusableWorktreeLock::try_acquire(&reusable, "test")
         .expect("first acquire on a fresh path should succeed");
     assert!(
-        ReusableWorktreeLock::try_acquire(&reusable).is_none(),
+        ReusableWorktreeLock::try_acquire(&reusable, "test").is_none(),
         "second acquire must fail while the first is held",
     );
     drop(first);
     assert!(
         lock_path.exists(),
         "lock file must persist after drop (only the kernel lock is released)",
-    );
-}
-
-#[test]
-fn base_analysis_root_preserves_repo_subdirectory_roots() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = tmp.path().join("repo");
-    let app_root = repo.join("apps/mobile");
-    let base_worktree = tmp.path().join("base-worktree");
-    fs::create_dir_all(&app_root).expect("app root should be created");
-    fs::create_dir_all(&base_worktree).expect("base worktree should be created");
-    git(&repo, &["init", "-b", "main"]);
-
-    assert_eq!(
-        base_analysis_root(&app_root, &base_worktree),
-        base_worktree.join("apps/mobile")
     );
 }
 
@@ -1655,7 +2033,7 @@ fn audit_base_worktree_reuses_current_node_modules_context() {
     .expect("node_modules tsconfig should be written");
 
     let worktree =
-        BaseWorktree::create(root, "HEAD", None).expect("base worktree should be created");
+        BaseWorktree::create(root, "HEAD", None, &[]).expect("base worktree should be created");
     assert!(
         worktree.path().join("node_modules").is_dir(),
         "base worktree should reuse ignored node_modules from the current checkout"
@@ -1690,7 +2068,7 @@ fn audit_base_worktree_uses_no_checkout_engine_materializer() {
     fs::set_permissions(&hook, permissions).expect("hook should be executable");
 
     let worktree =
-        BaseWorktree::create(&repo, "HEAD", None).expect("base worktree should be created");
+        BaseWorktree::create(&repo, "HEAD", None, &[]).expect("base worktree should be created");
 
     assert!(worktree.path().join("README.md").is_file());
     assert!(
@@ -1724,7 +2102,7 @@ fn materialize_base_dependency_context_symlinks_nuxt_generated_dir() {
     )
     .expect(".nuxt/tsconfig.app.json should be written");
 
-    materialize_base_dependency_context(host.path(), worktree.path());
+    materialize_base_dependency_context(host.path(), worktree.path(), &[]);
 
     let mirrored = worktree.path().join(".nuxt");
     assert!(
@@ -1763,7 +2141,7 @@ fn materialize_base_dependency_context_symlinks_astro_generated_dir() {
     fs::write(dot_astro.join("types.d.ts"), "// generated types\n")
         .expect(".astro/types.d.ts should be written");
 
-    materialize_base_dependency_context(host.path(), worktree.path());
+    materialize_base_dependency_context(host.path(), worktree.path(), &[]);
 
     let mirrored = worktree.path().join(".astro");
     assert!(
@@ -1788,7 +2166,7 @@ fn materialize_base_dependency_context_skips_when_host_lacks_meta_framework_dir(
     let host = tempfile::TempDir::new().expect("host tempdir should be created");
     let worktree = tempfile::TempDir::new().expect("worktree tempdir should be created");
 
-    materialize_base_dependency_context(host.path(), worktree.path());
+    materialize_base_dependency_context(host.path(), worktree.path(), &[]);
 
     assert!(
         !worktree.path().join(".nuxt").exists(),
@@ -1815,7 +2193,7 @@ fn materialize_base_dependency_context_handles_each_dir_independently() {
     fs::create_dir_all(host.path().join("node_modules"))
         .expect("host node_modules should be created");
 
-    materialize_base_dependency_context(host.path(), worktree.path());
+    materialize_base_dependency_context(host.path(), worktree.path(), &[]);
 
     assert!(
         worktree.path().join("node_modules").is_dir(),
@@ -1848,7 +2226,7 @@ fn materialize_base_dependency_context_preserves_real_worktree_dir() {
     fs::write(worktree_nuxt.join("tsconfig.json"), r#"{"_source":"base"}"#)
         .expect("worktree .nuxt/tsconfig.json should be written");
 
-    materialize_base_dependency_context(host.path(), worktree.path());
+    materialize_base_dependency_context(host.path(), worktree.path(), &[]);
 
     let link_meta = fs::symlink_metadata(&worktree_nuxt)
         .expect(".nuxt entry should still exist in the worktree");
@@ -1886,7 +2264,7 @@ fn audit_reusable_base_worktree_refreshes_current_node_modules_context() {
         .expect("node_modules tsconfig should be written");
 
     let base_sha = git_rev_parse(root, "HEAD").expect("HEAD should resolve");
-    let first = BaseWorktree::reuse_or_create(root, &base_sha)
+    let first = BaseWorktree::reuse_or_create(root, &base_sha, &[])
         .expect("persistent base worktree should be created");
     let worktree_path = first.path().to_path_buf();
     assert!(
@@ -1900,7 +2278,7 @@ fn audit_reusable_base_worktree_refreshes_current_node_modules_context() {
     );
     drop(first);
 
-    let reused = BaseWorktree::reuse_or_create(root, &base_sha)
+    let reused = BaseWorktree::reuse_or_create(root, &base_sha, &[])
         .expect("ready persistent base worktree should be reused");
     assert_eq!(reused.path(), worktree_path.as_path());
     assert!(
@@ -1926,24 +2304,6 @@ fn remove_node_modules_context(worktree_path: &Path) {
     }
 }
 
-fn empty_snapshot_with_type_aware(
-    identity: Option<fallow_types::semantic::SemanticAnalysisIdentity>,
-    gap_signature: Vec<String>,
-) -> AuditKeySnapshot {
-    AuditKeySnapshot {
-        type_aware_identity: identity,
-        type_aware_gap_signature: gap_signature,
-        syntactic_dead_code: None,
-        dead_code: FxHashSet::default(),
-        health: FxHashSet::default(),
-        styling: FxHashSet::default(),
-        dupes: FxHashSet::default(),
-        boundary_edges: FxHashSet::default(),
-        cycles: FxHashSet::default(),
-        public_api: FxHashSet::default(),
-    }
-}
-
 fn identity_with_hash(
     project_config_hash: &str,
 ) -> fallow_types::semantic::SemanticAnalysisIdentity {
@@ -1953,107 +2313,20 @@ fn identity_with_hash(
     }
 }
 
-fn meta_with_identity(
-    identity: fallow_types::semantic::SemanticAnalysisIdentity,
-) -> fallow_types::envelope::TypeAwareMeta {
-    fallow_types::envelope::TypeAwareMeta {
-        identity: Some(identity),
-        ..Default::default()
+fn branching_totals(
+    branch_points: u32,
+    functions: u32,
+    peak: u16,
+) -> fallow_types::extract::FileBranching {
+    fallow_types::extract::FileBranching {
+        branch_points,
+        functions,
+        peak_cyclomatic: peak,
+        cognitive: branch_points,
+        cognitive_nesting_weight: 0,
+        has_module_unit: false,
+        has_synthetic_units: false,
     }
-}
-
-#[test]
-fn degrade_reason_absent_for_fully_syntactic_comparison() {
-    let base = empty_snapshot_with_type_aware(None, Vec::new());
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), None),
-        None
-    );
-    assert_eq!(type_aware_attribution_degrade_reason(None, None), None);
-}
-
-/// Regression test for #2102: a side without a semantic identity made no
-/// semantic claims (it legitimately ran no semantic queries), so the other
-/// side's identity cannot conflict with it and the comparison must not
-/// degrade.
-#[test]
-fn degrade_reason_absent_when_only_one_side_has_type_aware_identity() {
-    let base = empty_snapshot_with_type_aware(Some(identity_with_hash("hash-a")), Vec::new());
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), None),
-        None
-    );
-
-    let base = empty_snapshot_with_type_aware(None, Vec::new());
-    let head = meta_with_identity(identity_with_hash("hash-a"));
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), Some(&head)),
-        None
-    );
-}
-
-/// Regression test for #2102: the deferred project-config hash (a side that
-/// needed no semantic queries) is compatible with any concrete hash, so a
-/// diff that adds a file (deferred base, concrete head) must not degrade.
-#[test]
-fn degrade_reason_absent_for_deferred_vs_concrete_project_config_hash() {
-    let deferred = identity_with_hash(fallow_types::semantic::DEFERRED_PROJECT_CONFIG_HASH);
-    let concrete = identity_with_hash("sha256:concrete");
-
-    let base = empty_snapshot_with_type_aware(Some(deferred.clone()), Vec::new());
-    let head = meta_with_identity(concrete.clone());
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), Some(&head)),
-        None
-    );
-
-    let base = empty_snapshot_with_type_aware(Some(concrete), Vec::new());
-    let head = meta_with_identity(deferred);
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), Some(&head)),
-        None
-    );
-}
-
-#[test]
-fn degrade_reason_when_semantic_identities_are_incompatible() {
-    let base = empty_snapshot_with_type_aware(Some(identity_with_hash("hash-a")), Vec::new());
-    let head = meta_with_identity(identity_with_hash("hash-b"));
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), Some(&head)),
-        Some("their semantic analysis identities are incompatible")
-    );
-}
-
-#[test]
-fn degrade_reason_absent_when_identities_and_gap_signatures_match() {
-    let base = empty_snapshot_with_type_aware(Some(identity_with_hash("hash-a")), Vec::new());
-    let head = meta_with_identity(identity_with_hash("hash-a"));
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), Some(&head)),
-        None
-    );
-}
-
-#[test]
-fn degrade_reason_when_gap_signatures_differ() {
-    let base = empty_snapshot_with_type_aware(Some(identity_with_hash("hash-a")), Vec::new());
-    let mut head = meta_with_identity(identity_with_hash("hash-a"));
-    head.queries = vec![fallow_types::semantic::SemanticQuerySummary {
-        query_id: 0,
-        capability: fallow_types::semantic::SemanticCapability::SymbolUse,
-        assertion: "candidate usage refinement".to_string(),
-        status: fallow_types::semantic::SemanticCompleteness::Partial,
-        reason_code: None,
-        total_evidence_count: 0,
-        truncated: false,
-        omissions: Vec::new(),
-        actions: Vec::new(),
-    }];
-    assert_eq!(
-        type_aware_attribution_degrade_reason(Some(&base), Some(&head)),
-        Some("their incomplete semantic query reasons or omissions differ")
-    );
 }
 
 #[test]
@@ -2063,6 +2336,12 @@ fn audit_base_snapshot_cache_payload_roundtrips_sets() {
         base_sha: "abc123".to_string(),
     };
     let snapshot = AuditKeySnapshot {
+        branching: [
+            ("src/z.ts".to_string(), branching_totals(7, 3, 9)),
+            ("src/a.ts".to_string(), branching_totals(2, 1, 3)),
+        ]
+        .into_iter()
+        .collect(),
         type_aware_identity: Some(identity_with_hash("hash-roundtrip")),
         type_aware_gap_signature: vec!["SymbolUse:None:".to_string()],
         syntactic_dead_code: Some(
@@ -2073,7 +2352,12 @@ fn audit_base_snapshot_cache_payload_roundtrips_sets() {
         dead_code: ["dead:a".to_string(), "dead:b".to_string()]
             .into_iter()
             .collect(),
-        health: std::iter::once("health:a".to_string()).collect(),
+        unprovable_dead_code: std::iter::once("unused_catalog_entries".to_string()).collect(),
+        health: std::iter::once((
+            "complexity:src/a.ts:f".to_string(),
+            vec![sample_complexity_metrics()],
+        ))
+        .collect(),
         styling: std::iter::once("styling:a".to_string()).collect(),
         dupes: ["dupe:a".to_string(), "dupe:b".to_string()]
             .into_iter()
@@ -2081,6 +2365,21 @@ fn audit_base_snapshot_cache_payload_roundtrips_sets() {
         boundary_edges: std::iter::once("ui->-db".to_string()).collect(),
         cycles: std::iter::once("a.ts|b.ts".to_string()).collect(),
         public_api: std::iter::once("src/index.ts::foo".to_string()).collect(),
+        dupe_groups: vec![fallow_api::diff_risk::clones::BaseCloneGroup {
+            instances: vec![
+                fallow_api::diff_risk::clones::CloneSpan {
+                    path: "src/a.ts".to_string(),
+                    start_line: 3,
+                    end_line: 12,
+                },
+                fallow_api::diff_risk::clones::CloneSpan {
+                    path: "src/b.ts".to_string(),
+                    start_line: 7,
+                    end_line: 16,
+                },
+            ],
+        }],
+        inherited_health: Vec::new(),
     };
 
     let cached = cached_from_snapshot(&key, &snapshot).expect("snapshot should serialize");
@@ -2093,7 +2392,21 @@ fn audit_base_snapshot_cache_payload_roundtrips_sets() {
         Some(vec!["syn:a".to_string(), "syn:b".to_string()])
     );
 
+    assert_eq!(
+        cached
+            .branching
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["src/a.ts", "src/z.ts"],
+        "the cached payload is sorted, so identical input encodes to identical bytes"
+    );
+
     let decoded = snapshot_from_cached(cached).expect("cached snapshot should decode");
+    assert_eq!(
+        decoded.branching, snapshot.branching,
+        "branching totals survive the cache round trip"
+    );
     assert_eq!(decoded.type_aware_identity, snapshot.type_aware_identity);
     assert_eq!(
         decoded.type_aware_gap_signature,
@@ -2101,6 +2414,11 @@ fn audit_base_snapshot_cache_payload_roundtrips_sets() {
     );
     assert_eq!(decoded.syntactic_dead_code, snapshot.syntactic_dead_code);
     assert_eq!(decoded.dead_code, snapshot.dead_code);
+    assert_eq!(decoded.unprovable_dead_code, snapshot.unprovable_dead_code);
+    assert_eq!(
+        decoded.dupe_groups, snapshot.dupe_groups,
+        "clone instance locations survive the cache round trip"
+    );
     assert_eq!(decoded.health, snapshot.health);
     assert_eq!(decoded.styling, snapshot.styling);
     assert_eq!(decoded.dupes, snapshot.dupes);
@@ -2120,6 +2438,271 @@ fn audit_base_snapshot_cache_dir_writes_gitignore() {
     assert_eq!(
         fs::read_to_string(cache_dir.join(".gitignore")).expect("gitignore should read"),
         "*\n"
+    );
+}
+
+/// Version 10 stores line-free canonical dead-code keys with occurrence
+/// suffixes. A version-9 snapshot holds the old keys, which some findings
+/// build from lines, so the head run must never compare against it.
+#[test]
+fn audit_base_snapshot_cache_version_rejects_snapshots_with_old_dead_code_keys() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let cache_root = tmp.path().join(".fallow-cache");
+    let old = cache_root.join("cache").join("audit-base-v9");
+    fs::create_dir_all(&old).expect("old dir should be created");
+
+    let cache_dir = audit_base_snapshot_cache_dir(&cache_root);
+    ensure_audit_base_snapshot_cache_dir(&cache_dir).expect("cache dir should be created");
+
+    const { assert!(AUDIT_BASE_SNAPSHOT_CACHE_VERSION >= 10) };
+    assert_ne!(cache_dir, old);
+    assert!(!old.exists(), "the old snapshot directory must be swept");
+}
+
+#[test]
+fn audit_base_snapshot_cache_dir_sweeps_lower_versions() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let cache_root = tmp.path().join(".custom-fallow-cache");
+    let cache_parent = cache_root.join("cache");
+    let stale = cache_parent.join(format!(
+        "audit-base-v{}",
+        AUDIT_BASE_SNAPSHOT_CACHE_VERSION - 1
+    ));
+    fs::create_dir_all(&stale).expect("stale dir should be created");
+    fs::write(stale.join("deadbeef.bin"), b"stale").expect("stale payload should write");
+    let newer = cache_parent.join(format!(
+        "audit-base-v{}",
+        AUDIT_BASE_SNAPSHOT_CACHE_VERSION + 1
+    ));
+    fs::create_dir_all(&newer).expect("newer dir should be created");
+    let unrelated = cache_parent.join("resolve");
+    fs::create_dir_all(&unrelated).expect("unrelated dir should be created");
+
+    let cache_dir = audit_base_snapshot_cache_dir(&cache_root);
+    ensure_audit_base_snapshot_cache_dir(&cache_dir).expect("cache dir should be created");
+
+    assert!(
+        !stale.exists(),
+        "lower-versioned snapshot cache directories should be swept"
+    );
+    assert!(
+        newer.exists(),
+        "an older binary must not delete a newer version's cache"
+    );
+    assert!(unrelated.exists(), "unrelated cache dirs must be untouched");
+    assert!(cache_dir.exists());
+}
+
+/// Write `count` snapshot files whose modification times step back one hour
+/// each from `newest`, so file 0 is the newest.
+fn write_snapshot_files(
+    cache_root: &std::path::Path,
+    count: usize,
+    newest: std::time::SystemTime,
+) -> Vec<PathBuf> {
+    let dir = audit_base_snapshot_cache_dir(cache_root);
+    ensure_audit_base_snapshot_cache_dir(&dir).expect("cache dir should be created");
+    (0..count)
+        .map(|index| {
+            let path = dir.join(format!("{index:016x}.bin"));
+            fs::write(&path, b"payload").expect("snapshot should write");
+            let hours = u64::try_from(index).expect("index fits u64");
+            let modified = newest - Duration::from_hours(hours);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(modified))
+                .expect("mtime should be set");
+            path
+        })
+        .collect()
+}
+
+#[test]
+fn base_snapshot_sweep_keeps_only_the_newest_files() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let cache_root = tmp.path().join(".fallow");
+    let now = std::time::SystemTime::now();
+    let files = write_snapshot_files(&cache_root, MAX_AUDIT_BASE_SNAPSHOT_FILES + 2, now);
+
+    let entries = sweep_base_snapshot_cache(
+        &cache_root,
+        Some(Duration::from_hours(30 * 24)),
+        SweepMode::Apply,
+        now,
+    );
+
+    let removed: Vec<&PathBuf> = entries
+        .iter()
+        .filter(|entry| entry.disposition.decision() == SweepDecision::Removed)
+        .map(|entry| &entry.path)
+        .collect();
+    assert_eq!(
+        removed,
+        files[MAX_AUDIT_BASE_SNAPSHOT_FILES..]
+            .iter()
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry.disposition.decision() == SweepDecision::Removed)
+            .all(|entry| entry.disposition.reason() == "over-capacity"
+                && entry.pass == SweepPass::Snapshot)
+    );
+    assert!(
+        files[..MAX_AUDIT_BASE_SNAPSHOT_FILES]
+            .iter()
+            .all(|path| path.exists())
+    );
+    assert!(
+        files[MAX_AUDIT_BASE_SNAPSHOT_FILES..]
+            .iter()
+            .all(|path| !path.exists())
+    );
+}
+
+#[test]
+fn base_snapshot_sweep_removes_only_files_it_wrote() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let cache_root = tmp.path().join(".fallow");
+    let now = std::time::SystemTime::now();
+    let old = now - Duration::from_hours(40 * 24);
+    let files = write_snapshot_files(&cache_root, 1, old);
+    let dir = audit_base_snapshot_cache_dir(&cache_root);
+    let foreign = dir.join("notes.bin");
+    fs::write(&foreign, b"user data").expect("foreign file should write");
+
+    let entries = sweep_base_snapshot_cache(
+        &cache_root,
+        Some(Duration::from_hours(30 * 24)),
+        SweepMode::Apply,
+        now,
+    );
+
+    assert_eq!(entries.len(), 1);
+    assert!(!files[0].exists(), "the aged snapshot must be removed");
+    assert!(foreign.exists(), "a file the cache did not write must stay");
+}
+
+#[cfg(unix)]
+#[test]
+fn base_snapshot_sweep_does_not_follow_a_symlinked_version_dir() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).expect("outside dir should be created");
+    let victim = outside.join(format!("{:016x}.bin", 7));
+    fs::write(&victim, b"payload").expect("victim should write");
+    let now = std::time::SystemTime::now();
+    fs::File::options()
+        .write(true)
+        .open(&victim)
+        .and_then(|file| file.set_modified(now - Duration::from_hours(40 * 24)))
+        .expect("mtime should be set");
+    let cache_root = tmp.path().join(".fallow");
+    let dir = audit_base_snapshot_cache_dir(&cache_root);
+    fs::create_dir_all(dir.parent().expect("version dir has a parent"))
+        .expect("cache dir should be created");
+    std::os::unix::fs::symlink(&outside, &dir).expect("symlink should be created");
+
+    let entries = sweep_base_snapshot_cache(
+        &cache_root,
+        Some(Duration::from_hours(30 * 24)),
+        SweepMode::Apply,
+        now,
+    );
+
+    assert!(entries.is_empty());
+    assert!(
+        victim.exists(),
+        "the sweep must not delete through a symlink"
+    );
+}
+
+#[test]
+fn base_snapshot_sweep_reclaims_aged_files_and_dry_run_keeps_them() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let cache_root = tmp.path().join(".fallow");
+    let now = std::time::SystemTime::now();
+    let files = write_snapshot_files(&cache_root, 1, now - Duration::from_hours(40 * 24));
+    let max_age = Some(Duration::from_hours(30 * 24));
+
+    let preview = sweep_base_snapshot_cache(&cache_root, max_age, SweepMode::DryRun, now);
+    assert_eq!(preview.len(), 1);
+    assert_eq!(preview[0].disposition.reason(), "aged-out");
+    assert_eq!(preview[0].age_days, Some(40));
+    assert!(files[0].exists(), "a dry run must not remove the file");
+
+    let applied = sweep_base_snapshot_cache(&cache_root, max_age, SweepMode::Apply, now);
+    assert_eq!(applied[0].disposition.reason(), "aged-out");
+    assert!(!files[0].exists(), "an aged snapshot must be removed");
+
+    let disabled = write_snapshot_files(&cache_root, 1, now - Duration::from_hours(40 * 24));
+    let kept = sweep_base_snapshot_cache(&cache_root, None, SweepMode::Apply, now);
+    assert_eq!(kept[0].disposition.reason(), "age-gc-disabled");
+    assert!(
+        disabled[0].exists(),
+        "max age 0 disables the age-based reclaim"
+    );
+}
+
+/// Each key folds in the base SHA and the changed files, so without a bound
+/// every commit adds one payload of up to 16 MiB to the cache directory.
+#[test]
+fn base_snapshot_save_bounds_the_cache_directory() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let config_path = None;
+    let cache_root = tmp.path().join(".fallow");
+    let opts = audit_review_benchmark_options(tmp.path(), &config_path, &cache_root, 1);
+    let now = std::time::SystemTime::now();
+    write_snapshot_files(&cache_root, MAX_AUDIT_BASE_SNAPSHOT_FILES, now);
+    let key = AuditBaseSnapshotCacheKey {
+        hash: 0xfeed_beef,
+        base_sha: "abc123".to_string(),
+    };
+
+    save_cached_base_snapshot(&opts, &key, &AuditKeySnapshot::default());
+
+    let dir = audit_base_snapshot_cache_dir(&cache_root);
+    let snapshots = fs::read_dir(&dir)
+        .expect("cache dir should read")
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
+        .count();
+    assert_eq!(snapshots, MAX_AUDIT_BASE_SNAPSHOT_FILES);
+    assert!(
+        audit_base_snapshot_cache_file(&cache_root, &key).exists(),
+        "the snapshot just saved is the newest and must stay"
+    );
+}
+
+#[test]
+fn base_snapshot_cache_hit_refreshes_the_file_age() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let config_path = None;
+    let cache_root = tmp.path().join(".fallow");
+    let opts = audit_review_benchmark_options(tmp.path(), &config_path, &cache_root, 1);
+    let key = AuditBaseSnapshotCacheKey {
+        hash: 0xfeed_beef,
+        base_sha: "abc123".to_string(),
+    };
+    save_cached_base_snapshot(&opts, &key, &AuditKeySnapshot::default());
+    let path = audit_base_snapshot_cache_file(&cache_root, &key);
+    let old = std::time::SystemTime::now() - Duration::from_hours(20 * 24);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.set_modified(old))
+        .expect("mtime should be set");
+
+    assert!(load_cached_base_snapshot(&opts, &key).is_some());
+
+    let modified = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .expect("mtime should read");
+    assert!(
+        modified > old,
+        "a cache hit must restart the age of the file"
     );
 }
 
@@ -2153,11 +2736,16 @@ fn audit_base_snapshot_cache_roundtrips_from_disk() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2170,22 +2758,31 @@ fn audit_base_snapshot_cache_roundtrips_from_disk() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
     let key = AuditBaseSnapshotCacheKey {
         hash: 0xfeed,
         base_sha: "abc123".to_string(),
     };
     let snapshot = AuditKeySnapshot {
+        branching: rustc_hash::FxHashMap::default(),
         type_aware_identity: None,
         type_aware_gap_signature: Vec::new(),
         syntactic_dead_code: None,
         dead_code: std::iter::once("dead:a".to_string()).collect(),
-        health: std::iter::once("health:a".to_string()).collect(),
+        unprovable_dead_code: FxHashSet::default(),
+        health: std::iter::once((
+            "complexity:src/a.ts:f".to_string(),
+            vec![sample_complexity_metrics()],
+        ))
+        .collect(),
         styling: std::iter::once("styling:a".to_string()).collect(),
         dupes: std::iter::once("dupe:a".to_string()).collect(),
         boundary_edges: FxHashSet::default(),
         cycles: FxHashSet::default(),
         public_api: FxHashSet::default(),
+        dupe_groups: Vec::new(),
+        inherited_health: Vec::new(),
     };
 
     save_cached_base_snapshot(&opts, &key, &snapshot);
@@ -2230,11 +2827,16 @@ fn audit_base_snapshot_cache_rejects_mismatched_key() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2247,12 +2849,15 @@ fn audit_base_snapshot_cache_rejects_mismatched_key() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
     let key = AuditBaseSnapshotCacheKey {
         hash: 0xbeef,
         base_sha: "head".to_string(),
     };
     let cached = CachedAuditKeySnapshot {
+        branching: Vec::new(),
+        dupe_groups: Vec::new(),
         version: AUDIT_BASE_SNAPSHOT_CACHE_VERSION,
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
         key_hash: key.hash,
@@ -2261,6 +2866,7 @@ fn audit_base_snapshot_cache_rejects_mismatched_key() {
         type_aware_gap_signature: Vec::new(),
         syntactic_dead_code: None,
         dead_code: vec!["dead:a".to_string()],
+        unprovable_dead_code: vec![],
         health: vec![],
         styling: vec![],
         dupes: vec![],
@@ -2321,11 +2927,16 @@ fn audit_base_snapshot_cache_key_includes_extended_config() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2338,6 +2949,7 @@ fn audit_base_snapshot_cache_key_includes_extended_config() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let first = config_file_fingerprint(&opts).expect("fingerprint should be computed");
@@ -2406,11 +3018,16 @@ fn audit_gate_all_skips_base_snapshot() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::All,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2423,6 +3040,7 @@ fn audit_gate_all_skips_base_snapshot() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -2511,11 +3129,16 @@ fn audit_gate_new_only_skips_base_snapshot_for_docs_only_diff() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2528,6 +3151,7 @@ fn audit_gate_new_only_skips_base_snapshot_for_docs_only_diff() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -2617,11 +3241,16 @@ fn audit_reuses_dead_code_parse_for_health_when_production_matches() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2634,6 +3263,7 @@ fn audit_reuses_dead_code_parse_for_health_when_production_matches() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -2644,6 +3274,329 @@ fn audit_reuses_dead_code_parse_for_health_when_production_matches() {
     assert!(
         result.dupes.is_some(),
         "dupes should run when changed files exist"
+    );
+}
+
+/// Issue #2164: a clone-removal refactor may re-shape a clone group (here the
+/// shared helper is extracted, leaving the surrounding scaffolding as a new,
+/// smaller group with a new attribution key) without writing any duplicated
+/// line. The new-only gate must classify that group as inherited, not
+/// introduced.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
+fn audit_new_only_does_not_gate_reshaped_clone_group_without_added_lines() {
+    let helper = "export function eq(xs: string[], ys: string[]): boolean {\n  if (xs.length !== ys.length) {\n    return false;\n  }\n  for (let index = 0; index < xs.length; index += 1) {\n    if (xs[index] !== ys[index]) {\n      return false;\n    }\n  }\n  return true;\n}\n";
+    let scaffolding = "export function selfTest(): boolean {\n  const alpha = ['alpha', 'beta', 'gamma'];\n  const beta = ['alpha', 'beta', 'gamma'];\n  const gamma = ['delta', 'epsilon', 'zeta'];\n  const first = eq(alpha, beta);\n  const second = eq(alpha, gamma);\n  const third = eq(beta, gamma);\n  const outcomes = [first, !second, !third];\n  const labels = ['same', 'differs', 'differs'];\n  const combined = outcomes.map((outcome, index) => `${labels[index]}:${outcome}`);\n  return combined.length === outcomes.length && outcomes.every((outcome) => outcome === true);\n}\n";
+
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let root = &tmp
+        .path()
+        .canonicalize()
+        .expect("temp dir should canonicalize");
+    fs::create_dir_all(root.join("src")).expect("src dir should be created");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-dupes-reshape","main":"src/index.ts"}"#,
+    )
+    .expect("package.json should be written");
+    fs::write(
+        root.join("src/index.ts"),
+        "import { selfTest as a } from './a';\nimport { selfTest as b } from './b';\na();\nb();\n",
+    )
+    .expect("index should be written");
+    let base_module = format!("{helper}{scaffolding}");
+    fs::write(root.join("src/a.ts"), &base_module).expect("a should be written");
+    fs::write(root.join("src/b.ts"), &base_module).expect("b should be written");
+
+    git(root, &["init", "-b", "main"]);
+    git(root, &["add", "."]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+    );
+
+    // The refactor: extract the identical helper to a shared lib. The
+    // scaffolding lines are untouched in both files.
+    let refactored = format!("import {{ eq }} from './lib';\n{scaffolding}");
+    fs::write(root.join("src/a.ts"), &refactored).expect("a should be rewritten");
+    fs::write(root.join("src/b.ts"), &refactored).expect("b should be rewritten");
+    fs::write(root.join("src/lib.ts"), helper).expect("lib should be written");
+
+    let config_path = None;
+    let cache_root = root.join(".fallow");
+    let opts = AuditOptions {
+        root,
+        cache_dir: &cache_root,
+        config_path: &config_path,
+        output: OutputFormat::Json,
+        json_style: crate::json_style::JsonStyle::Compact,
+        no_cache: true,
+        threads: 1,
+        quiet: true,
+        allow_remote_extends: false,
+        changed_since: Some("HEAD"),
+        production: false,
+        production_dead_code: None,
+        production_health: None,
+        production_dupes: None,
+        workspace: None,
+        changed_workspaces: None,
+        explain: false,
+        explain_skipped: false,
+        performance: false,
+        group_by: None,
+        dead_code_baseline: None,
+        health_baseline: None,
+        dupes_baseline: None,
+        health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
+        max_crap: None,
+        coverage: None,
+        coverage_root: None,
+        gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
+        include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
+        css: false,
+        css_deep: false,
+        runtime_coverage: None,
+        min_invocations_hot: 100,
+        brief: false,
+        max_decisions: 4,
+        walkthrough_guide: false,
+        walkthrough: false,
+        mark_viewed: &[],
+        show_cleared: false,
+        walkthrough_file: None,
+        show_deprioritized: false,
+        scope: None,
+    };
+
+    let result = execute_audit(&opts).expect("audit should execute");
+    let dupes = result.dupes.as_ref().expect("dupes should run");
+    assert!(
+        !dupes.report.clone_groups.is_empty(),
+        "the scaffolding clone group should still be reported"
+    );
+    assert!(
+        !result.base_snapshot_skipped,
+        "base snapshot should be computed for attribution"
+    );
+    assert_eq!(
+        result.attribution.duplication_introduced, 0,
+        "a re-shaped clone group with no added lines must not gate as introduced"
+    );
+    assert!(
+        result.attribution.duplication_inherited >= 1,
+        "the pre-existing duplication should be reported as inherited"
+    );
+
+    assert_reshaped_demotion_observability(&result);
+}
+
+/// Issue #2220 assertions for the re-shaped-clone fixture: the demotion is
+/// recorded and surfaced on the wire, but stays observability-only.
+fn assert_reshaped_demotion_observability(result: &AuditResult) {
+    let comparison = result.comparison.as_ref().expect("comparison retained");
+    assert!(
+        comparison.dupes.demoted_count() >= 1,
+        "the re-shaped group must be recorded as demoted"
+    );
+    assert!(
+        comparison.dupes.demoted_count() <= comparison.dupes.inherited_count(),
+        "demoted groups stay counted as inherited"
+    );
+    assert!(
+        matches!(
+            result.dupe_demotion_diff_source,
+            Some(DupeDemotionDiffSource::Worktree)
+        ),
+        "without an opt-in shared diff the merge-base worktree diff decides"
+    );
+    assert_eq!(
+        result.verdict,
+        AuditVerdict::Pass,
+        "demotion observability must not change the verdict; attribution={:?}",
+        result.attribution,
+    );
+    assert_eq!(
+        crate::audit::print_audit_result(result, true, false),
+        std::process::ExitCode::SUCCESS,
+        "demotion observability must not change the exit code"
+    );
+
+    let json = super::output::build_audit_json_output(result).expect("audit json should build");
+    assert_eq!(json["attribution"]["duplication_demoted"], 1);
+    let groups = json["duplication"]["clone_groups"]
+        .as_array()
+        .expect("clone groups array");
+    let demoted: Vec<&serde_json::Value> = groups
+        .iter()
+        .filter(|group| group.get("demotion_reason").is_some())
+        .collect();
+    assert_eq!(demoted.len(), 1, "exactly one group carries the marker");
+    assert_eq!(demoted[0]["demotion_reason"], "no-added-lines");
+    assert_eq!(demoted[0]["introduced"], false);
+}
+
+/// Repo whose working tree pastes a whole module into a new file on top of a
+/// committed base, with a duplication threshold so the pasted clone can fail
+/// the gate.
+fn pasted_clone_audit_repo() -> tempfile::TempDir {
+    let helper = "export function eq(xs: string[], ys: string[]): boolean {\n  if (xs.length !== ys.length) {\n    return false;\n  }\n  for (let index = 0; index < xs.length; index += 1) {\n    if (xs[index] !== ys[index]) {\n      return false;\n    }\n  }\n  return true;\n}\n";
+    let scaffolding = "export function selfTest(): boolean {\n  const alpha = ['alpha', 'beta', 'gamma'];\n  const beta = ['alpha', 'beta', 'gamma'];\n  const gamma = ['delta', 'epsilon', 'zeta'];\n  const first = eq(alpha, beta);\n  const second = eq(alpha, gamma);\n  const third = eq(beta, gamma);\n  const outcomes = [first, !second, !third];\n  const labels = ['same', 'differs', 'differs'];\n  const combined = outcomes.map((outcome, index) => `${labels[index]}:${outcome}`);\n  return combined.length === outcomes.length && outcomes.every((outcome) => outcome === true);\n}\n";
+
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let root = &tmp
+        .path()
+        .canonicalize()
+        .expect("temp dir should canonicalize");
+    fs::create_dir_all(root.join("src")).expect("src dir should be created");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-dupes-paste","main":"src/index.ts"}"#,
+    )
+    .expect("package.json should be written");
+    fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"duplicates":{"threshold":1.0}}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        root.join("src/index.ts"),
+        "import { selfTest as a } from './a';\na();\n",
+    )
+    .expect("index should be written");
+    let module = format!("{helper}{scaffolding}");
+    fs::write(root.join("src/a.ts"), &module).expect("a should be written");
+
+    git(root, &["init", "-b", "main"]);
+    git(root, &["add", "."]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+    );
+
+    // The paste: copy the whole module into a new file. Every line of the new
+    // clone instance is an added line, so the group must keep gating.
+    fs::write(root.join("src/b.ts"), &module).expect("b should be written");
+    fs::write(
+        root.join("src/index.ts"),
+        "import { selfTest as a } from './a';\nimport { selfTest as b } from './b';\na();\nb();\n",
+    )
+    .expect("index should be rewritten");
+
+    tmp
+}
+
+/// Strict-side pin for the issue #2164 fix: the touched-instance guard must
+/// only demote re-shaped groups. A genuinely pasted clone (whole module copied
+/// into a new file) contains added lines, so it must still gate as introduced
+/// and fail the new-only gate.
+#[test]
+fn audit_new_only_still_gates_pasted_clone_as_introduced() {
+    let tmp = pasted_clone_audit_repo();
+    let root_buf = tmp
+        .path()
+        .canonicalize()
+        .expect("temp root should canonicalize");
+    let root = root_buf.as_path();
+
+    let config_path = None;
+    let cache_root = root.join(".fallow");
+    let opts = AuditOptions {
+        root,
+        cache_dir: &cache_root,
+        config_path: &config_path,
+        output: OutputFormat::Json,
+        json_style: crate::json_style::JsonStyle::Compact,
+        no_cache: true,
+        threads: 1,
+        quiet: true,
+        allow_remote_extends: false,
+        changed_since: Some("HEAD"),
+        production: false,
+        production_dead_code: None,
+        production_health: None,
+        production_dupes: None,
+        workspace: None,
+        changed_workspaces: None,
+        explain: false,
+        explain_skipped: false,
+        performance: false,
+        group_by: None,
+        dead_code_baseline: None,
+        health_baseline: None,
+        dupes_baseline: None,
+        health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
+        max_crap: None,
+        coverage: None,
+        coverage_root: None,
+        gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
+        include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
+        css: false,
+        css_deep: false,
+        runtime_coverage: None,
+        min_invocations_hot: 100,
+        brief: false,
+        max_decisions: 4,
+        walkthrough_guide: false,
+        walkthrough: false,
+        mark_viewed: &[],
+        show_cleared: false,
+        walkthrough_file: None,
+        show_deprioritized: false,
+        scope: None,
+    };
+
+    let result = execute_audit(&opts).expect("audit should execute");
+    let dupes = result.dupes.as_ref().expect("dupes should run");
+    assert!(
+        !dupes.report.clone_groups.is_empty(),
+        "the pasted clone group should be reported"
+    );
+    assert!(
+        !result.base_snapshot_skipped,
+        "base snapshot should be computed for attribution"
+    );
+    assert!(
+        result.attribution.duplication_introduced >= 1,
+        "a pasted clone contains added lines and must gate as introduced"
+    );
+    assert_eq!(
+        result.verdict,
+        AuditVerdict::Fail,
+        "introduced duplication above the threshold must fail the new-only gate"
+    );
+
+    // Issue #2220: no demotion happened, so nothing may carry the marker and
+    // the verdict/exit code stay exactly as pinned above.
+    let comparison = result.comparison.as_ref().expect("comparison retained");
+    assert_eq!(comparison.dupes.demoted_count(), 0);
+    assert_eq!(
+        crate::audit::print_audit_result(&result, true, false),
+        std::process::ExitCode::from(1),
+        "a genuinely pasted clone must keep failing with exit code 1"
+    );
+    let json = super::output::build_audit_json_output(&result).expect("audit json should build");
+    assert_eq!(json["attribution"]["duplication_demoted"], 0);
+    assert!(
+        json["duplication"]["clone_groups"]
+            .as_array()
+            .expect("clone groups array")
+            .iter()
+            .all(|group| group.get("demotion_reason").is_none()),
+        "non-demoted groups must not carry a demotion_reason key"
     );
 }
 
@@ -2707,11 +3660,16 @@ fn audit_dupes_falls_back_to_own_discovery_when_health_off() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2724,88 +3682,11 @@ fn audit_dupes_falls_back_to_own_discovery_when_health_off() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
     assert!(result.dupes.is_some(), "dupes should still run");
-}
-
-#[cfg(unix)]
-#[test]
-fn remap_focus_files_does_not_canonicalize_through_symlinks() {
-    let tmp = tempfile::TempDir::new().expect("temp dir");
-    let real = tmp.path().join("real");
-    let link = tmp.path().join("link");
-    fs::create_dir_all(&real).expect("real dir");
-    std::os::unix::fs::symlink(&real, &link).expect("symlink");
-    let canonical = link.canonicalize().expect("canonicalize symlink");
-    assert_ne!(link, canonical, "symlink should not equal its target");
-
-    let from_root = PathBuf::from("/repo");
-    let mut focus = FxHashSet::default();
-    focus.insert(from_root.join("src/foo.ts"));
-
-    let remapped = remap_focus_files(&focus, &from_root, &link)
-        .expect("remap should succeed for in-prefix files");
-
-    let expected = link.join("src/foo.ts");
-    assert!(
-        remapped.contains(&expected),
-        "remapped paths must keep the un-canonical to_root prefix; got {remapped:?}, expected entry {expected:?}"
-    );
-}
-
-#[test]
-fn remap_focus_files_skips_paths_outside_from_root() {
-    let from_root = PathBuf::from("/repo/apps/web");
-    let to_root = PathBuf::from("/wt/apps/web");
-    let mut focus = FxHashSet::default();
-    focus.insert(PathBuf::from("/repo/apps/web/src/in.ts"));
-    focus.insert(PathBuf::from("/repo/services/api/src/out.ts"));
-
-    let remapped =
-        remap_focus_files(&focus, &from_root, &to_root).expect("partial map should succeed");
-
-    assert_eq!(remapped.len(), 1);
-    assert!(remapped.contains(&PathBuf::from("/wt/apps/web/src/in.ts")));
-}
-
-#[test]
-fn remap_focus_files_returns_none_when_no_paths_map() {
-    let from_root = PathBuf::from("/repo/apps/web");
-    let to_root = PathBuf::from("/wt/apps/web");
-    let mut focus = FxHashSet::default();
-    focus.insert(PathBuf::from("/elsewhere/foo.ts"));
-
-    let remapped = remap_focus_files(&focus, &from_root, &to_root);
-    assert!(
-        remapped.is_none(),
-        "remap should return None when no paths can be mapped, falling caller back to full corpus"
-    );
-}
-
-#[test]
-fn remap_cache_dir_moves_project_local_cache_to_base_worktree() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let current_root = tmp.path().join("repo");
-    let base_root = tmp.path().join("fallow-base");
-    let cache_dir = current_root.join(".cache").join("fallow");
-
-    let remapped = remap_cache_dir_for_base_worktree(&current_root, &base_root, &cache_dir);
-
-    assert_eq!(remapped, base_root.join(".cache").join("fallow"));
-}
-
-#[test]
-fn remap_cache_dir_keeps_external_absolute_cache_shared() {
-    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let current_root = tmp.path().join("repo");
-    let base_root = tmp.path().join("fallow-base");
-    let cache_dir = tmp.path().join("shared").join("fallow-cache");
-
-    let remapped = remap_cache_dir_for_base_worktree(&current_root, &base_root, &cache_dir);
-
-    assert_eq!(remapped, cache_dir);
 }
 
 fn inherited_duplicate_audit_repo() -> tempfile::TempDir {
@@ -2886,11 +3767,16 @@ fn audit_gate_new_only_inherits_pre_existing_duplicates_in_focused_files() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -2903,6 +3789,7 @@ fn audit_gate_new_only_inherits_pre_existing_duplicates_in_focused_files() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -3033,11 +3920,16 @@ export function App() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -3050,6 +3942,7 @@ export function App() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -3187,11 +4080,16 @@ export function App() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -3204,6 +4102,7 @@ export function App() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -3281,11 +4180,16 @@ fn audit_base_uses_new_explicit_config_without_hard_failure() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -3298,6 +4202,7 @@ fn audit_base_uses_new_explicit_config_without_hard_failure() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute with a new explicit config");
@@ -3370,11 +4275,16 @@ fn audit_base_uses_current_discovered_config_for_attribution() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -3387,6 +4297,7 @@ fn audit_base_uses_current_discovered_config_for_attribution() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -3468,11 +4379,16 @@ fn audit_base_current_config_attribution_survives_cache_hit() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -3485,6 +4401,7 @@ fn audit_base_current_config_attribution_survives_cache_hit() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let first = execute_audit(&opts).expect("first audit should execute");
@@ -3494,9 +4411,9 @@ fn audit_base_current_config_attribution_survives_cache_hit() {
         first.attribution
     );
 
-    let changed_files =
-        crate::check::get_changed_files(root, "HEAD").expect("changed files should resolve");
-    let key = audit_base_snapshot_cache_key(&opts, "HEAD", &changed_files)
+    let changed_files = fallow_engine::changed_files::get_changed_files(root, "HEAD")
+        .expect("changed files should resolve");
+    let key = audit_base_snapshot_cache_key(&opts, "HEAD", &changed_files, &[])
         .expect("cache key should compute")
         .expect("cache key should exist");
     assert!(
@@ -3518,6 +4435,10 @@ fn audit_base_current_config_attribution_survives_cache_hit() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn audit_dupes_only_materializes_groups_touching_changed_files() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let root_path = tmp
@@ -3586,11 +4507,16 @@ fn audit_dupes_only_materializes_groups_touching_changed_files() {
         health_baseline: None,
         dupes_baseline: None,
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
         max_crap: None,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::All,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
         css: false,
         css_deep: false,
         runtime_coverage: None,
@@ -3603,6 +4529,7 @@ fn audit_dupes_only_materializes_groups_touching_changed_files() {
         show_cleared: false,
         walkthrough_file: None,
         show_deprioritized: false,
+        scope: None,
     };
 
     let result = execute_audit(&opts).expect("audit should execute");
@@ -3621,219 +4548,86 @@ fn audit_dupes_only_materializes_groups_touching_changed_files() {
     }));
 }
 
-// Unit tests for js_ts_tokens_equivalent, is_analysis_input, is_non_behavioral_doc.
-
-#[test]
-fn tokens_equivalent_whitespace_only() {
-    // Reformatting (indentation, blank lines) must not change token identity.
-    let a = "export const x = 1;\nexport const y = 2;\n";
-    let b = "export const x = 1;\n\n\nexport const y = 2;\n";
-    assert!(
-        js_ts_tokens_equivalent(Path::new("a.ts"), a, b),
-        "whitespace-only change must be treated as equivalent"
-    );
-}
-
-#[test]
-fn tokens_equivalent_comment_only_change() {
-    // Comments do not produce tokens; adding or removing a comment should be
-    // treated as equivalent by the tokenizer.
-    let a = "export const x = 1;\n";
-    let b = "// note\nexport const x = 1;\n";
-    assert!(
-        js_ts_tokens_equivalent(Path::new("a.ts"), a, b),
-        "comment-only change must be treated as equivalent (comments emit no tokens)"
-    );
-}
-
-#[test]
-fn tokens_equivalent_identifier_rename_is_not_equivalent() {
-    // Identifier carries its text payload; a rename must not be reusable.
-    let a = "export const a = 1;\n";
-    let b = "export const b = 1;\n";
-    assert!(
-        !js_ts_tokens_equivalent(Path::new("a.ts"), a, b),
-        "identifier rename must be treated as non-equivalent"
-    );
-}
-
-#[test]
-fn tokens_equivalent_string_literal_change_is_not_equivalent() {
-    // StringLiteral carries its text payload; a changed import path must not be reusable.
-    let a = r#"import x from "./a";"#;
-    let b = r#"import x from "./b";"#;
-    assert!(
-        !js_ts_tokens_equivalent(Path::new("a.ts"), a, b),
-        "string-literal change must be treated as non-equivalent"
-    );
-}
-
-#[test]
-fn tokens_equivalent_fallow_ignore_marker_forces_false() {
-    // The guard fires before tokenization; even identical content containing the
-    // marker must return false so suppression changes are never skipped.
-    let code = "// fallow-ignore-next-line unused-exports\nexport const x = 1;\n";
-    assert!(
-        !js_ts_tokens_equivalent(Path::new("a.ts"), code, code),
-        "fallow-ignore marker in either side must force false"
-    );
-}
-
-#[test]
-fn tokens_equivalent_non_js_extension_is_false() {
-    // The extension check fires before tokenization; CSS content cannot be reused.
-    let a = ".foo { color: red; }\n";
-    let b = ".foo {\n  color: red;\n}\n";
-    assert!(
-        !js_ts_tokens_equivalent(Path::new("styles.css"), a, b),
-        "non-JS/TS extension must always return false"
-    );
-}
-
-/// KNOWN SOUNDNESS GAP: `TokenKind::TemplateLiteral` carries no payload
-/// (see `crates/engine/src/duplication_detector/token_types.rs`), so a change to the
-/// content of a template literal is invisible to the tokenizer and is
-/// treated as equivalent. This is safe for most template strings but
-/// unsound for dynamic `import(\`...\`)` patterns where the quasi prefix
-/// feeds module-resolution pattern edges. This test pins the current
-/// behavior. A follow-up fix should give `TemplateLiteral` a payload to
-/// close the gap.
-#[test]
-fn tokens_equivalent_template_literal_content_change_is_equivalent_known_gap() {
-    let a = "const p = import(`./pages/${x}`);\n";
-    let b = "const p = import(`./views/${x}`);\n";
-    // KNOWN GAP: changing the quasi string of a template literal is NOT
-    // detected as a behavioral change because TokenKind::TemplateLiteral
-    // has no payload. Expected: true (equivalent), which is incorrect for
-    // dynamic-import prefixes but documents the current reality.
-    assert!(
-        js_ts_tokens_equivalent(Path::new("a.ts"), a, b),
-        "template-literal content change is CURRENTLY treated as equivalent (known gap)"
-    );
-}
-
-/// Companion to the template-literal gap test: a regex-literal content
-/// change is also invisible to the tokenizer.
-#[test]
-fn tokens_equivalent_regex_literal_content_change_is_equivalent_known_gap() {
-    let a = "const re = /^foo/;\n";
-    let b = "const re = /^bar/;\n";
-    // KNOWN GAP: TokenKind::RegExpLiteral has no payload.
-    assert!(
-        js_ts_tokens_equivalent(Path::new("a.ts"), a, b),
-        "regex-literal content change is CURRENTLY treated as equivalent (known gap)"
-    );
-}
-
-#[test]
-fn analysis_input_and_doc_classification() {
-    // Analysis inputs: JS/TS variants and component formats are behavioral.
-    assert!(is_analysis_input(Path::new("src/app.ts")));
-    assert!(is_analysis_input(Path::new("src/app.tsx")));
-    assert!(is_analysis_input(Path::new("src/app.js")));
-    assert!(is_analysis_input(Path::new("src/app.jsx")));
-    assert!(is_analysis_input(Path::new("src/app.mts")));
-    assert!(is_analysis_input(Path::new("src/app.vue")));
-    assert!(is_analysis_input(Path::new("src/styles.css")));
-
-    // Non-analysis inputs.
-    assert!(!is_analysis_input(Path::new("README.md")));
-    assert!(!is_analysis_input(Path::new("package.json")));
-    assert!(!is_analysis_input(Path::new("image.png")));
-
-    // Non-behavioral docs.
-    assert!(is_non_behavioral_doc(Path::new("README.md")));
-    assert!(is_non_behavioral_doc(Path::new("CHANGELOG.txt")));
-    assert!(is_non_behavioral_doc(Path::new("docs/guide.rst")));
-    assert!(is_non_behavioral_doc(Path::new("docs/guide.adoc")));
-
-    // .json is neither an analysis input nor a non-behavioral doc, so the
-    // predicate treats it as behavioral (can_reuse returns false for it).
-    assert!(!is_analysis_input(Path::new("package.json")));
-    assert!(!is_non_behavioral_doc(Path::new("package.json")));
-}
-
-/// The weakening scan must never conflate a head-read FAILURE with removed
-/// content: a file deleted at head genuinely scans against empty head content,
-/// a net-new file (missing at base) scans against an empty base, and head
+/// The security-step scan must never conflate a head-read failure with removed
+/// content: a CI file deleted at head scans against empty head content, a
+/// net-new CI file (missing at base) scans against an empty base, and head
 /// bytes that are not valid UTF-8 are read lossily instead of collapsing to an
-/// empty string that fabricates an `it( removed` signal.
+/// empty string that fabricates a removed-step signal.
 #[test]
-fn weakening_scan_distinguishes_deleted_head_from_unreadable_content() {
+fn security_step_scan_distinguishes_deleted_head_from_unreadable_content() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "weakening-head-reads");
     let repo = dunce::canonicalize(&repo).expect("repo root should canonicalize");
-    let tests = "it('a', () => {});\nit('b', () => {});\n";
-    fs::write(repo.join("deleted.test.ts"), tests).expect("fixture write");
-    fs::write(repo.join("lossy.test.ts"), tests).expect("fixture write");
+    let workflows = repo.join(".github/workflows");
+    fs::create_dir_all(&workflows).expect("workflow dir");
+    let steps = "jobs:\n  ci:\n    steps:\n      - run: npm audit\n";
+    fs::write(workflows.join("deleted.yml"), steps).expect("fixture write");
+    fs::write(workflows.join("lossy.yml"), steps).expect("fixture write");
     git(&repo, &["add", "."]);
     git(
         &repo,
-        &["-c", "commit.gpgsign=false", "commit", "-m", "tests"],
+        &["-c", "commit.gpgsign=false", "commit", "-m", "workflows"],
     );
 
-    fs::remove_file(repo.join("deleted.test.ts")).expect("fixture delete");
-    let mut lossy = tests.as_bytes().to_vec();
-    lossy.extend_from_slice(b"// ");
+    fs::remove_file(workflows.join("deleted.yml")).expect("fixture delete");
+    let mut lossy = steps.as_bytes().to_vec();
+    lossy.extend_from_slice(b"# ");
     lossy.extend_from_slice(&[0xFF, 0xFE, b'\n']);
-    fs::write(repo.join("lossy.test.ts"), lossy).expect("fixture write");
-    fs::write(repo.join("added.test.ts"), "it('new', () => {});\n").expect("fixture write");
+    fs::write(workflows.join("lossy.yml"), lossy).expect("fixture write");
+    fs::write(workflows.join("added.yml"), "jobs: {}\n").expect("fixture write");
 
     let changed: FxHashSet<PathBuf> = [
-        repo.join("deleted.test.ts"),
-        repo.join("lossy.test.ts"),
-        repo.join("added.test.ts"),
+        workflows.join("deleted.yml"),
+        workflows.join("lossy.yml"),
+        workflows.join("added.yml"),
     ]
     .into_iter()
     .collect();
-    let signals = compute_weakening_signals(&repo, "HEAD", &changed);
+    let signals = compute_security_step_signals(&repo, "HEAD", &changed);
 
     assert!(
         signals
             .iter()
-            .any(|signal| signal.file == "deleted.test.ts"
-                && signal.evidence.contains("it( removed")),
+            .any(|signal| signal.file == ".github/workflows/deleted.yml"
+                && signal.evidence == "npm audit step removed"),
         "a file deleted at head scans against empty head content: {signals:?}"
     );
     assert!(
-        !signals.iter().any(|signal| signal.file == "lossy.test.ts"),
-        "invalid UTF-8 head bytes are read lossily, never fabricated as removed tests: {signals:?}"
+        !signals
+            .iter()
+            .any(|signal| signal.file == ".github/workflows/lossy.yml"),
+        "invalid UTF-8 head bytes are read lossily, never fabricated as removed steps: {signals:?}"
     );
     assert!(
-        !signals.iter().any(|signal| signal.file == "added.test.ts"),
+        !signals
+            .iter()
+            .any(|signal| signal.file == ".github/workflows/added.yml"),
         "a net-new file scans against an empty base without fabricated signals: {signals:?}"
     );
 }
 
-/// A head file that exists but cannot be read (permission denied) is skipped
-/// entirely; scanning it as empty content would fabricate a removed-tests
-/// signal for every test the file still contains.
+/// A head CI file that exists but cannot be read (permission denied) is
+/// skipped; scanning it as empty content would fabricate a removed-step
+/// signal for every step the file still contains.
 #[cfg(unix)]
 #[test]
-fn weakening_scan_skips_permission_denied_head_file() {
+fn security_step_scan_skips_permission_denied_head_file() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "weakening-unreadable-head");
     let repo = dunce::canonicalize(&repo).expect("repo root should canonicalize");
-    fs::write(
-        repo.join("guarded.test.ts"),
-        "it('a', () => {});\nit('b', () => {});\n",
-    )
-    .expect("fixture write");
+    fs::write(repo.join(".gitlab-ci.yml"), "audit:\n  script: npm audit\n").expect("fixture write");
     git(&repo, &["add", "."]);
-    git(
-        &repo,
-        &["-c", "commit.gpgsign=false", "commit", "-m", "tests"],
-    );
+    git(&repo, &["-c", "commit.gpgsign=false", "commit", "-m", "ci"]);
     fs::set_permissions(
-        repo.join("guarded.test.ts"),
+        repo.join(".gitlab-ci.yml"),
         fs::Permissions::from_mode(0o000),
     )
     .expect("permissions should be set");
 
-    let changed: FxHashSet<PathBuf> = std::iter::once(repo.join("guarded.test.ts")).collect();
-    let signals = compute_weakening_signals(&repo, "HEAD", &changed);
+    let changed: FxHashSet<PathBuf> = std::iter::once(repo.join(".gitlab-ci.yml")).collect();
+    let signals = compute_security_step_signals(&repo, "HEAD", &changed);
 
     assert!(
         signals.is_empty(),
@@ -3841,38 +4635,117 @@ fn weakening_scan_skips_permission_denied_head_file() {
     );
 }
 
-/// [`BaseFileReader`] distinguishes a missing object (the file is new since
-/// base) from a broken request pipe: a pipe failure must surface as
-/// [`BaseRead::Error`], never as [`BaseRead::Missing`], so callers stop the
-/// scan instead of treating every remaining file as empty at base.
 #[test]
-fn base_file_reader_distinguishes_missing_from_pipe_error() {
+fn audit_envelope_states_a_failed_type_aware_completeness_gate() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
-    let repo = init_throwaway_repo(tmp.path(), "base-read-modes");
-    let mut reader = BaseFileReader::spawn(&repo).expect("reader should spawn");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).expect("src dir should be created");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-type-aware-gate","main":"src/index.ts"}"#,
+    )
+    .expect("package.json should be written");
+    fs::write(root.join("src/index.ts"), "export const legacy = 1;\n")
+        .expect("index should be written");
+    git(root, &["init", "-b", "main"]);
+    git(root, &["add", "."]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+    );
+    fs::write(
+        root.join("src/index.ts"),
+        "export const legacy = 1;\nexport const changed = 2;\n",
+    )
+    .expect("changed module should be written");
 
-    assert!(
-        matches!(
-            reader.read("HEAD", Path::new("README.md")),
-            BaseRead::Content(content) if content == "seed\n"
+    let config_path = None;
+    let cache_root = root.join(".fallow");
+    let opts = AuditOptions {
+        root,
+        cache_dir: &cache_root,
+        config_path: &config_path,
+        output: OutputFormat::Json,
+        json_style: crate::json_style::JsonStyle::Compact,
+        no_cache: true,
+        threads: 1,
+        quiet: true,
+        allow_remote_extends: false,
+        changed_since: Some("HEAD"),
+        production: false,
+        production_dead_code: None,
+        production_health: None,
+        production_dupes: None,
+        workspace: None,
+        changed_workspaces: None,
+        explain: false,
+        explain_skipped: false,
+        performance: false,
+        group_by: None,
+        dead_code_baseline: None,
+        health_baseline: None,
+        dupes_baseline: None,
+        health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        fail_on_stale_baseline: false,
+        max_crap: None,
+        coverage: None,
+        coverage_root: None,
+        gate: AuditGate::All,
+        worsened: fallow_config::AuditWorsened::Warn,
+        include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
+        analyses: AuditAnalysisSelection::ALL,
+        css: false,
+        css_deep: false,
+        runtime_coverage: None,
+        min_invocations_hot: 100,
+        brief: false,
+        max_decisions: 4,
+        walkthrough_guide: false,
+        walkthrough: false,
+        mark_viewed: &[],
+        show_cleared: false,
+        walkthrough_file: None,
+        show_deprioritized: false,
+        scope: None,
+    };
+    let mut result = execute_audit(&opts).expect("audit should execute");
+    let meta = fallow_types::envelope::TypeAwareMeta {
+        required_completeness: Some(
+            fallow_types::semantic::SemanticCompletenessRequirement::Complete,
         ),
-        "a committed file reads back as content"
-    );
+        ..Default::default()
+    };
+    result
+        .check
+        .as_mut()
+        .expect("audit runs the dead-code pass")
+        .type_aware_meta = Some(meta);
     assert!(
-        matches!(
-            reader.read("HEAD", Path::new("absent.ts")),
-            BaseRead::Missing
-        ),
-        "an object absent at base is Missing, not an error"
-    );
-    assert!(
-        matches!(reader.read("HEAD", Path::new("a\nb.ts")), BaseRead::Error),
-        "a newline path cannot be requested over the batch protocol"
+        audit_type_aware_completeness_failed(&result),
+        "the fixture must fail the completeness gate"
     );
 
-    reader.stdin.take();
-    assert!(
-        matches!(reader.read("HEAD", Path::new("README.md")), BaseRead::Error),
-        "a severed request pipe is an Error, never Missing or empty content"
+    let json = super::output::build_audit_json_output(&result).expect("audit JSON should build");
+    assert_eq!(
+        json["gate_outcomes"]["type-aware-require"],
+        serde_json::json!({ "status": "fail", "enforced": true }),
+        "the run exits 1 on this gate, so the envelope must state it: {}",
+        json["gate_outcomes"]
     );
+}
+
+/// Base complexity values with every field set, for cache round trips.
+fn sample_complexity_metrics() -> fallow_api::audit_keys::ComplexityMetrics {
+    fallow_api::audit_keys::ComplexityMetrics {
+        line: 3,
+        cyclomatic: 17,
+        cognitive: 16,
+        crap: Some(42.5),
+        line_count: 12,
+        exceeded: fallow_output::ExceededThreshold::CognitiveCrap,
+        severity: fallow_output::FindingSeverity::High,
+        crap_estimated: true,
+    }
 }

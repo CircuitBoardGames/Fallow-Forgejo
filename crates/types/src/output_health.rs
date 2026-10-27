@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Evidence linking a refactoring target back to specific analysis data.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -102,7 +102,7 @@ pub struct CloneSiblingEvidence {
 /// (`add-tests`, `increase-coverage`) carry only `note`.
 ///
 /// [`ComplexityViolation`]: ../../fallow-output/src/health_scores.rs
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HealthFindingAction {
     /// Action type identifier. A single finding's `actions` array can carry
@@ -154,8 +154,13 @@ pub struct HealthFindingAction {
     pub comment: Option<String>,
     /// Where to insert the suppress comment
     /// (e.g., `above-function-declaration`, `above-angular-decorator`,
-    /// `above-component-worst-method`, or `top-of-template`). Present on
-    /// `suppress-line` and `suppress-file` action variants.
+    /// `above-template-anchor-line`, `above-component-worst-method`, or
+    /// `top-of-template`). Present on `suppress-line` and `suppress-file`
+    /// action variants. `above-template-anchor-line` is used for
+    /// single-file-component markup (`.svelte`, `.vue`, `.astro`), where the
+    /// synthetic `<template>` unit is anchored at its first contributing
+    /// construct rather than at the top of the file, so the comment belongs on
+    /// the line immediately preceding the reported line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<String>,
     /// Project-relative path the action should target when the finding's
@@ -176,7 +181,7 @@ pub struct HealthFindingAction {
 /// exceeded both cyclomatic and CRAP at `coverage_tier: partial` will get
 /// BOTH `increase-coverage` AND `refactor-function`, plus the trailing
 /// `suppress-line`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum HealthFindingActionType {
@@ -198,8 +203,11 @@ pub enum HealthFindingActionType {
     /// synthetic Angular `<template>` findings on `.html` files where a
     /// line suppression cannot be expressed.
     SuppressFile,
-    /// Suppress with an inline `// fallow-ignore-next-line complexity`
-    /// comment above the function or Angular decorator.
+    /// Suppress with a next-line comment above the reported line: the
+    /// inline `// fallow-ignore-next-line complexity` form above a function
+    /// or Angular decorator, or the markup
+    /// `<!-- fallow-ignore-next-line complexity -->` form for synthetic
+    /// `<template>` findings in `.svelte`, `.vue`, and `.astro` files.
     SuppressLine,
 }
 
@@ -211,7 +219,7 @@ pub enum HealthFindingActionType {
 /// the corresponding signal fires for the hotspot.
 ///
 /// [`HotspotEntry`]: ../../fallow-output/src/health_scores.rs
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HotspotAction {
     /// Action type identifier.
@@ -240,7 +248,7 @@ pub struct HotspotAction {
 }
 
 /// Discriminant for [`HotspotAction::kind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum HotspotActionType {
@@ -261,7 +269,7 @@ pub enum HotspotActionType {
 
 /// Strategy discriminant for the suggested CODEOWNERS pattern attached to
 /// an `unowned-hotspot` action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum HotspotActionHeuristic {
@@ -287,7 +295,7 @@ pub enum HotspotActionHeuristic {
 /// `ComplexityViolation` and read placement from THAT action instead.
 ///
 /// [`RefactoringTarget`]: ../../fallow-output/src/health_targets.rs
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RefactoringTargetAction {
     /// Action type identifier.
@@ -313,7 +321,7 @@ pub struct RefactoringTargetAction {
 }
 
 /// Discriminant for [`RefactoringTargetAction::kind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum RefactoringTargetActionType {
@@ -333,7 +341,7 @@ pub enum RefactoringTargetActionType {
 /// `comment` for `suppress-file`) depends on the `kind`.
 ///
 /// [`UntestedFile`]: ../../fallow-output/src/health_coverage_gaps.rs
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UntestedFileAction {
     /// Action type identifier.
@@ -356,7 +364,7 @@ pub struct UntestedFileAction {
 
 /// Discriminant for [`UntestedFileAction::kind`]. Mirrors the action types
 /// emitted by `build_untested_file_actions`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum UntestedFileActionType {
@@ -378,7 +386,7 @@ pub enum UntestedFileActionType {
 /// just any test coverage, is what closes the gap.
 ///
 /// [`UntestedExport`]: ../../fallow-output/src/health_coverage_gaps.rs
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UntestedExportAction {
     /// Action type identifier.
@@ -403,7 +411,7 @@ pub struct UntestedExportAction {
 
 /// Discriminant for [`UntestedExportAction::kind`]. Mirrors the action
 /// types emitted by `build_untested_export_actions`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum UntestedExportActionType {

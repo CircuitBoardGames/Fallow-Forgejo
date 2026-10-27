@@ -1,7 +1,11 @@
 import path from "node:path";
 
-import { SymbolFlags } from "typescript/unstable/sync";
-import {
+import { sync, ast } from "./backend.mjs";
+
+import { canonicalFileIdentity } from "./file-identity.mjs";
+
+const { SymbolFlags } = sync;
+const {
   isClassDeclaration,
   isClassExpression,
   isEnumDeclaration,
@@ -12,14 +16,14 @@ import {
   isMethodDeclaration,
   isMethodSignatureDeclaration,
   isModuleDeclaration,
+  isNamespaceExport,
   isPropertyDeclaration,
   isPropertySignatureDeclaration,
   isSetAccessorDeclaration,
+  isSourceFile,
   isTypeAliasDeclaration,
   isVariableDeclaration,
-} from "typescript/unstable/ast/is";
-
-import { canonicalFileIdentity } from "./file-identity.mjs";
+} = ast;
 
 const DECLARATION_KIND_RULES = [
   [[isClassDeclaration, isClassExpression], "class"],
@@ -45,7 +49,12 @@ const TYPE_ONLY_DECLARATIONS = [
   isTypeAliasDeclaration,
   isPropertySignatureDeclaration,
 ];
-const DUAL_NAMESPACE_DECLARATIONS = [isClassDeclaration, isClassExpression, isEnumDeclaration];
+const DUAL_NAMESPACE_DECLARATIONS = [
+  isClassDeclaration,
+  isClassExpression,
+  isEnumDeclaration,
+  isSourceFile,
+];
 const DECLARATION_OWNER_NODES = [isClassDeclaration, isClassExpression, isInterfaceDeclaration];
 
 const slash = (value) => value.split(path.sep).join("/");
@@ -56,7 +65,7 @@ export const relativePath = (root, fileName) =>
 
 export const sourceFileIdentity = (sourceFile) => canonicalFileIdentity(sourceFile.fileName);
 
-export const positions = (node) => {
+const positions = (node) => {
   const sourceFile = node.getSourceFile();
   const nodes = node.name ? [node, node.name] : [node];
   return nodes.map((candidate) => {
@@ -72,7 +81,7 @@ export const positions = (node) => {
 
 export const nodeText = (node) => node?.text;
 
-export const declarationKind = (node) =>
+const declarationKind = (node) =>
   DECLARATION_KIND_RULES.find(([checks]) => matchesAny(node, checks))?.[1];
 
 export const declarationNamespaces = (node) =>
@@ -88,7 +97,7 @@ const ownerName = (node) => {
   return ownerName(node.parent);
 };
 
-export const declarationOwner = (node) => ownerName(node.parent);
+const declarationOwner = (node) => ownerName(node.parent);
 
 export const ownerDeclaration = (node) => {
   let current = node?.parent;
@@ -100,6 +109,8 @@ export const ownerDeclaration = (node) => {
 };
 
 export const isDeclaration = (node) => declarationKind(node) !== undefined;
+
+export const isExportAnchor = (node) => isExportSpecifier(node) || isNamespaceExport(node);
 
 const visit = (node, callback) => {
   callback(node);
@@ -151,6 +162,16 @@ const indexExportSpecifier = (index, node) => {
   );
 };
 
+const indexNamespaceExport = (index, node) => {
+  const exportedName = nodeText(node.name);
+  if (!exportedName) return;
+  [node.parent, node]
+    .flatMap((candidate) => positions(candidate))
+    .forEach((position) =>
+      indexExportPosition(index, node, { localName: exportedName, exportedName }, position),
+    );
+};
+
 const defaultModifierFor = (node) =>
   node.modifiers?.find((modifier) => modifier.getText(node.getSourceFile()) === "default");
 
@@ -197,6 +218,10 @@ const declarationIndex = (sourceFile) => {
       indexExportSpecifier(index, node);
       return;
     }
+    if (isNamespaceExport(node)) {
+      indexNamespaceExport(index, node);
+      return;
+    }
     indexDeclarationNode(index, node);
   });
   declarationIndexes.set(sourceFile, index);
@@ -205,7 +230,7 @@ const declarationIndex = (sourceFile) => {
 
 export const findDeclaration = (sourceFile, identity) => {
   const anchor = declarationIndex(sourceFile).get(anchorKey(identity));
-  if (!anchor || isExportSpecifier(anchor)) return anchor;
+  if (!anchor || isExportAnchor(anchor)) return anchor;
   return declarationNamespaces(anchor).has(identity.namespace) ? anchor : undefined;
 };
 
@@ -214,9 +239,15 @@ export const symbolForDeclaration = (project, declaration) =>
 
 export const resolveAlias = (checker, symbol) => {
   if (!symbol) return undefined;
-  if ((symbol.flags & SymbolFlags.Alias) === 0) return symbol;
-  const aliased = checker.getAliasedSymbol(symbol);
-  return checker.isUnknownSymbol(aliased) ? symbol : aliased;
+  const seen = new Set();
+  let current = symbol;
+  while ((current.flags & SymbolFlags.Alias) !== 0 && !seen.has(current)) {
+    seen.add(current);
+    const aliased = checker.getAliasedSymbol(current);
+    if (checker.isUnknownSymbol(aliased) || aliased === current) return current;
+    current = aliased;
+  }
+  return current;
 };
 
 export const declarationsForSymbol = (project, symbol) =>

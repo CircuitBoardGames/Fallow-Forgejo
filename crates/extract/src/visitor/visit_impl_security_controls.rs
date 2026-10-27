@@ -7,11 +7,11 @@
 use oxc_ast::ast::*;
 use oxc_span::Span;
 
-use fallow_types::extract::{SecurityControlKind, SecurityControlSite};
+use fallow_types::extract::{SecurityControlKind, SecurityControlSite, SinkLiteralValue};
 
 use super::{
     ModuleInfoExtractor, callee_leaf_name, expression_has_boundary_validation_keys,
-    expression_has_fastify_schema, flatten_callee_path,
+    expression_has_fastify_schema, flatten_callee_path, unwrap_static_expr,
 };
 
 pub(super) fn security_control_kind_for_callee(callee_path: &str) -> Option<SecurityControlKind> {
@@ -38,14 +38,7 @@ fn is_validation_control(callee_path: &str, leaf: &str) -> bool {
         "parse" | "safeparse" | "validate" | "validateasync" | "assert" | "check" | "is"
     ) && matches!(
         control_object(callee_path),
-        Some("z")
-            | Some("zod")
-            | Some("joi")
-            | Some("yup")
-            | Some("valibot")
-            | Some("v")
-            | Some("superstruct")
-            | Some("schema")
+        Some("z" | "zod" | "joi" | "yup" | "valibot" | "v" | "superstruct" | "schema")
     )) || matches!(leaf, "validatesync" | "parseasync" | "safeparseasync")
 }
 
@@ -98,7 +91,55 @@ fn route_method_leaf(callee_path: &str) -> Option<&str> {
     .then_some(leaf)
 }
 
+fn branch_exits_immediately(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
+        Statement::BlockStatement(block) => {
+            block.body.first().is_some_and(branch_exits_immediately)
+        }
+        _ => false,
+    }
+}
+
+fn is_origin_property(expression: &Expression<'_>) -> bool {
+    matches!(unwrap_static_expr(expression), Expression::StaticMemberExpression(member)
+        if member.property.name == "origin")
+}
+
 impl ModuleInfoExtractor {
+    /// Record comparison syntax for verification, without claiming URL provenance
+    /// or that this branch protects a particular input or sink.
+    pub(super) fn capture_origin_guard_observation(&mut self, statement: &IfStatement<'_>) {
+        let Expression::BinaryExpression(comparison) = unwrap_static_expr(&statement.test) else {
+            return;
+        };
+        let mismatch_exits = match comparison.operator {
+            BinaryOperator::StrictInequality => branch_exits_immediately(&statement.consequent),
+            BinaryOperator::StrictEquality => statement
+                .alternate
+                .as_ref()
+                .is_some_and(branch_exits_immediately),
+            _ => false,
+        };
+        if !mismatch_exits {
+            return;
+        }
+        let expected = if is_origin_property(&comparison.left) {
+            &comparison.right
+        } else if is_origin_property(&comparison.right) {
+            &comparison.left
+        } else {
+            return;
+        };
+        if !matches!(
+            self.static_sink_literal_value(expected),
+            Some(SinkLiteralValue::String(_))
+        ) {
+            return;
+        }
+        self.record_validation_control_site("origin-equality-guard", statement.span);
+    }
+
     fn record_validation_control_site(&mut self, callee_path: &str, span: Span) {
         self.security_control_sites.push(SecurityControlSite {
             kind: SecurityControlKind::Validation,
@@ -161,16 +202,16 @@ impl ModuleInfoExtractor {
         let Some(callee_path) = flatten_callee_path(&expr.callee) else {
             return;
         };
-        if self.has_package_evidence("@nestjs/common")
-            && callee_path.rsplit('.').next() == Some("ValidationPipe")
+        if callee_path.rsplit('.').next() == Some("ValidationPipe")
+            && self.has_package_evidence("@nestjs/common")
         {
             self.record_validation_control_site("nestjs.validation-pipe", expr.span);
         }
     }
 
     fn is_elysia_validation_route(&self, callee_path: &str, expr: &CallExpression<'_>) -> bool {
-        self.has_package_evidence("elysia")
-            && route_method_leaf(callee_path).is_some()
+        route_method_leaf(callee_path).is_some()
+            && self.has_package_evidence("elysia")
             && expr
                 .arguments
                 .iter()
@@ -180,8 +221,8 @@ impl ModuleInfoExtractor {
     }
 
     fn is_fastify_validation_route(&self, callee_path: &str, expr: &CallExpression<'_>) -> bool {
-        self.has_package_evidence("fastify")
-            && route_method_leaf(callee_path).is_some()
+        route_method_leaf(callee_path).is_some()
+            && self.has_package_evidence("fastify")
             && expr
                 .arguments
                 .iter()
@@ -190,39 +231,40 @@ impl ModuleInfoExtractor {
     }
 
     fn is_trpc_input_control(&self, callee_path: &str, expr: &CallExpression<'_>) -> bool {
-        let lower = callee_path.to_ascii_lowercase();
-        self.has_package_evidence("@trpc/server")
-            && callee_path
+        if expr.arguments.is_empty()
+            || !callee_path
                 .rsplit('.')
                 .next()
                 .is_some_and(|leaf| leaf.eq_ignore_ascii_case("input"))
-            && lower.contains("procedure")
-            && !expr.arguments.is_empty()
+        {
+            return false;
+        }
+
+        callee_path.to_ascii_lowercase().contains("procedure")
+            && self.has_package_evidence("@trpc/server")
     }
 
     fn is_hono_validation_middleware(&self, callee_path: &str, expr: &CallExpression<'_>) -> bool {
-        (self.has_package_evidence("hono") || self.has_package_evidence("@hono/zod-validator"))
-            && matches!(
-                callee_path.rsplit('.').next(),
-                Some("validator" | "zValidator")
-            )
-            && !expr.arguments.is_empty()
+        matches!(
+            callee_path.rsplit('.').next(),
+            Some("validator" | "zValidator")
+        ) && !expr.arguments.is_empty()
+            && (self.has_package_evidence("hono")
+                || self.has_package_evidence("@hono/zod-validator"))
     }
 
     fn is_nest_validation_pipe_call(&self, callee_path: &str) -> bool {
-        self.has_package_evidence("@nestjs/common")
-            && matches!(
-                callee_path.rsplit('.').next(),
-                Some("UsePipes" | "ValidationPipe")
-            )
+        matches!(
+            callee_path.rsplit('.').next(),
+            Some("UsePipes" | "ValidationPipe")
+        ) && self.has_package_evidence("@nestjs/common")
     }
 
     fn is_express_validator_control(&self, callee_path: &str, expr: &CallExpression<'_>) -> bool {
-        self.has_package_evidence("express-validator")
-            && matches!(
-                callee_path.rsplit('.').next(),
-                Some("body" | "param" | "query" | "check")
-            )
-            && !expr.arguments.is_empty()
+        matches!(
+            callee_path.rsplit('.').next(),
+            Some("body" | "param" | "query" | "check")
+        ) && !expr.arguments.is_empty()
+            && self.has_package_evidence("express-validator")
     }
 }

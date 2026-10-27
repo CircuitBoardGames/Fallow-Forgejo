@@ -13,8 +13,8 @@ pub(super) struct TokenConsumersInput<'a> {
 
 fn collect_located_utility_consumers(
     input: &TokenConsumersInput<'_>,
-) -> Vec<(String, String, u32)> {
-    let mut located: Vec<(String, String, u32)> = Vec::new();
+) -> Vec<(String, std::sync::Arc<str>, u32)> {
+    let mut located = Vec::new();
     for file in input.files {
         let path = &file.path;
         let extension = path.extension().and_then(|ext| ext.to_str());
@@ -83,7 +83,7 @@ fn token_consumer_candidates(input: &TokenConsumersInput<'_>) -> Vec<ThemeTokenC
 fn build_token_consumer(
     input: &TokenConsumersInput<'_>,
     candidate: ThemeTokenCandidate,
-    utility_located: &[(String, String, u32)],
+    utility_located: &[(String, std::sync::Arc<str>, u32)],
 ) -> fallow_output::TokenConsumers {
     use fallow_output::TOKEN_CONSUMER_SAMPLE_CAP;
 
@@ -104,7 +104,7 @@ fn build_token_consumer(
 fn token_consumer_locations(
     input: &TokenConsumersInput<'_>,
     candidate: &ThemeTokenCandidate,
-    utility_located: &[(String, String, u32)],
+    utility_located: &[(String, std::sync::Arc<str>, u32)],
 ) -> Vec<fallow_output::TokenConsumerLocation> {
     let dash_name = format!("-{}", candidate.name);
     let raw = candidate.token.trim_start_matches('-');
@@ -155,16 +155,16 @@ fn append_exact_token_consumers(
     }
 }
 
-fn append_suffix_token_consumers(
+fn append_suffix_token_consumers<P: AsRef<str>>(
     consumers: &mut Vec<fallow_output::TokenConsumerLocation>,
-    located: &[(String, String, u32)],
+    located: &[(String, P, u32)],
     suffix: &str,
     kind: fallow_output::ConsumerKind,
 ) {
     for (token, path, line) in located {
         if token.len() > suffix.len() && token.ends_with(suffix) {
             consumers.push(fallow_output::TokenConsumerLocation {
-                path: path.clone(),
+                path: path.as_ref().to_owned(),
                 line: *line,
                 kind,
             });
@@ -197,6 +197,7 @@ pub(super) struct CssInJsDefiner {
 pub(super) struct CssInJsDefiners {
     pub(super) entries: Vec<CssInJsDefiner>,
     pub(super) index: rustc_hash::FxHashMap<(std::path::PathBuf, String), usize>,
+    pub(super) by_path: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(usize, String)>>,
     pub(super) paths: rustc_hash::FxHashSet<std::path::PathBuf>,
 }
 
@@ -211,10 +212,10 @@ type ResolvedCssInJsImportTargets =
 /// Whether a specifier names a CSS-in-JS token-DEFINITION library. `@vanilla-extract/recipes`
 /// is excluded: it exports no token-definition function (`createTheme` family lives
 /// in `@vanilla-extract/css`), so it is not a definer-pass pre-filter source.
-fn is_css_in_js_token_lib(specifier: &str) -> bool {
+pub(super) fn is_css_in_js_token_lib(specifier: &str) -> bool {
     matches!(
         specifier,
-        "@stylexjs/stylex" | "@vanilla-extract/css" | "@pandacss/dev"
+        "@stylexjs/stylex" | "stylex" | "@vanilla-extract/css" | "@pandacss/dev"
     )
 }
 
@@ -234,7 +235,7 @@ fn source_mentions_theme_definer(source: &str) -> bool {
     source.contains("theme") || source.contains("Theme")
 }
 
-fn is_theme_provider_source(specifier: &str) -> bool {
+pub(super) fn is_theme_provider_source(specifier: &str) -> bool {
     matches!(specifier, "styled-components" | "@emotion/react")
 }
 
@@ -340,7 +341,8 @@ fn resolve_css_in_js_import_targets(
     modules: &[fallow_types::extract::ModuleInfo],
     config: &ResolvedConfig,
 ) -> ResolvedCssInJsImportTargets {
-    let workspaces = fallow_config::discover_workspaces(&config.root);
+    let workspaces =
+        fallow_config::discover_workspaces_with_patterns(&config.root, &config.workspace_patterns);
     let active_plugins: Vec<String> = Vec::new();
     let path_aliases: Vec<(String, String)> = Vec::new();
     let auto_imports: Vec<fallow_config::AutoImportRule> = Vec::new();
@@ -353,8 +355,10 @@ fn resolve_css_in_js_import_targets(
         active_plugins: &active_plugins,
         path_aliases: &path_aliases,
         auto_imports: &auto_imports,
+        jsx_import_sources: &[],
         scss_include_paths: &scss_include_paths,
         static_dir_mappings: &static_dir_mappings,
+        framework_static_dir_mappings: &static_dir_mappings,
         root: &config.root,
         extra_conditions: &config.resolve.conditions,
     };
@@ -414,6 +418,8 @@ pub(super) fn collect_css_in_js_definers(
     let mut definers: Vec<CssInJsDefiner> = Vec::new();
     let mut definer_index: rustc_hash::FxHashMap<(std::path::PathBuf, String), usize> =
         rustc_hash::FxHashMap::default();
+    let mut definers_by_path: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(usize, String)>> =
+        rustc_hash::FxHashMap::default();
     let mut definer_paths: rustc_hash::FxHashSet<std::path::PathBuf> =
         rustc_hash::FxHashSet::default();
     let has_theme_provider = project_imports_theme_provider(modules);
@@ -446,6 +452,10 @@ pub(super) fn collect_css_in_js_definers(
         for def in defs {
             let idx = definers.len();
             definer_index.insert((norm.clone(), def.binding.clone()), idx);
+            definers_by_path
+                .entry(norm.clone())
+                .or_default()
+                .push((idx, def.binding.clone()));
             definer_paths.insert(norm.clone());
             definers.push(CssInJsDefiner {
                 rel_path: rel.clone(),
@@ -458,6 +468,7 @@ pub(super) fn collect_css_in_js_definers(
     CssInJsDefiners {
         entries: definers,
         index: definer_index,
+        by_path: definers_by_path,
         paths: definer_paths,
     }
 }
@@ -498,7 +509,20 @@ fn collect_css_in_js_consumers(
         .filter(|(_, definer)| definer.origin == fallow_extract::CssInJsTokenOrigin::Panda)
         .map(|(idx, _)| idx)
         .collect();
+    let stylex_definer_indices: rustc_hash::FxHashSet<usize> = definers
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, definer)| definer.origin == fallow_extract::CssInJsTokenOrigin::StyleX)
+        .map(|(idx, _)| idx)
+        .collect();
     let has_theme_definers = !theme_definer_indices.is_empty();
+    let query_definers = DefinerQuerySets {
+        leaf_sets: &leaf_sets,
+        stylex: &stylex_definer_indices,
+        theme: &theme_definer_indices,
+        panda: &panda_definer_indices,
+    };
 
     for module in modules {
         let Some(consumer_abs) = path_by_id.get(&module.file_id).copied() else {
@@ -520,9 +544,7 @@ fn collect_css_in_js_consumers(
         let style_aliases = module_panda_style_aliases(module);
         let (queries, attribution) = build_module_consumer_queries(
             &matches,
-            &leaf_sets,
-            &theme_definer_indices,
-            &panda_definer_indices,
+            &query_definers,
             &token_aliases,
             &style_aliases,
         );
@@ -541,13 +563,21 @@ fn collect_css_in_js_consumers(
 fn css_in_js_definer_matches<'a>(
     module: &'a fallow_types::extract::ModuleInfo,
     consumer_abs: &std::path::Path,
-    definers: &CssInJsDefiners,
+    definers: &'a CssInJsDefiners,
     path_by_id: &rustc_hash::FxHashMap<fallow_types::discover::FileId, &std::path::Path>,
     resolved_targets: &ResolvedCssInJsImportTargets,
 ) -> Vec<(usize, &'a str)> {
     use fallow_types::extract::ImportedName;
 
     let mut matches: Vec<(usize, &str)> = Vec::new();
+    let consumer_norm = lexical_normalize(consumer_abs);
+    if let Some(entries) = definers.by_path.get(&consumer_norm) {
+        matches.extend(
+            entries
+                .iter()
+                .map(|(idx, binding)| (*idx, binding.as_str())),
+        );
+    }
     for import in &module.imports {
         if import.is_type_only || !matches!(&import.imported_name, ImportedName::Named(_)) {
             continue;
@@ -620,15 +650,20 @@ type ConsumerQueryPlan<'a> = (
     Vec<(usize, fallow_output::ConsumerKind)>,
 );
 
+struct DefinerQuerySets<'a> {
+    leaf_sets: &'a [rustc_hash::FxHashSet<String>],
+    stylex: &'a rustc_hash::FxHashSet<usize>,
+    theme: &'a [usize],
+    panda: &'a [usize],
+}
+
 /// Build the per-module `ConsumerQuery` list plus a parallel attribution vector
 /// mapping each query position to its `(definer index, ConsumerKind)`. The single
 /// scan of the consumer source returns `(query_index, hit)` pairs the caller folds
 /// back through this attribution, preserving the old per-definer kinds exactly.
 fn build_module_consumer_queries<'a>(
     matches: &[(usize, &'a str)],
-    leaf_sets: &'a [rustc_hash::FxHashSet<String>],
-    theme_definer_indices: &[usize],
-    panda_definer_indices: &[usize],
+    definers: &'a DefinerQuerySets<'a>,
     token_aliases: &[&'a str],
     style_aliases: &'a rustc_hash::FxHashSet<String>,
 ) -> ConsumerQueryPlan<'a> {
@@ -643,27 +678,34 @@ fn build_module_consumer_queries<'a>(
     for &(idx, alias) in matches {
         queries.push(ConsumerQuery::MemberBinding {
             alias,
-            leaf_paths: &leaf_sets[idx],
+            leaf_paths: &definers.leaf_sets[idx],
         });
         attribution.push((idx, ConsumerKind::JsMember));
+        if definers.stylex.contains(&idx) {
+            queries.push(ConsumerQuery::StyleXThemeGroup {
+                contract_alias: alias,
+                leaf_paths: &definers.leaf_sets[idx],
+            });
+            attribution.push((idx, ConsumerKind::JsCall));
+        }
     }
 
     // PandaCSS generated-token consumers: `token('a.b')` calls and style-object
     // values, scanned against every Panda definer (matching the old pass, which
     // ran once per Panda definer when the module had any Panda alias).
     if !token_aliases.is_empty() || !style_aliases.is_empty() {
-        for &idx in panda_definer_indices {
+        for &idx in definers.panda {
             for &alias in token_aliases {
                 queries.push(ConsumerQuery::PandaTokenCall {
                     alias,
-                    leaf_paths: &leaf_sets[idx],
+                    leaf_paths: &definers.leaf_sets[idx],
                 });
                 attribution.push((idx, ConsumerKind::JsCall));
             }
             if !style_aliases.is_empty() {
                 queries.push(ConsumerQuery::PandaStyleValues {
                     aliases: style_aliases,
-                    leaf_paths: &leaf_sets[idx],
+                    leaf_paths: &definers.leaf_sets[idx],
                 });
                 attribution.push((idx, ConsumerKind::JsCall));
             }
@@ -672,9 +714,9 @@ fn build_module_consumer_queries<'a>(
 
     // styled-components / Emotion theme reads (`theme.colors.x`): unconditional
     // per theme definer for every surviving module (matching the old pass).
-    for &idx in theme_definer_indices {
+    for &idx in definers.theme {
         queries.push(ConsumerQuery::ThemeReads {
-            leaf_paths: &leaf_sets[idx],
+            leaf_paths: &definers.leaf_sets[idx],
         });
         attribution.push((idx, ConsumerKind::JsMember));
     }

@@ -166,7 +166,7 @@ pub fn note_result_count(count: usize) {
     FINDINGS_PRESENT.fetch_max(value, Ordering::Relaxed);
 
     let capped = count.min(RESULT_COUNT_MAX) as u16;
-    let _ = RESULT_COUNT_CAPPED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = RESULT_COUNT_CAPPED.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         let next = match current {
             RESULT_COUNT_UNSET => capped,
             RESULT_COUNT_UNKNOWN => RESULT_COUNT_UNKNOWN,
@@ -230,11 +230,11 @@ pub fn note_report_truncation(truncated: bool, reason: TruncationReason) {
     if truncated {
         REPORT_TRUNCATED.store(REPORT_TRUNCATION_TRUE, Ordering::Relaxed);
         let reason_state = truncation_reason_to_state(reason);
-        let _ = TRUNCATION_REASON.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = TRUNCATION_REASON.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.max(reason_state))
         });
     } else {
-        let _ = REPORT_TRUNCATED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = REPORT_TRUNCATED.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             if current == REPORT_TRUNCATION_UNSET {
                 Some(REPORT_TRUNCATION_FALSE)
             } else {
@@ -635,6 +635,8 @@ pub enum Workflow {
     RuntimeCoverageSetup,
     Impact,
     Security,
+    SimilarCode,
+    Architecture,
     Fix,
     Explain,
     ProjectInventory,
@@ -660,10 +662,12 @@ impl Workflow {
         match self {
             Workflow::Audit
             | Workflow::DeadCode
+            | Workflow::Architecture
             | Workflow::Health
             | Workflow::Dupes
             | Workflow::CodeQualityReview
-            | Workflow::Security => true,
+            | Workflow::Security
+            | Workflow::SimilarCode => true,
             Workflow::DependencyCleanup
             | Workflow::GithubAction
             | Workflow::GitlabCi
@@ -787,6 +791,7 @@ pub enum AnalysisMode {
     RuntimeCoverage,
     ProductionCoverage,
     Security,
+    SimilarCode,
     Fix,
     Unknown,
 }
@@ -961,8 +966,8 @@ struct TelemetryEvent {
     /// `outcome` gate. Absent on commands that run no analysis (admin commands)
     /// and on older binaries. On the combined `code_quality_review` and `audit`
     /// workflows this is an OR across the sub-analyses; per-analysis find-rate
-    /// is answerable only on the standalone `dead_code` / `dupes` / `health`
-    /// workflows.
+    /// is answerable on the standalone `dead_code` / `architecture` / `dupes` /
+    /// `health` / `security` workflows.
     #[serde(skip_serializing_if = "Option::is_none")]
     findings_present: Option<bool>,
     /// Coarse bucket of the rendered analysis result count. Never serializes
@@ -1417,7 +1422,7 @@ fn build_workflow_event_with(
         agent_source,
         output_format: output_format_label(record.output),
         quiet: record.quiet,
-        ci: is_ci(),
+        ci: fallow_engine::ci_env::is_ci(),
         tty: std::io::stdout().is_terminal(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -1475,7 +1480,7 @@ fn status_changed_event(enabled: bool) -> TelemetryEvent {
         agent_source: None,
         output_format: "human",
         quiet: false,
-        ci: is_ci(),
+        ci: fallow_engine::ci_env::is_ci(),
         tty: std::io::stdout().is_terminal(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -1552,7 +1557,7 @@ fn telemetry_context_field_purposes() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "workflow",
-            "Prioritizes audit, dead-code, health, dupes, and integration workflows.",
+            "Prioritizes audit, dead-code, architecture, health, dupes, and integration workflows.",
         ),
         (
             "integration_surface",
@@ -1618,7 +1623,7 @@ fn telemetry_result_field_purposes() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "findings_present",
-            "Whether the analysis surfaced any findings, decoupled from the exit-code gate. On combined and audit workflows it is an OR across sub-analyses; per-analysis find-rate is answerable only on standalone dead_code, dupes, and health.",
+            "Whether the analysis surfaced any findings, decoupled from the exit-code gate. On combined and audit workflows it is an OR across sub-analyses; per-analysis find-rate is answerable on the standalone dead_code, architecture, dupes, health, and security workflows.",
         ),
         (
             "result_count_bucket",
@@ -1700,7 +1705,7 @@ fn effective_config() -> EffectiveConfig {
             config_path: config_path(),
         };
     }
-    if is_ci() {
+    if fallow_engine::ci_env::is_ci() {
         return EffectiveConfig {
             mode: EffectiveMode::Off,
             source: ModeSource::Default,
@@ -1790,8 +1795,10 @@ fn debug_enabled() -> bool {
     env_truthy(DEBUG_ENV)
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
+/// True when env var `name` holds a truthy value (`1`, `true`, `yes`, `on`).
+/// Shared with the update check and the cache notice opt-out gate.
+pub fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -2101,19 +2108,52 @@ struct SpoolLock {
     _file: std::fs::File,
 }
 
+/// Why [`SpoolLock::acquire`] did not hand back the lock.
+///
+/// The two cases mean opposite things and only one is normal. `Contended` is
+/// the designed outcome when another `fallow` process is already rewriting the
+/// spool: the caller skips and the next run picks the work up. `Unavailable`
+/// means this machine cannot take the lock at all, so every drain and trim is
+/// skipped on every run and the spool grows until the size cap trims it
+/// blindly. Collapsing both into "no lock" hid that second case entirely.
+#[derive(Debug)]
+enum SpoolLockUnavailable {
+    /// Another process holds the lock. Expected, and self-correcting.
+    Contended,
+    /// The lock file could not be opened or locked on this machine: a
+    /// read-only or missing directory, permissions, or a descriptor limit.
+    /// Never self-correcting, so it is worth a diagnostic.
+    Unusable(std::io::Error),
+}
+
 impl SpoolLock {
-    fn try_acquire(lock_path: &Path) -> Option<Self> {
+    /// Take the lock, reporting WHY when it is not taken.
+    ///
+    /// Separate from [`Self::try_acquire`] so tests can tell a contended lock
+    /// apart from a lock file that could not be opened. A test asserting only
+    /// `is_none()` reports "another process holds it" for an environment that
+    /// could not open the file at all, which sends the reader after a
+    /// concurrency bug that is not there.
+    fn acquire(lock_path: &Path) -> Result<Self, SpoolLockUnavailable> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(lock_path)
-            .ok()?;
+            .map_err(SpoolLockUnavailable::Unusable)?;
         match file.try_lock() {
-            Ok(()) => Some(Self { _file: file }),
+            Ok(()) => Ok(Self { _file: file }),
             // Another process holds the lock; skip and let the next run retry.
-            Err(std::fs::TryLockError::WouldBlock) => None,
-            Err(std::fs::TryLockError::Error(err)) => {
+            Err(std::fs::TryLockError::WouldBlock) => Err(SpoolLockUnavailable::Contended),
+            Err(std::fs::TryLockError::Error(err)) => Err(SpoolLockUnavailable::Unusable(err)),
+        }
+    }
+
+    fn try_acquire(lock_path: &Path) -> Option<Self> {
+        match Self::acquire(lock_path) {
+            Ok(lock) => Some(lock),
+            Err(SpoolLockUnavailable::Contended) => None,
+            Err(SpoolLockUnavailable::Unusable(err)) => {
                 tracing::debug!(error = %err, "could not acquire telemetry spool lock");
                 None
             }
@@ -2133,7 +2173,7 @@ fn classify_invocation_context() -> InvocationContext {
     if classify_agent_source() != AgentSource::None {
         return InvocationContext::Agent;
     }
-    if is_ci() {
+    if fallow_engine::ci_env::is_ci() {
         return InvocationContext::Ci;
     }
     if std::env::var_os("VSCODE_PID").is_some() || std::env::var_os("TERM_PROGRAM").is_some() {
@@ -2143,6 +2183,30 @@ fn classify_invocation_context() -> InvocationContext {
         InvocationContext::Human
     } else {
         InvocationContext::Unknown
+    }
+}
+
+/// The detected agent source as its snake_case wire value, or `None` when no
+/// agent runs this process. Cloud reads send it as the
+/// `x-fallow-agent-source` header after the cloud allowlist filters it.
+pub fn agent_source_wire_value() -> Option<&'static str> {
+    match classify_agent_source() {
+        AgentSource::None => None,
+        AgentSource::Codex => Some("codex"),
+        AgentSource::ClaudeCode => Some("claude_code"),
+        AgentSource::Cursor => Some("cursor"),
+        AgentSource::Copilot => Some("copilot"),
+        AgentSource::Opencode => Some("opencode"),
+        AgentSource::Aider => Some("aider"),
+        AgentSource::Roo => Some("roo"),
+        AgentSource::Windsurf => Some("windsurf"),
+        AgentSource::Gemini => Some("gemini"),
+        AgentSource::Cline => Some("cline"),
+        AgentSource::Continue => Some("continue"),
+        AgentSource::Zed => Some("zed"),
+        AgentSource::Goose => Some("goose"),
+        AgentSource::OtherKnown => Some("other_known"),
+        AgentSource::Unknown => Some("unknown"),
     }
 }
 
@@ -2220,12 +2284,6 @@ where
 fn key_has_token(key: &str, token: &str) -> bool {
     key.match_indices(token)
         .any(|(idx, _)| idx == 0 || key.as_bytes()[idx - 1] == b'_')
-}
-
-pub fn is_ci() -> bool {
-    std::env::var_os("CI").is_some()
-        || std::env::var_os("GITHUB_ACTIONS").is_some()
-        || std::env::var_os("GITLAB_CI").is_some()
 }
 
 fn integration_surface(output: OutputFormat) -> IntegrationSurface {
@@ -2370,11 +2428,12 @@ fn followup_kind(workflow: Workflow) -> FollowupKind {
         Workflow::Audit => FollowupKind::Audit,
         Workflow::Security => FollowupKind::Security,
         Workflow::Health => FollowupKind::Health,
-        Workflow::DeadCode => FollowupKind::Check,
+        Workflow::DeadCode | Workflow::Architecture => FollowupKind::Check,
         Workflow::Dupes => FollowupKind::Dupes,
         Workflow::Fix => FollowupKind::Fix,
         Workflow::Explain => FollowupKind::Explain,
-        Workflow::DependencyCleanup
+        Workflow::SimilarCode
+        | Workflow::DependencyCleanup
         | Workflow::CodeQualityReview
         | Workflow::GithubAction
         | Workflow::GitlabCi
@@ -2799,7 +2858,8 @@ mod tests {
     }
 
     fn read_telemetry_doc() -> Option<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/telemetry.md");
+        let path = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?)
+            .join("../../docs/telemetry.md");
         std::fs::read_to_string(path).ok()
     }
 
@@ -2931,10 +2991,12 @@ mod tests {
         for workflow in [
             Workflow::Audit,
             Workflow::DeadCode,
+            Workflow::Architecture,
             Workflow::Health,
             Workflow::Dupes,
             Workflow::CodeQualityReview,
             Workflow::Security,
+            Workflow::SimilarCode,
         ] {
             assert!(
                 workflow.surfaces_findings(),
@@ -3234,7 +3296,7 @@ mod tests {
         assert_eq!(kept.first().copied(), Some(6), "oldest of the tail dropped");
         assert_eq!(
             kept.last().copied(),
-            Some((total - 1) as i64),
+            i64::try_from(total - 1).ok(),
             "newest kept"
         );
     }
@@ -3270,11 +3332,11 @@ mod tests {
         );
         assert_eq!(
             kept.first().copied(),
-            Some((total - SPOOL_MAX_EVENTS) as i64)
+            i64::try_from(total - SPOOL_MAX_EVENTS).ok()
         );
         assert_eq!(
             kept.last().copied(),
-            Some((total - 1) as i64),
+            i64::try_from(total - 1).ok(),
             "newest kept"
         );
     }
@@ -3297,19 +3359,90 @@ mod tests {
         );
     }
 
+    /// How many times the post-drop reacquire is retried before the test
+    /// calls the lock genuinely stuck. Generous on purpose: the failure this
+    /// guards against is a release that never becomes visible, not one that
+    /// takes a few milliseconds under load.
+    const RELEASE_VISIBILITY_ATTEMPTS: u32 = 50;
+    const RELEASE_VISIBILITY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
     #[test]
     fn spool_lock_excludes_concurrent_acquire() {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_path = dir.path().join(SPOOL_LOCK_NAME);
-        let first = SpoolLock::try_acquire(&lock_path).expect("first acquire");
+        // Assert on WHY each acquire failed, not just that it failed. An
+        // environment that cannot open the lock file at all would otherwise
+        // report "the lock was still held after its holder dropped", pointing
+        // at a lock-release bug that is not there.
+        let first = match SpoolLock::acquire(&lock_path) {
+            Ok(lock) => lock,
+            Err(err) => panic!("first acquire should take a free lock, got {err:?}"),
+        };
+        match SpoolLock::acquire(&lock_path) {
+            Err(SpoolLockUnavailable::Contended) => {}
+            Ok(_) => panic!("second acquire should contend while the first is held"),
+            Err(SpoolLockUnavailable::Unusable(err)) => {
+                panic!("second acquire should contend, not fail to open the lock file: {err}")
+            }
+        }
+        drop(first);
+        // Retry the post-drop reacquire instead of demanding it succeed on the
+        // first attempt. Dropping the holder closes the descriptor, but the
+        // kernel does not promise the release is visible to the next
+        // `flock` immediately, and under a loaded parallel test run it
+        // measurably is not (issue #2460: this assertion is the one that fires,
+        // and it fires as Contended, meaning the file opened fine and the lock
+        // was simply still held).
+        //
+        // Retrying is honest rather than a mask because production never needs
+        // the guarantee this used to assert. Both callers of `try_acquire`
+        // (`trim_spool_if_oversized` and the drain) treat contention as "skip,
+        // the next run picks it up", so a release that becomes visible a
+        // moment later costs nothing. What still matters, and is still
+        // asserted, is that the lock DOES come free once its holder is gone.
+        let mut reacquired = None;
+        for _ in 0..RELEASE_VISIBILITY_ATTEMPTS {
+            match SpoolLock::acquire(&lock_path) {
+                Ok(lock) => {
+                    reacquired = Some(lock);
+                    break;
+                }
+                Err(SpoolLockUnavailable::Contended) => {
+                    std::thread::sleep(RELEASE_VISIBILITY_BACKOFF);
+                }
+                Err(SpoolLockUnavailable::Unusable(err)) => panic!(
+                    "lock file became unusable between acquires, which is an environment \
+                     failure rather than a locking failure: {err}"
+                ),
+            }
+        }
+        assert!(
+            reacquired.is_some(),
+            "lock never came free after the holder dropped, across {RELEASE_VISIBILITY_ATTEMPTS} \
+             attempts over {:?}",
+            RELEASE_VISIBILITY_BACKOFF * RELEASE_VISIBILITY_ATTEMPTS,
+        );
+    }
+
+    #[test]
+    fn spool_lock_reports_an_unusable_lock_file_separately_from_contention() {
+        // A directory that does not exist stands in for every environment
+        // failure that reaches the same code path: a read-only parent, a
+        // permissions denial, or a descriptor limit. None of them mean another
+        // process holds the lock, and the production caller logs this case
+        // instead of silently skipping every drain.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_path = dir.path().join("missing-parent").join(SPOOL_LOCK_NAME);
+        match SpoolLock::acquire(&lock_path) {
+            Err(SpoolLockUnavailable::Unusable(_)) => {}
+            Ok(_) => panic!("a lock file under a missing directory should not be acquirable"),
+            Err(SpoolLockUnavailable::Contended) => {
+                panic!("an unopenable lock file must not be reported as contention")
+            }
+        }
         assert!(
             SpoolLock::try_acquire(&lock_path).is_none(),
-            "second acquire should contend while the first is held",
-        );
-        drop(first);
-        assert!(
-            SpoolLock::try_acquire(&lock_path).is_some(),
-            "lock should be free after the holder drops",
+            "the Option-returning caller still declines the lock"
         );
     }
 
@@ -3874,6 +4007,18 @@ mod tests {
     // --- field_purposes and transport_headers (lines 1398-1532) ---
 
     #[test]
+    fn findings_present_purpose_lists_every_standalone_workflow() {
+        let purposes = field_purposes();
+        let (_, purpose) = purposes
+            .iter()
+            .find(|(field, _)| *field == "findings_present")
+            .expect("findings_present purpose");
+        for workflow in ["dead_code", "architecture", "dupes", "health", "security"] {
+            assert!(purpose.contains(workflow), "{workflow}: {purpose}");
+        }
+    }
+
+    #[test]
     fn field_purposes_is_non_empty_and_unique() {
         let purposes = field_purposes();
         assert!(
@@ -4069,7 +4214,7 @@ mod tests {
     fn invocation_context_is_ci_when_agent_source_is_none_and_ci_is_set() {
         // We cannot safely mutate env vars in parallel tests. However, we can
         // exercise the pure helper classify_agent_source_from_env with no keys,
-        // which yields AgentSource::None, and then observe that is_ci() returns
+        // which yields AgentSource::None, and then observe that `ci_env::is_ci()` returns
         // a bool based on the actual env (which may or may not be CI).
         // The function classify_invocation_context() itself reads env directly, so
         // we verify the surrounding pure helpers cover the branches instead.

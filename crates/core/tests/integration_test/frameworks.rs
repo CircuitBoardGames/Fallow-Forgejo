@@ -988,6 +988,40 @@ fn vite_array_aliases_from_config_resolve_internal_modules() {
     );
 }
 
+/// An alias replacement can call a same-file path helper with one literal
+/// argument. The helper body is a path expression that the parser reads.
+#[test]
+fn vite_alias_replacement_through_local_path_helper_resolves() {
+    let root = fixture_path("vite-alias-helper-replacement");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unlisted_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|u| u.dep.package_name.as_str())
+        .collect();
+    for alias in ["local-widget", "local-format"] {
+        assert!(
+            !unlisted_names.contains(&alias),
+            "alias {alias} must not be an unlisted dependency: {unlisted_names:?}"
+        );
+    }
+
+    let unused_file_paths: Vec<String> = results
+        .unused_files
+        .iter()
+        .filter_map(|f| f.file.path.strip_prefix(&root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    for file in ["src/widget.ts", "src/format.ts"] {
+        assert!(
+            !unused_file_paths.contains(&file.to_string()),
+            "{file} must be reachable through the alias: {unused_file_paths:?}"
+        );
+    }
+}
+
 #[test]
 fn webpack_aliases_from_config_resolve_internal_modules() {
     let root = fixture_path("webpack-alias-project");
@@ -1267,6 +1301,58 @@ fn nuxt_default_scan_keeps_nested_plugin_index_but_not_nested_helpers() {
         assert!(
             !unused_file_names.contains(&expected_used.to_string()),
             "{expected_used} should stay reachable via Nuxt default scanning: {unused_file_names:?}"
+        );
+    }
+}
+
+#[test]
+fn nuxt_convention_dirs_credit_only_the_files_nuxt_scans() {
+    let root = fixture_path("nuxt-convention-dir-depth");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| {
+            f.file
+                .path
+                .strip_prefix(&root)
+                .unwrap_or(&f.file.path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+
+    for expected_unused in [
+        "plugins/foo/helper.ts",
+        "plugins/foo/deep/index.ts",
+        "middleware/admin/guard.ts",
+        "modules/kit/internal/helper.ts",
+        "layers/base/plugins/nested/helper.ts",
+        "layers/base/middleware/nested/guard.ts",
+    ] {
+        assert!(
+            unused.contains(&expected_unused.to_string()),
+            "{expected_unused} is not a Nuxt convention file, so it is unused: {unused:?}"
+        );
+    }
+
+    for expected_used in [
+        "plugins/bar.ts",
+        "plugins/foo/index.ts",
+        "plugins/foo/explicit.ts",
+        "middleware/auth.ts",
+        "middleware/admin/index.ts",
+        "modules/local.ts",
+        "modules/kit/index.ts",
+        "modules/kit/runtime/plugin.ts",
+        "layers/base/plugins/layer.ts",
+        "layers/base/middleware/layer-auth.ts",
+    ] {
+        assert!(
+            !unused.contains(&expected_used.to_string()),
+            "{expected_used} is scanned or registered by Nuxt: {unused:?}"
         );
     }
 }
@@ -1960,5 +2046,53 @@ fn wrangler_plain_json_config_main_keeps_worker_alive() {
     assert!(
         !unused_files.iter().any(|path| path == "src/worker.tsx"),
         "wrangler.json main should be an entry point: {unused_files:?}"
+    );
+}
+
+#[test]
+fn sveltekit_3_framework_loaded_files_are_entry_points() {
+    let root = fixture_path("sveltekit-3-project");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_files: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| f.file.path.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    for convention in [
+        "src/params.ts",
+        "src/env.ts",
+        "src/instrumentation.server.ts",
+        "src/service-worker/index.ts",
+        "src/routes/api/remote.ts",
+    ] {
+        assert!(
+            !unused_files.iter().any(|path| path.ends_with(convention)),
+            "{convention} is loaded by SvelteKit 3, not imported: {unused_files:?}"
+        );
+    }
+
+    let unused_exports: Vec<&str> = results
+        .unused_exports
+        .iter()
+        .map(|e| e.export.export_name.as_str())
+        .collect();
+    for framework_read in ["params", "variables", "health", "QUERY"] {
+        assert!(
+            !unused_exports.contains(&framework_read),
+            "{framework_read} is read by SvelteKit 3, not imported: {unused_exports:?}"
+        );
+    }
+
+    let unused_dependencies: Vec<&str> = results
+        .unused_dependencies
+        .iter()
+        .map(|d| d.dep.package_name.as_str())
+        .collect();
+    assert!(
+        !unused_dependencies.contains(&"@sveltejs/adapter-node"),
+        "the adapter is referenced from vite.config.ts in SvelteKit 3: {unused_dependencies:?}"
     );
 }

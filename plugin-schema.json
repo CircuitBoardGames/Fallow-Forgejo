@@ -57,6 +57,14 @@
       },
       "default": []
     },
+    "configDefaultExportOptOut": {
+      "description": "Entries of `configPatterns` whose files do not get the `default`\nexport credit under `includeEntryExports`. Use it when the tool reads\nnamed exports, or when the pattern also matches ordinary source files.\nWrite each entry exactly as in `configPatterns`. Other entries have\nno effect.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
     "alwaysUsed": {
       "description": "Files that are always considered \"used\" when this plugin is active.",
       "type": "array",
@@ -101,13 +109,13 @@
           "description": "Plugin detected if this package is in dependencies.",
           "type": "object",
           "properties": {
-            "package": {
-              "description": "Exact package name looked up in the project's declared dependencies.",
-              "type": "string"
-            },
             "type": {
               "type": "string",
               "const": "dependency"
+            },
+            "package": {
+              "description": "Exact package name looked up in the project's declared dependencies.",
+              "type": "string"
             }
           },
           "required": [
@@ -119,13 +127,13 @@
           "description": "Plugin detected if this file pattern matches.",
           "type": "object",
           "properties": {
-            "pattern": {
-              "description": "Project-root-relative glob; the plugin activates when any\ndiscovered file matches it. Validated at load like other user\nglobs (no absolute paths or `..` segments).",
-              "type": "string"
-            },
             "type": {
               "type": "string",
               "const": "fileExists"
+            },
+            "pattern": {
+              "description": "Project-root-relative glob; the plugin activates when any\ndiscovered file matches it. Validated at load like other user\nglobs (no absolute paths or `..` segments).\nA single `*` stays within one path segment; use `**` to match across directories.",
+              "type": "string"
             }
           },
           "required": [
@@ -137,16 +145,16 @@
           "description": "All conditions must be true.",
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "all"
+            },
             "conditions": {
               "description": "Sub-conditions combined with logical AND.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/PluginDetection"
               }
-            },
-            "type": {
-              "type": "string",
-              "const": "all"
             }
           },
           "required": [
@@ -158,16 +166,16 @@
           "description": "Any condition must be true.",
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "any"
+            },
             "conditions": {
               "description": "Sub-conditions combined with logical OR.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/PluginDetection"
               }
-            },
-            "type": {
-              "type": "string",
-              "const": "any"
             }
           },
           "required": [
@@ -202,7 +210,7 @@
       "type": "object",
       "properties": {
         "manifests": {
-          "description": "Recursive glob selecting the manifest files to read (e.g. `**/kibana.jsonc`).",
+          "description": "Recursive glob selecting the manifest files to read (e.g. `**/kibana.jsonc`).\nA single `*` stays within one path segment; use `**` to match across directories.",
           "type": "string"
         },
         "format": {
@@ -211,9 +219,11 @@
           "default": "jsonc"
         },
         "when": {
-          "description": "Manifest-level gate: a map of dotted field path to an expected scalar\nvalue. ALL entries must match by STRICT EQUALITY for the manifest to be\nprocessed. An empty map matches every manifest.",
+          "description": "Manifest-level gate: a map of field path to an equality expectation or\nan explicit `exists` predicate. Paths use dotted object keys and may\ntraverse arrays with `[*]`. ALL entries must match; a wildcard equality\nmatches when any yielded value equals the expectation. An empty map\nmatches every manifest.",
           "type": "object",
-          "additionalProperties": true,
+          "additionalProperties": {
+            "$ref": "#/$defs/ManifestCondition"
+          },
           "default": {}
         },
         "entries": {
@@ -244,18 +254,46 @@
         }
       ]
     },
+    "ManifestCondition": {
+      "description": "A typed condition used by a manifest entry gate.\n\nPlain JSON values retain strict equality semantics. The reserved\n`{ \"exists\": bool }` object tests field presence without truthiness.",
+      "anyOf": [
+        {
+          "description": "Require the field path to resolve (`true`) or not resolve (`false`).",
+          "$ref": "#/$defs/ManifestExistsPredicate"
+        },
+        {
+          "description": "Require at least one yielded value to equal this JSON value exactly."
+        }
+      ]
+    },
+    "ManifestExistsPredicate": {
+      "description": "The explicit field-presence predicate accepted by [`ManifestCondition`].",
+      "type": "object",
+      "properties": {
+        "exists": {
+          "description": "Whether the field path must resolve to at least one value.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "exists"
+      ]
+    },
     "ManifestSeedRule": {
       "description": "A single entry seeded by a [`ManifestEntryRule`], resolved relative to the\nmanifest's directory.",
       "type": "object",
       "properties": {
         "path": {
-          "description": "Entry glob relative to the manifest directory. May contain\n`${dotted.field}` interpolation that fans out over string / array\nmanifest field values (a missing or empty field seeds nothing). The glob\nmust encode its own extension (e.g. `public/index.{ts,tsx}`); glob entry\npatterns are matched literally against discovered files without\nsource-extension probing.",
+          "description": "Entry glob relative to the manifest directory. May contain\n`${dotted.field}` interpolation that fans out over string / array\nmanifest field values; `[*]` traverses object arrays. A missing or empty\nfield seeds nothing. The glob must encode its own extension, such as\n`public/index.{ts,tsx}`. Glob entry patterns are matched literally\nagainst discovered files without\nsource-extension probing.",
           "type": "string"
         },
         "when": {
-          "description": "Per-entry gate (strict equality), evaluated against the same manifest.\nAn empty map always passes.",
+          "description": "Per-entry gate, using the same strict equality and `[*]` traversal as the\nmanifest-level gate. An empty map always passes.",
           "type": "object",
-          "additionalProperties": true,
+          "additionalProperties": {
+            "$ref": "#/$defs/ManifestCondition"
+          },
           "default": {}
         }
       },
@@ -268,7 +306,7 @@
       "type": "object",
       "properties": {
         "pattern": {
-          "description": "Glob pattern for files.",
+          "description": "Glob pattern for files.\nA single `*` stays within one path segment; use `**` to match across directories.",
           "type": "string"
         },
         "exports": {

@@ -2,22 +2,38 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { runTests } from "@vscode/test-electron";
+import { resolveExtensionDevelopmentPath } from "./extensionPath.js";
 
-const extensionDevelopmentPath = path.resolve(__dirname, "../../../..");
+const repositoryExtensionPath = path.resolve(__dirname, "../../../..");
+const configuredExtensionPath = process.env["FALLOW_EXTENSION_PATH"];
+const extensionDevelopmentPath = resolveExtensionDevelopmentPath(
+  repositoryExtensionPath,
+  configuredExtensionPath,
+);
 const extensionTestsPath = path.resolve(__dirname, "suite/index.js");
-const vscodeTestCachePath = path.join(os.tmpdir(), "fallow-vscode-test-cache");
+const vscodeTestCachePath = path.resolve(
+  process.env["FALLOW_VSCODE_TEST_CACHE_PATH"] ??
+    path.join(os.tmpdir(), "fallow-vscode-test-cache"),
+);
 const fixtureWorkspacePath = path.resolve(
-  extensionDevelopmentPath,
+  repositoryExtensionPath,
   "test/integration/fixtures/real-workspace",
 );
 
 const requiredCurrentBinary = (): string => {
   const configured = process.env["FALLOW_BIN"];
   if (!configured) {
-    throw new Error(
-      "FALLOW_BIN is required for the real VS Code CLI/LSP contract smoke",
-    );
+    throw new Error("FALLOW_BIN is required for the real VS Code CLI/LSP contract smoke");
   }
+
+  const binary = path.resolve(configured);
+  fs.accessSync(binary, fs.constants.X_OK);
+  return binary;
+};
+
+const configuredLspBinary = (): string | undefined => {
+  const configured = process.env["FALLOW_LSP_BIN"];
+  if (!configured) return undefined;
 
   const binary = path.resolve(configured);
   fs.accessSync(binary, fs.constants.X_OK);
@@ -35,20 +51,36 @@ const createWorkspace = (binary: string): string => {
   );
   const vscodeDir = path.join(workspaceDir, ".vscode");
   const binDir = path.join(workspaceDir, "bin");
-  const cliPath = path.join(binDir, "fallow");
-  const lspPath = path.join(binDir, "fallow-lsp");
+  const executableSuffix = process.platform === "win32" ? ".exe" : "";
+  const cliPath = path.join(binDir, `fallow${executableSuffix}`);
+  const lspPath = path.join(binDir, `fallow-lsp${executableSuffix}`);
 
   fs.cpSync(fixtureWorkspacePath, workspaceDir, { recursive: true });
   fs.mkdirSync(vscodeDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
-  fs.symlinkSync(binary, cliPath);
-  writeExecutable(lspPath, '#!/bin/sh\nexec "$FALLOW_BIN" lsp-server\n');
+  const lspBinary = configuredLspBinary();
+  if (process.platform === "win32") {
+    if (!lspBinary) {
+      throw new Error("FALLOW_LSP_BIN is required for the real VS Code Windows contract smoke");
+    }
+    fs.copyFileSync(binary, cliPath);
+    fs.copyFileSync(lspBinary, lspPath);
+  } else {
+    fs.symlinkSync(binary, cliPath);
+    if (lspBinary) {
+      fs.symlinkSync(lspBinary, lspPath);
+    } else {
+      writeExecutable(lspPath, '#!/bin/sh\nexec "$FALLOW_BIN" lsp-server\n');
+    }
+  }
   fs.writeFileSync(
     path.join(vscodeDir, "settings.json"),
     `${JSON.stringify(
       {
         "fallow.autoDownload": false,
         "fallow.lspPath": lspPath,
+        "fallow.typeAware.enabled": true,
+        "fallow.typeAware.require": "complete",
       },
       null,
       2,
@@ -69,7 +101,10 @@ const main = async (): Promise<void> => {
     await runTests({
       cachePath: vscodeTestCachePath,
       extensionDevelopmentPath,
-      extensionTestsEnv: { FALLOW_BIN: binary },
+      extensionTestsEnv: {
+        FALLOW_BIN: binary,
+        ...(configuredExtensionPath ? { FALLOW_EXTENSION_PATH: extensionDevelopmentPath } : {}),
+      },
       extensionTestsPath,
       launchArgs: [
         workspaceDir,
