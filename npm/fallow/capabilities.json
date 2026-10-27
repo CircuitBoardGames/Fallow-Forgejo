@@ -1,6 +1,6 @@
 {
   "name": "fallow",
-  "version": "3.36.0",
+  "version": "3.37.0",
   "manifest_version": "1",
   "description": "Codebase analyzer for TypeScript/JavaScript: unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations",
   "global_flags": [
@@ -1284,6 +1284,16 @@
           "type": "bool",
           "required": false,
           "description": "Type-check each survived mutant through the `--type-aware` companion. A survivor that does not type-check becomes `compile_error` and leaves the score",
+          "possible_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "--resume",
+          "type": "bool",
+          "required": false,
+          "description": "Continue an interrupted or partial run: reuse the killed and confirmed survived mutants in its journal and run only the others. A journal of other inputs exits 2",
           "possible_values": [
             "true",
             "false"
