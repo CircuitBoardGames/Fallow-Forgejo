@@ -1,5 +1,8 @@
 //! Subcommand dispatch for the `fallow` command line.
 
+#[path = "dispatch_coverage_upload.rs"]
+mod coverage_upload;
+
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,18 +22,20 @@ use crate::dupes::{DupesOptions, DupesOverrides};
 use crate::error::emit_error;
 use crate::health::HealthOptions;
 use crate::list::ListOptions;
-use crate::runtime_support::{
-    AnalysisKind, ConfigLoadOptions, LoadConfigArgs, load_config, load_config_for_analysis,
-};
+use crate::runtime_support::{AnalysisKind, LoadConfigArgs, load_config};
 use crate::{
     DEFAULT_MIN_INVOCATIONS_HOT, DispatchContext, audit, audit_cache_prune, base_worktree,
     baseline_gate, baseline_growth, baselines, check, ci, ci_template, cli_report, combined,
-    config, coverage, dupes, error, explain, fix, flags, guard, health, init, inspect, json_style,
-    license, list, migrate, mutation_cli, onboarding, plugin_check, regression,
-    regression_save_targets, report, resolve_audit_baseline_path, rule_pack, security, selector,
-    setup_hooks, similar_code_cli, suppressions, telemetry, trace_chain, trace_dependency,
-    trace_error, trace_path, viz, watch,
+    config, coverage, dupes, error, explain, fix, flags, guard, health, init, json_style, license,
+    list, migrate, mutation_cli, onboarding, plugin_check, regression, regression_save_targets,
+    report, resolve_audit_baseline_path, rule_pack, security, setup_hooks, similar_code_cli,
+    suppressions, telemetry, trace_chain, trace_dependency, trace_error, trace_path, viz, watch,
 };
+
+#[path = "dispatch_inspect.rs"]
+mod inspect_dispatch;
+#[path = "dispatch_type_aware.rs"]
+mod type_aware_status;
 
 fn dispatch_mutation_command(
     dispatch: &DispatchContext<'_>,
@@ -156,12 +161,7 @@ pub fn dispatch_subcommand(command: Command, dispatch: &DispatchContext<'_>) -> 
         Command::Mutation { subcommand, args } => {
             dispatch_mutation_command(dispatch, subcommand, args)
         }
-        Command::Inspect {
-            file,
-            symbol,
-            symbol_chain,
-            churn,
-        } => dispatch_inspect_command(dispatch, file, symbol, symbol_chain, churn),
+        inspect @ Command::Inspect { .. } => inspect_dispatch::dispatch_inspect(dispatch, inspect),
         Command::Trace {
             symbol,
             dependency,
@@ -305,6 +305,9 @@ pub fn dispatch_subcommand(command: Command, dispatch: &DispatchContext<'_>) -> 
         Command::License { subcommand } => {
             dispatch_license_command(subcommand, output, dispatch.json_style)
         }
+        Command::Cloud { subcommand } => {
+            inspect_dispatch::dispatch_cloud(subcommand, output, dispatch.json_style)
+        }
         Command::Telemetry { .. } => unreachable!("handled before root validation"),
         Command::Coverage { subcommand } => dispatch_coverage_command(dispatch, &subcommand),
         setup_hooks @ Command::SetupHooks { .. } => {
@@ -348,12 +351,7 @@ fn dispatch_type_aware_command(
                             "{}",
                             report::human_status_line(
                                 report::HumanStatus::Ok,
-                                format_args!(
-                                    "Type-aware companion: available ({}, protocol {}, TypeScript {})",
-                                    status.package_version.as_deref().unwrap_or("unknown"),
-                                    status.protocol_version,
-                                    status.backend_version.as_deref().unwrap_or("unknown"),
-                                )
+                                type_aware_status::available_message(&status),
                             )
                         );
                     } else {
@@ -687,81 +685,6 @@ fn enable_check_filter(filters: &mut IssueFilters, flag: &str, active: bool) {
             "check command uses unregistered dead-code filter flag {flag}"
         );
     }
-}
-
-fn dispatch_inspect_command(
-    dispatch: &DispatchContext<'_>,
-    file: Option<String>,
-    symbol: Option<String>,
-    symbol_chain: bool,
-    churn: bool,
-) -> ExitCode {
-    let target = match (file, symbol) {
-        (Some(file), None) => inspect::InspectTarget::File { file },
-        (None, Some(symbol)) => match selector::parse_file_symbol_selector(&symbol) {
-            Some((file, export_name)) => inspect::InspectTarget::Symbol {
-                file: file.to_string(),
-                export_name: export_name.to_string(),
-            },
-            None => {
-                return emit_error(
-                    "--symbol must be formatted as FILE:EXPORT",
-                    2,
-                    dispatch.output,
-                );
-            }
-        },
-        _ => {
-            return emit_error(
-                "inspect requires exactly one of --file or --symbol",
-                2,
-                dispatch.output,
-            );
-        }
-    };
-
-    let churn_config = if churn {
-        match load_config_for_analysis(
-            dispatch.root,
-            &dispatch.cli.config,
-            ConfigLoadOptions {
-                output: dispatch.output,
-                no_cache: dispatch.cli.no_cache,
-                threads: dispatch.threads,
-                production_override: None,
-                quiet: dispatch.quiet,
-                allow_remote_extends: dispatch.cli.allow_remote_extends,
-            },
-            fallow_config::ProductionAnalysis::Health,
-        ) {
-            Ok(config) => Some(config),
-            Err(code) => return code,
-        }
-    } else {
-        None
-    };
-
-    inspect::run_inspect(&inspect::InspectOptions {
-        root: dispatch.root,
-        config_path: dispatch.cli.config.as_ref(),
-        output: dispatch.output,
-        json_style: dispatch.json_style,
-        no_cache: dispatch.cli.no_cache,
-        no_production: dispatch.cli.no_production,
-        max_file_size: dispatch.cli.max_file_size,
-        threads: dispatch.threads,
-        quiet: dispatch.quiet,
-        production: dispatch.cli.production,
-        workspace: dispatch.cli.workspace.as_ref(),
-        target,
-        churn_cache_dir: churn_config
-            .as_ref()
-            .map(|config| config.cache_dir.as_path()),
-        symbol_chain,
-        type_aware: dispatch.cli.type_aware_override(),
-        type_aware_projects: &dispatch.cli.type_aware_project,
-        type_aware_require: dispatch.cli.type_aware_require.map(Into::into),
-    })
 }
 
 /// The call-chain flags of `fallow trace FILE:SYMBOL`.
@@ -1289,6 +1212,7 @@ fn dispatch_health_command(command: Command, dispatch: &DispatchContext<'_>) -> 
         max_cyclomatic,
         max_cognitive,
         max_crap,
+        max_file_lines,
         top,
         sort,
         complexity,
@@ -1336,6 +1260,7 @@ fn dispatch_health_command(command: Command, dispatch: &DispatchContext<'_>) -> 
         max_cyclomatic,
         max_cognitive,
         max_crap,
+        max_file_lines,
         top,
         sort,
         complexity,
@@ -1576,10 +1501,10 @@ fn dispatch_baselines_command(
     let cli = dispatch.cli;
     let root = dispatch.root;
     let output = dispatch.output;
-    if let Some(flag) = baselines_prune_narrowing_flag(cli) {
+    if let Some(flag) = baselines::narrowing_flag(cli) {
         return emit_error(
             &format!(
-                "`fallow baselines prune` always analyzes the whole project, so it does not accept `{flag}`. A narrowed run would remove valid entries."
+                "`fallow baselines prune` runs one analysis over the whole project, in production mode with --production or config, so it does not accept `{flag}`. A narrowed run would remove valid entries."
             ),
             2,
             output,
@@ -1609,23 +1534,11 @@ fn dispatch_baselines_command(
         Ok(config) => config,
         Err(code) => return code,
     };
-    let targets = baselines::BaselineTargets {
-        dead_code: resolve_audit_baseline_path(
-            root,
-            dead_code_baseline.as_deref(),
-            config.audit.dead_code_baseline.as_deref(),
-        ),
-        health: resolve_audit_baseline_path(
-            root,
-            health_baseline.as_deref(),
-            config.audit.health_baseline.as_deref(),
-        ),
-        dupes: resolve_audit_baseline_path(
-            root,
-            dupes_baseline.as_deref(),
-            config.audit.dupes_baseline.as_deref(),
-        ),
-    };
+    let targets = baselines::prune_targets(
+        root,
+        &config.audit,
+        [dead_code_baseline, health_baseline, dupes_baseline],
+    );
     if targets.dead_code.is_none() && targets.health.is_none() && targets.dupes.is_none() {
         return emit_error(
             "no baseline to prune. Set `audit.deadCodeBaseline`, `audit.healthBaseline` or `audit.dupesBaseline` in the config, or pass --dead-code-baseline, --health-baseline or --dupes-baseline",
@@ -1658,28 +1571,14 @@ fn dispatch_baselines_command(
         check: *check,
         targets,
         production,
+        mode_flags: fallow_output::BaselineMode {
+            production: cli.production,
+            include_entry_exports: cli.include_entry_exports,
+        },
         coverage: coverage_inputs.coverage.as_deref(),
         coverage_root: coverage_inputs.coverage_root.as_deref(),
         regression_opts: dispatch.regression_opts(true),
     })
-}
-
-/// The first flag or environment variable that would narrow the prune run.
-fn baselines_prune_narrowing_flag(cli: &Cli) -> Option<&'static str> {
-    [
-        (cli.changed_since.is_some(), "--changed-since"),
-        (cli.workspace.is_some(), "--workspace"),
-        (cli.changed_workspaces.is_some(), "--changed-workspaces"),
-        (cli.diff_file.is_some(), "--diff-file"),
-        (cli.diff_stdin, "--diff-stdin"),
-        (
-            std::env::var_os("FALLOW_DIFF_FILE").is_some_and(|value| !value.is_empty()),
-            "FALLOW_DIFF_FILE",
-        ),
-        (cli.production, "--production"),
-    ]
-    .into_iter()
-    .find_map(|(present, flag)| present.then_some(flag))
 }
 
 fn dispatch_flags_command(
@@ -1992,14 +1891,12 @@ fn map_coverage_subcommand(
     base: Option<&str>,
 ) -> coverage::CoverageSubcommand {
     match sub {
-        CoverageCli::Setup {
-            yes,
-            non_interactive,
-            json,
-        } => map_coverage_setup(*yes, *non_interactive, *json, explain),
+        CoverageCli::Setup { args } => args.to_subcommand(explain),
         CoverageCli::Analyze { .. } => map_coverage_analyze(sub),
-        CoverageCli::UploadInventory { .. } => map_coverage_upload_inventory(sub),
-        CoverageCli::UploadSourceMaps { .. } => map_coverage_upload_source_maps(sub),
+        CoverageCli::UploadInventory { .. } => coverage_upload::map_coverage_upload_inventory(sub),
+        CoverageCli::UploadSourceMaps { .. } => {
+            coverage_upload::map_coverage_upload_source_maps(sub)
+        }
         CoverageCli::UploadStaticFindings { .. } => map_coverage_upload_static_findings(sub),
         CoverageCli::ReviewPacket {
             api_key,
@@ -2040,20 +1937,6 @@ fn map_coverage_subcommand(
             cursor: cursor.clone(),
         }),
     }
-}
-
-fn map_coverage_setup(
-    yes: bool,
-    non_interactive: bool,
-    json: bool,
-    explain: bool,
-) -> coverage::CoverageSubcommand {
-    coverage::CoverageSubcommand::Setup(coverage::SetupArgs {
-        yes,
-        non_interactive: non_interactive || json,
-        json,
-        explain,
-    })
 }
 
 fn map_coverage_analyze(sub: &CoverageCli) -> coverage::CoverageSubcommand {
@@ -2097,66 +1980,6 @@ fn map_coverage_analyze(sub: &CoverageCli) -> coverage::CoverageSubcommand {
         blast_radius: *blast_radius,
         importance: *importance,
         debug_unmatched: *debug_unmatched,
-    })
-}
-
-fn map_coverage_upload_inventory(sub: &CoverageCli) -> coverage::CoverageSubcommand {
-    let CoverageCli::UploadInventory {
-        api_key,
-        api_endpoint,
-        project_id,
-        git_sha,
-        allow_dirty,
-        exclude_paths,
-        path_prefix,
-        dry_run,
-        with_callers,
-        ignore_upload_errors,
-    } = sub
-    else {
-        unreachable!("coverage inventory mapper called with non-inventory variant");
-    };
-    coverage::CoverageSubcommand::UploadInventory(coverage::UploadInventoryArgs {
-        api_key: api_key.clone(),
-        api_endpoint: api_endpoint.clone(),
-        project_id: project_id.clone(),
-        git_sha: git_sha.clone(),
-        allow_dirty: *allow_dirty,
-        exclude_paths: exclude_paths.clone(),
-        path_prefix: path_prefix.clone(),
-        dry_run: *dry_run,
-        with_callers: *with_callers,
-        ignore_upload_errors: *ignore_upload_errors,
-    })
-}
-
-fn map_coverage_upload_source_maps(sub: &CoverageCli) -> coverage::CoverageSubcommand {
-    let CoverageCli::UploadSourceMaps {
-        dir,
-        include,
-        exclude,
-        repo,
-        git_sha,
-        endpoint,
-        strip_path,
-        dry_run,
-        concurrency,
-        fail_fast,
-    } = sub
-    else {
-        unreachable!("coverage source-map mapper called with non-source-map variant");
-    };
-    coverage::CoverageSubcommand::UploadSourceMaps(coverage::UploadSourceMapsArgs {
-        dir: dir.clone(),
-        include: include.clone(),
-        exclude: exclude.clone(),
-        repo: repo.clone(),
-        git_sha: git_sha.clone(),
-        endpoint: endpoint.clone(),
-        strip_path: *strip_path,
-        dry_run: *dry_run,
-        concurrency: *concurrency,
-        fail_fast: *fail_fast,
     })
 }
 
@@ -2649,6 +2472,7 @@ struct ResolvedAuditInputs {
     /// base passes score from the same map the standalone health run uses.
     coverage: Option<PathBuf>,
     coverage_root: Option<PathBuf>,
+    file_lines_check: bool,
 }
 
 fn dispatch_audit(dispatch: &DispatchContext<'_>, args: &AuditDispatchArgs) -> ExitCode {
@@ -2730,6 +2554,7 @@ fn resolve_audit_inputs(
     )?;
     let cache_dir = config.cache_dir.clone();
     let audit_cfg = config.audit;
+    let file_lines_check = config.health.file_lines_check_enabled();
     let production = resolve_production_modes(
         cli,
         root,
@@ -2798,6 +2623,7 @@ fn resolve_audit_inputs(
         dupes_baseline: resolved_dupes_baseline,
         coverage: coverage_inputs.coverage,
         coverage_root: coverage_inputs.coverage_root,
+        file_lines_check,
     })
 }
 
@@ -2898,6 +2724,7 @@ fn run_resolved_audit(
             health_baseline_mode: cli.baseline_mode.unwrap_or_default().into(),
             fail_on_stale_baseline: cli.fail_on_stale_baseline,
             max_crap: args.max_crap,
+            file_lines_check: inputs.file_lines_check,
             coverage: inputs.coverage.as_deref(),
             coverage_root: inputs.coverage_root.as_deref(),
             gate: args.gate.map_or(inputs.audit_cfg.gate, Into::into),
@@ -2998,71 +2825,15 @@ fn decision_surface_audit_args(max_decisions: usize) -> AuditDispatchArgs {
     }
 }
 
-fn decision_surface_audit_options<'a>(
-    dispatch: &'a DispatchContext<'a>,
-    inputs: &'a ResolvedAuditInputs,
-    max_decisions: usize,
-) -> audit::AuditOptions<'a> {
-    let cli = dispatch.cli;
-    audit::AuditOptions {
-        root: dispatch.root,
-        config_path: &cli.config,
-        cache_dir: &inputs.cache_dir,
-        output: dispatch.output,
-        json_style: dispatch.json_style,
-        no_cache: cli.no_cache,
-        threads: dispatch.threads,
-        quiet: dispatch.quiet,
-        allow_remote_extends: cli.allow_remote_extends,
-        changed_since: cli.changed_since.as_deref(),
-        production: cli.production,
-        production_dead_code: Some(inputs.production.dead_code),
-        production_health: Some(inputs.production.health),
-        production_dupes: Some(inputs.production.dupes),
-        workspace: cli.workspace.as_deref(),
-        changed_workspaces: cli.changed_workspaces.as_deref(),
-        explain: cli.explain,
-        explain_skipped: cli.explain_skipped,
-        performance: cli.performance,
-        group_by: cli.group_by,
-        dead_code_baseline: inputs.dead_code_baseline.as_deref(),
-        health_baseline: inputs.health_baseline.as_deref(),
-        dupes_baseline: inputs.dupes_baseline.as_deref(),
-        health_baseline_mode: cli.baseline_mode.unwrap_or_default().into(),
-        // The decision surface renders the apex brief through
-        // `run_decision_surface`, which owns no exit gates and prints no gate
-        // lines, so the flag has nothing to say on this path.
-        fail_on_stale_baseline: false,
-        max_crap: None,
-        coverage: None,
-        coverage_root: None,
-        gate: inputs.audit_cfg.gate,
-        worsened: inputs.audit_cfg.worsened,
-        include_entry_exports: cli.include_entry_exports,
-        show_cascade: cli.show_cascade,
-        fail_on_parse_error: false,
-        analyses: audit::AuditAnalysisSelection::ALL,
-        // Decision-surface (brief apex) does not render styling; keep it lean.
-        css: false,
-        css_deep: false,
-        runtime_coverage: None,
-        min_invocations_hot: 0,
-        brief: true,
-        max_decisions,
-        walkthrough_guide: false,
-        walkthrough: false,
-        mark_viewed: &[],
-        show_cleared: false,
-        walkthrough_file: None,
-        show_deprioritized: false,
-        scope: None,
-    }
-}
+#[path = "dispatch_decision_surface.rs"]
+mod decision_surface_options;
+use decision_surface_options::*;
 
 struct HealthDispatchArgs<'a> {
     max_cyclomatic: Option<u16>,
     max_cognitive: Option<u16>,
     max_crap: Option<f64>,
+    max_file_lines: Option<u32>,
     top: Option<usize>,
     sort: health::SortBy,
     complexity: bool,
@@ -3312,6 +3083,7 @@ fn health_threshold_overrides(
         max_cyclomatic: args.max_cyclomatic,
         max_cognitive: args.max_cognitive,
         max_crap: args.max_crap,
+        max_file_lines: args.max_file_lines,
     }
 }
 

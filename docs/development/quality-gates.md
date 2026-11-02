@@ -248,6 +248,28 @@ When a guessed companion path is absent, the check prints `skipped:` with the
 path it tried. It still reports a missing expected document when the companion
 checkout exists.
 
+### Test temp directory
+
+On Unix hosts, `cargo nextest run` gives each run its own `TMPDIR`. The setup
+script `scripts/nextest-run-tmpdir.sh` creates the directory. It also removes
+each run directory that has not changed for two hours, because nothing removes
+a directory at the end of its run. `.config/nextest.toml` attaches the script
+to the `default` profile, and the other profiles inherit it. The config needs
+nextest 0.9.123 or later.
+
+The reason is the audit base snapshot cache. Each `fallow audit` in the suite
+leaves one cache entry in the temp directory, and each later audit probes all
+entries. The fixture of a test is gone after the test, so its entry stays for
+the 30-day age limit. In a shared temp directory, a local suite run then
+spends most of its audit time on this probe. `cargo test` does not run the
+setup script, so it keeps the shared temp directory.
+
+On a long-lived host, the entries of earlier runs stay in the shared temp
+directory until their age limit. To remove them once, run
+`fallow audit-cache prune --max-age-days 0` from a repository. With age `0`,
+the command removes the entries whose recorded owner directory is gone. Add
+`--dry-run` to see the decisions first.
+
 ## CI placement
 
 The repository uses the GitHub free plan: 20 concurrent jobs, and 5 of them on
@@ -347,8 +369,10 @@ The slowest `CI` jobs have parts that run in parallel:
   and the platform Clippy pass. `Windows drift harness` runs the drift harness
   on Windows. The two Windows jobs have the same trigger.
 - `Miri` runs `cargo miri test` for `fallow-types`, `fallow-graph` and
-  `fallow-extract` as three parallel processes in one step. The Miri
-  interpreter uses one core, so the job takes as long as the slowest crate.
+  `fallow-extract` as parallel processes in one step. The Miri interpreter
+  uses one core, so the job takes as long as the slowest process.
+  `fallow-graph` runs as three shards with test name filters. The last shard
+  skips every filter of the other two, so each test runs exactly once.
   Do not use `cargo miri nextest run`: it starts a new Miri process for each
   test, and each start costs seconds. A test that only checks safe logic at
   scale gets `#[cfg_attr(miri, ignore = "too slow under Miri: ...")]`. Miri

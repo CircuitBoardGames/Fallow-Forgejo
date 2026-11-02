@@ -12,6 +12,7 @@ mod ignore_patterns;
 mod legacy_glob;
 mod markup_extensions;
 mod mutation;
+mod override_effect;
 mod parsing;
 mod resolution;
 mod resolve;
@@ -54,6 +55,7 @@ pub use markup_extensions::{
     DEFAULT_MARKUP_EXTENSIONS, resolve_markup_extensions, template_markup_extension,
 };
 pub use mutation::{MutationConfig, MutationOperatorName, MutationRunner};
+pub use override_effect::{IneffectiveOverrideRule, project_level_override_rules};
 pub use parsing::{CONFIG_FILE_NAMES, ConfigLoadOptions};
 pub use resolution::{
     AnalysisSnapshot, CACHE_DIR_ENV, CACHE_MAX_SIZE_ENV, CompiledIgnoreCatalogReferenceRule,
@@ -335,7 +337,7 @@ pub struct FallowConfig {
     #[schemars(schema_with = "extends_schema")]
     pub extends: Vec<String>,
 
-    /// An array of project-root-relative glob patterns whose matching files are seeded as manual entry points, on top of the framework and package.json entries fallow discovers automatically, so their transitive imports are not reported as unused. Set it (e.g. `["src/main.ts"]`) when a file is a real runtime root that no plugin or manifest declares; patterns are validated at load and matched against discovered files. A single `*` stays within one path segment; use `**` to match across directories.
+    /// An array of project-root-relative glob patterns whose matching files are seeded as manual entry points, on top of the framework and package.json entries fallow discovers automatically, so their transitive imports are not reported as unused. Set it (e.g. `["src/main.ts"]`) when a file is a real runtime root that no plugin or manifest declares; patterns are validated at load and matched against discovered files. For a script that does not run in production, use a `framework[]` entry with `entryPointRole: "support"` and leave its glob out of `entry`: a file that also matches `entry` stays a runtime root. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub entry: Vec<String>,
 
@@ -347,7 +349,7 @@ pub struct FallowConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_findings: Vec<String>,
 
-    /// Declares inline external framework plugins as data (array of plugin objects), each with `name` plus optional `enablers` (package names that activate it) or richer `detection` (dependency/file-existence/`all`/`any` checks, taking priority over `enablers`), `entryPoints` (+ `entryPointRole` runtime/support/test), `configPatterns`, `alwaysUsed`, `toolingDependencies`, `usedExports` (`{ pattern, exports }`), and `usedClassMembers`. Set it to keep a custom or in-house framework's entry points, config files, and conventions reachable without a Rust plugin; these definitions are appended to plugins discovered via `plugins`, `.fallow/plugins/`, and root `fallow-plugin-*` files (first occurrence of a name wins), and cannot do AST-based config parsing.
+    /// Declares inline external framework plugins as data (array of plugin objects), each with `name` plus optional `enablers` (package names that activate it) or richer `detection` (dependency/file-existence/`all`/`any` checks, taking priority over `enablers`); an entry with neither never activates, and config load warns. Each entry can also have `entryPoints` (+ `entryPointRole` runtime/support/test), `configPatterns`, `alwaysUsed`, `toolingDependencies`, `usedExports` (`{ pattern, exports }`), and `usedClassMembers`. Set it to keep a custom or in-house framework's entry points, config files, and conventions reachable without a Rust plugin; these definitions are appended to plugins discovered via `plugins`, `.fallow/plugins/`, and root `fallow-plugin-*` files (first occurrence of a name wins), and cannot do AST-based config parsing.
     #[serde(default)]
     pub framework: Vec<ExternalPluginDef>,
 
@@ -410,7 +412,7 @@ pub struct FallowConfig {
     #[serde(default, skip_serializing_if = "MutationConfig::is_default")]
     pub mutation: MutationConfig,
 
-    /// Sets complexity and health thresholds for `fallow health` (also applied in combined `fallow` and `fallow audit`): `maxCyclomatic` (20), `maxCognitive` (15), `maxCrap` (30.0, findings at or above this are reported), `crapRefactorBand` (5, cyclomatic band below `maxCyclomatic` where a secondary refactor action is added), `maxUnitSize` (max function lines before a large-function finding, 60), `coverage`/`coverageRoot` (Istanbul coverage path and path-prefix strip for accurate CRAP), `ignore` globs (remove files from findings AND the health score), `thresholdOverrides` (per-file/per-function ceilings via `files`/`functions`/`maxCyclomatic`/`maxCognitive`/`maxCrap`/`maxUnitSize`/`reason`), `ownership` (`botPatterns` and `emailMode` for `--ownership`), and `suggestInlineSuppression` (true, emit `suppress-line` action hints in JSON). Raise thresholds to relax which functions are flagged, wire `coverage` for real CRAP scores, or exempt generated/test files via `ignore` (drops them from the score too) or `thresholdOverrides` (keeps them visible under a higher ceiling). The four `max*` thresholds govern findings only and never move `health_score`: its penalties use fixed calibration so grades stay comparable across projects, and `ignore` is the lever that removes files from the score.
+    /// Sets complexity and health thresholds for `fallow health` (also applied in combined `fallow` and `fallow audit`): `maxCyclomatic` (20), `maxCognitive` (15), `maxCrap` (30.0, findings at or above this are reported), `crapRefactorBand` (5, cyclomatic band below `maxCyclomatic` where a secondary refactor action is added), `maxUnitSize` (max function lines before a large-function finding, 60), `maxFileLines` (max physical lines per file before a file-level finding, 0 means off), `coverage`/`coverageRoot` (Istanbul coverage path and path-prefix strip for accurate CRAP), `ignore` globs (remove files from findings AND the health score), `thresholdOverrides` (per-file/per-function ceilings via `files`/`functions`/`maxCyclomatic`/`maxCognitive`/`maxCrap`/`maxUnitSize`/`maxFileLines`/`reason`), `ownership` (`botPatterns` and `emailMode` for `--ownership`), and `suggestInlineSuppression` (true, emit `suppress-line` action hints in JSON). Raise thresholds to relax which functions are flagged, wire `coverage` for real CRAP scores, or exempt generated/test files via `ignore` (drops them from the score too) or `thresholdOverrides` (keeps them visible under a higher ceiling). The `max*` thresholds govern findings only and never move `health_score`: its penalties use fixed calibration so grades stay comparable across projects, and `ignore` is the lever that removes files from the score.
     #[serde(default)]
     pub health: HealthConfig,
 
@@ -486,7 +488,7 @@ pub struct FallowConfig {
     )]
     pub markup_extensions: Vec<String>,
 
-    /// An ordered list of per-file rule-severity overrides: each entry re-severities specific analysis rules for files its globs match, layered on top of the top-level `rules` defaults. Set to relax or tighten rules for a subset of paths (e.g. downgrade unused-exports to warn under a generated directory); each entry has `files` (glob-pattern array) and `rules` (a partial per-rule severity map of error/warn/off). Entries apply in list order and a file matched by several entries takes every matching entry's overrides (later entries win on conflict); inter-file rules (duplicate-exports, circular-dependencies, re-export-cycle) have no effect in an override (fallow warns during analysis and points to the right mechanism: top-level `ignoreExports` for duplicate-exports, a file-level `// fallow-ignore-file` comment for the others). A single `*` stays within one path segment; use `**` to match across directories.
+    /// An ordered list of per-file rule-severity overrides: each entry re-severities specific analysis rules for files its globs match, layered on top of the top-level `rules` defaults. Set to relax or tighten a rule for a subset of paths (e.g. downgrade unused-exports to warn under a generated directory); each entry has `files` (glob-pattern array) and `rules` (a partial per-rule severity map of error/warn/off). Entries apply in list order and a file matched by several entries takes every matching entry's overrides (later entries win on conflict). For most rules, an override cannot start a detector for a rule that is off at top level, so set the top-level rule on and use an override to set `off` for the other paths. Project-level rules ignore overrides: unused-dependencies, unused-dev-dependencies, unused-optional-dependencies, unlisted-dependencies, type-only-dependencies, test-only-dependencies, dev-dependencies-in-production, duplicate-exports, re-export-cycle and unused-catalog-entries. Fallow reports each such entry as an `override-rule-ineffective` diagnostic that names the mechanism that works. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub overrides: Vec<ConfigOverride>,
 

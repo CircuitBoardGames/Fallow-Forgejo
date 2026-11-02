@@ -103,7 +103,7 @@ pub(super) const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "FALLOW_TYPE_AWARE_BACKEND",
-        "Experimental. Type-checker backend for the TypeScript semantic sidecar: typescript-go (default) or tsrs. The tsrs backend needs the exact pinned tsrs npm package where fallow-type-aware can resolve it. An unknown value makes the type-aware pass unavailable.",
+        "Experimental. Type-checker backend for the TypeScript semantic sidecar: typescript-go (default) or tsrs. The tsrs backend needs a tsrs npm package in the supported range of the type-aware protocol manifest, where fallow-type-aware can resolve it. An unknown value makes the type-aware pass unavailable.",
     ),
     (
         "FALLOW_TYPE_AWARE_BIN",
@@ -151,7 +151,7 @@ pub(super) const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "FALLOW_REPO",
-        "owner/repo fallback for fallow coverage analyze --cloud when --repo is not passed (otherwise parsed from the git origin remote).",
+        "owner/repo fallback for fallow coverage analyze --cloud and fallow inspect --cloud when --repo is not passed (otherwise parsed from the git origin remote).",
     ),
     (
         "FALLOW_API_URL",
@@ -159,7 +159,11 @@ pub(super) const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "FALLOW_API_KEY",
-        "Fallow Cloud bearer token for coverage upload commands, and the fallback bearer for fallow license refresh when the stored license JWT is missing or too stale.",
+        "Fallow Cloud bearer token for coverage upload and cloud read commands (wins over the key that fallow cloud login stored), and the fallback bearer for fallow license refresh when the stored license JWT is missing or too stale.",
+    ),
+    (
+        "FALLOW_CREDENTIAL_STORE",
+        "Credential store for the key that fallow cloud login writes: auto (default: OS keychain, else ~/.config/fallow/credentials), file (credentials file only) or none (no stored key is read or written).",
     ),
     (
         "FALLOW_CA_BUNDLE",

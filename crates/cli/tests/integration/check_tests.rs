@@ -557,6 +557,32 @@ fn type_aware_class_method_impact_uses_exact_owner_identity() {
             .all(|consumer| consumer["path"] != "src/repository.ts"),
         "the same-named AuditRepository.save declaration is not a consumer"
     );
+    assert_eq!(
+        json["affected_files"],
+        serde_json::json!([
+            {
+                "path": "src/index.ts",
+                "relation": "transitive-consumer",
+                "distance": 2,
+                "via": ["src/index.ts", "src/service.ts"]
+            },
+            {
+                "path": "test/service.test.ts",
+                "relation": "transitive-consumer",
+                "distance": 3,
+                "via": ["test/service.test.ts", "src/index.ts", "src/service.ts"]
+            }
+        ])
+    );
+    assert_eq!(
+        json["targeted_tests"],
+        serde_json::json!([{
+            "path": "test/service.test.ts",
+            "relation": "targeted-test",
+            "distance": 3,
+            "via": ["test/service.test.ts", "src/index.ts", "src/service.ts"]
+        }])
+    );
 
     let preview = run_fallow_raw_with_type_aware_sidecar(&[
         "fix",
@@ -4220,7 +4246,7 @@ fn adding_baseline_staleness_moved_no_schema_version() {
         "json",
         "--quiet",
     ]);
-    assert_eq!(parse_json(&health)["schema_version"], 12);
+    assert_eq!(parse_json(&health)["schema_version"], 13);
     let combined = run_fallow_raw(&[
         "--root",
         project.path().to_str().expect("temp path is UTF-8"),
@@ -4235,7 +4261,7 @@ fn adding_baseline_staleness_moved_no_schema_version() {
             .to_str()
             .expect("temp path is UTF-8"),
     ]);
-    assert_eq!(parse_json(&combined)["schema_version"], 14);
+    assert_eq!(parse_json(&combined)["schema_version"], 15);
 }
 
 /// The bare combined run is the action's default shape.
@@ -4710,5 +4736,206 @@ fn an_ignore_pattern_that_excludes_a_workspace_manifest_has_an_effect() {
             "packages/gone/**".to_owned()
         )],
         "the glob that hides a workspace without source files still has an effect: {json}"
+    );
+}
+
+/// One used export with a suppression that has no effect (a stale comment),
+/// one export with a suppression that has an effect, and one unused export.
+fn stale_suppression_project(stale_rule: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"repro","private":true,"type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import { used } from './lib.ts';\n\nconsole.log(used());\n",
+    )
+    .expect("write index");
+    std::fs::write(
+        root.join("src/lib.ts"),
+        "// fallow-ignore-next-line unused-export\n\
+         export function used(): number {\n  return 1;\n}\n\n\
+         // fallow-ignore-next-line unused-export\n\
+         export const keptOnPurpose = 2;\n\n\
+         export const unused = 3;\n",
+    )
+    .expect("write lib");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        format!(r#"{{"rules":{{"stale-suppressions":"{stale_rule}"}}}}"#),
+    )
+    .expect("write config");
+    dir
+}
+
+#[test]
+fn suppression_footer_omits_the_stale_count_when_the_rule_is_off() {
+    let dir = stale_suppression_project("off");
+    let output = run_fallow_in_root("dead-code", dir.path(), &[]);
+    assert!(
+        output.stderr.contains("1 issue \u{b7} 1 suppressed\n"),
+        "the footer must end after the suppressed count: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("stale"),
+        "a run that did not check must not state a stale count: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn suppression_footer_omits_the_stale_count_when_a_filter_excludes_it() {
+    let dir = stale_suppression_project("warn");
+    let output = run_fallow_in_root("dead-code", dir.path(), &["--unused-exports"]);
+    assert!(
+        output.stderr.contains("1 issue \u{b7} 1 suppressed\n"),
+        "the footer must end after the suppressed count: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("stale"),
+        "a run that filtered the check out must not state a stale count: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn suppression_footer_keeps_the_stale_count_when_one_is_reported() {
+    let dir = stale_suppression_project("error");
+    let output = run_fallow_in_root("dead-code", dir.path(), &[]);
+    assert!(
+        output
+            .stderr
+            .contains("2 issues \u{b7} 1 suppressed \u{b7} 1 stale suppression\n"),
+        "the footer must keep the reported count: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn bare_run_suppression_footer_omits_the_stale_count_when_the_rule_is_off() {
+    let dir = stale_suppression_project("off");
+    let root = dir.path().to_str().expect("utf-8 temp path");
+    let output = run_fallow_raw(&["--root", root]);
+    assert!(
+        output.stderr.contains("1 suppressed\n"),
+        "the footer must end after the suppressed count: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("stale"),
+        "a run that did not check must not state a stale count: {}",
+        output.stderr
+    );
+}
+
+/// A project with one private type leak and one used `@deprecated` export.
+fn unlabeled_status_line_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"repro","private":true,"type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import { old } from './dep.ts';\nimport { leak } from './leak.ts';\n\n\
+         console.log(old(), leak());\n",
+    )
+    .expect("write index");
+    std::fs::write(
+        root.join("src/dep.ts"),
+        "/** @deprecated use other */\nexport const old = (): number => 1;\n",
+    )
+    .expect("write dep");
+    std::fs::write(
+        root.join("src/leak.ts"),
+        "type Hidden = { a: number };\n\
+         export function leak(): Hidden {\n  return { a: 1 };\n}\n",
+    )
+    .expect("write leak");
+    dir
+}
+
+#[test]
+fn status_line_names_private_type_leaks() {
+    let dir = unlabeled_status_line_project();
+    let output = run_fallow_in_root("dead-code", dir.path(), &["--private-type-leaks"]);
+    assert!(
+        output.stderr.contains(" 1 private type leak ("),
+        "the status line must name the finding: {}",
+        output.stderr
+    );
+}
+
+/// A pnpm project with one unused catalog entry, one empty catalog group and
+/// one override of an undeclared package.
+fn workspace_findings_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"repro","private":true,"type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - \".\"\ncatalog:\n  unused-thing: ^1.0.0\ncatalogs:\n  empty: {}\n\
+         overrides:\n  not-declared: 1.0.0\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    std::fs::write(root.join("src/index.ts"), "export const a = 1;\n").expect("write index");
+    dir
+}
+
+#[test]
+fn status_line_names_workspace_findings() {
+    let dir = workspace_findings_project();
+    for (flag, label) in [
+        ("--unused-catalog-entries", " 1 unused catalog entry ("),
+        ("--empty-catalog-groups", " 1 empty catalog group ("),
+        (
+            "--unused-dependency-overrides",
+            " 1 unused dependency override (",
+        ),
+    ] {
+        let output = run_fallow_in_root("dead-code", dir.path(), &[flag]);
+        assert!(
+            output.stderr.contains(label),
+            "the status line must name the finding for {flag}: {}",
+            output.stderr
+        );
+    }
+
+    let output = run_fallow_in_root("dead-code", dir.path(), &[]);
+    for label in [
+        "1 unused catalog entry",
+        "1 empty catalog group",
+        "1 unused dependency override",
+    ] {
+        assert!(
+            output.stderr.contains(label),
+            "the status line of a mixed run must name {label}: {}",
+            output.stderr
+        );
+    }
+}
+
+#[test]
+fn status_line_names_deprecated_exports_in_use() {
+    let dir = unlabeled_status_line_project();
+    let output = run_fallow_in_root("dead-code", dir.path(), &["--deprecated-exports-in-use"]);
+    assert!(
+        output.stderr.contains(" 1 deprecated export in use ("),
+        "the status line must name the finding: {}",
+        output.stderr
     );
 }

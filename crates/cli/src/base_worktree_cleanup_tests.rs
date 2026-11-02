@@ -90,6 +90,7 @@ fn missing_legacy_cache_cleanup_reports_failed_git_removal() {
         temp.path(),
         SweepMode::Apply,
         SweepSizes::Skip,
+        SweepScope::All,
     );
 
     assert!(
@@ -127,6 +128,7 @@ fn assert_legacy_cache_cleanup_preserves_unrelated_registration(missing: bool) {
         temp.path(),
         SweepMode::DryRun,
         SweepSizes::Skip,
+        SweepScope::All,
     );
     assert!(
         dry_run
@@ -151,6 +153,7 @@ fn assert_legacy_cache_cleanup_preserves_unrelated_registration(missing: bool) {
         temp.path(),
         SweepMode::Apply,
         SweepSizes::Skip,
+        SweepScope::All,
     );
     assert!(
         applied
@@ -272,5 +275,58 @@ fn deregistration_rejects_admin_entry_with_another_worktree_backlink() {
     assert!(
         candidate_admin.join("gitdir").is_file(),
         "the separate admin entry must remain"
+    );
+}
+
+/// A process that opened the lock file before a sweep unlinked it can still
+/// win the flock on the unlinked inode. The acquirer must see that its fd no
+/// longer names the file at the path, or two processes hold the lock for one
+/// cache path at once.
+#[cfg(unix)]
+#[test]
+fn lock_acquirer_rejects_an_unlinked_lock_inode() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cache_path = tmp
+        .path()
+        .join("fallow-audit-base-cache-0123456789abcdef-root-0123456789abcdef");
+    let lock_path = reusable_worktree_lock_path(&cache_path);
+    let stale = open_or_create_owned_sidecar(&lock_path).unwrap();
+    assert!(lock_file_is_current(&stale, &lock_path));
+
+    let sweep = ReusableWorktreeLock::try_acquire(&cache_path, "test").unwrap();
+    assert!(sweep.remove_lock_file().unwrap());
+    assert!(!lock_path.exists());
+    drop(sweep);
+
+    stale.try_lock().unwrap();
+    assert!(
+        !lock_file_is_current(&stale, &lock_path),
+        "a flock on an unlinked inode must not count as the cache lock",
+    );
+    let fresh = ReusableWorktreeLock::try_acquire(&cache_path, "test")
+        .expect("a new acquirer creates a new lock file");
+    assert!(lock_file_is_current(&fresh.file, &lock_path));
+    assert!(
+        !lock_file_is_current(&stale, &lock_path),
+        "the stale fd must not match the new lock file either",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_lock_file_keeps_a_lock_file_that_replaced_the_held_one() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cache_path = tmp
+        .path()
+        .join("fallow-audit-base-cache-0123456789abcdef-root-0123456789abcdef");
+    let lock_path = reusable_worktree_lock_path(&cache_path);
+    let held = ReusableWorktreeLock::try_acquire(&cache_path, "test").unwrap();
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::write(&lock_path, "").unwrap();
+
+    assert!(!held.remove_lock_file().unwrap());
+    assert!(
+        lock_path.exists(),
+        "only the held inode may be unlinked, never a newer lock file",
     );
 }

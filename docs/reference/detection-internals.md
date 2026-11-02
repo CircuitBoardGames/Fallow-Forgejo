@@ -63,7 +63,7 @@ error by suppressing a downstream detector.
   `crates/engine/src/health/`.
 - Security candidates: `crates/core/src/analyze/security/` with matcher data
   owned by `crates/security/`.
-- Feature flags: extraction facts in `crates/extract/src/flags.rs`, project
+- Feature flags: extraction facts in `crates/extract/src/flags/mod.rs`, project
   analysis in `crates/engine/src/flags.rs`, and extraction helpers exposed by
   `crates/engine/src/feature_flags.rs`. A read such as `useFlag(FLAGS.X)`
   resolves in the extractor when `FLAGS` is a module-level `as const` object
@@ -370,11 +370,22 @@ error by suppressing a downstream detector.
   path reference, because the consumer of the path can run the file, and
   stops at an asset reference. A new consumer that walks edges must pick one
   of these predicates instead of reading the variants.
-- A `require` from `createRequire(import.meta.url)` or
-  `createRequire(__filename)` in any scope is the module `require`, so its
-  `require.resolve` calls count. A nested `require` with another base, a
-  parameter or another declaration shadows the module `require`
-  (`is_module_create_require_binding`).
+- `createRequire(<this file>)` gives a `require` function of this file. The
+  base is `import.meta.url`, `import.meta.filename`, `__filename` or
+  `fileURLToPath(import.meta.url)` (`is_this_file_create_require_call`). The
+  callee can be `<x>.createRequire` or another import name, such as
+  `createRequire as cr`.
+  Load and `.resolve` calls count on the inline call and on a binding of the
+  call with any name. A `.resolve` call on the inline form ignores a shadow of
+  the name `require`.
+- A nested `require` binding of that call is the module `require`, so the scope
+  does not record a shadow. A nested `require` with another base, a parameter
+  or another declaration shadows the module `require` for `.resolve` calls. A
+  nested binding with another name stays a declaration of its scope, and
+  `scoped_require_aliases` marks it for that scope only.
+- A call with another base resolves from another directory. It credits nothing,
+  except that a module-level `const require = createRequire(otherBase)` keeps
+  the plain `require` path.
 
 ## Value references and test reach
 
@@ -481,6 +492,39 @@ definition whose type does not accept a boolean, such as `-w`, `--prefix`,
 `--tag`, `--otp`, and `--node-options`. Dockerfile flag values
 (`--input=src/a.ts`) go through the same resolution, so `ignoreCommandEntries`
 applies to the command of the script body.
+
+The program of a command decides which of its file arguments are entry
+points (issue #3967). `crates/core/src/scripts/argument_entries.rs` holds
+the rules:
+
+- A script runtime (`node`, `tsx`, `bun`, `deno run`, `nodemon`, a shell)
+  runs one script: its first positional argument that looks like a script
+  file. The arguments after the script are data for the script. A relative
+  path value of a runtime flag that loads a module (`-r`, `--import`,
+  `--loader`, `bun --preload`), also in the `--flag=value` form, stays an
+  entry point. When the script is the binary of a known file runner
+  (`node node_modules/jest/bin/jest.js`), the rules of that runner apply.
+- A known file runner (a test runner, a bundler, a compiler, and runtime
+  subcommands such as `bun build` and `deno serve`) runs or loads every
+  file argument, so each one stays an entry point.
+- A program that fallow does not know can run a known program
+  (`time node x.js`, `infisical run -- node x.js`). The rules of the first
+  known program in its arguments then apply. That program must be a bare
+  name or a binary under `node_modules/`, must not be the value of the flag
+  before it, and must come before any literal file argument. So
+  `my-cli app/a.js --engine node` keeps `app/a.js`. An executable script
+  file (`bun --smol app/tool.js`) runs itself, and its arguments are data.
+  Without a known program, the
+  literal file arguments and option values stay entry points, but a glob
+  never expands from them. `watchee -f './src/**/*'` gives no entry point,
+  and `jscodeshift -t codemods/transform.js` keeps its transform.
+- A call of a script with an unknown body keeps every file argument,
+  because the body can run any program.
+- `sh -c "<command>"` reads the quoted command with the same rules.
+
+Formatters and linters (`file_target_tools.rs`) and the built-in test
+runners (`node --test`, `bun test`, `deno test`, `borp`) keep their own
+rules.
 
 A package-manager command can run in other workspace packages. The parser
 records where the command runs as a `RunLocation` in
@@ -919,13 +963,17 @@ packages that a script runs, that a plugin config names, or that a plugin
 credits as tooling with evidence of use. Plugin tooling without evidence and
 catalogue tooling do not start a closure. The dependency trace reads the same
 seeds through `TraceProvenance::peer_seeds`, so `peer_of` names the same
-hosts. A duplicate-export group drops an aliased-import adapter: a module that
-imports `X` under another local name from a group member and declares its own
-`X` derives its export from that member, as a re-export chain member does.
-An adapter is dropped only when its adapter links reach a member that is not
-an adapter. Two modules that import `X` from each other under aliases both
-stay. The check does not read the body of the local `X`, so an aliased import
-that only avoids a name clash also marks the module as an adapter.
+hosts. A duplicate-export group drops a star re-export overlay: a module that
+imports `X` under another local name from a group member, declares
+`export * from` that same module, and declares its own `X`. The overlay
+re-exports the full surface of the member and replaces one binding, as a
+re-export chain member does. The star edge must have a declaration span, so a
+star edge that the graph layer synthesizes does not count. An overlay is
+dropped only when its overlay links reach a member that is not an overlay.
+Two modules that overlay each other both stay. A module that imports `X` under
+an alias and declares its own `X` without the star re-export is a wrapper.
+Importers see two `X` exports with different behavior, so the group keeps the
+wrapper.
 Dependency ignores suppress findings without fabricating resolution edges. Raw-specifier
 unresolved-import ignores are not filesystem globs. A relative import whose
 target is missing and ignored by a repository ignore file is build output, not

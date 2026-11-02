@@ -7,9 +7,10 @@ use serde_json::Value;
 
 /// Wire version for the `fallow audit --brief --format json` envelope.
 ///
-/// Version 13 tracks the embedded health contract: the required
-/// `targets[].category` enum gained `resolve_hidden_coupling`.
-pub const REVIEW_BRIEF_SCHEMA_VERSION: u32 = 13;
+/// Version 14 tracks the embedded health contract: the runtime coverage summary fields
+/// `functions_tracked`, `functions_unhit` and `coverage_percent` are nullable
+/// (null for a positive-only capture), and `capture_policy` is new.
+pub const REVIEW_BRIEF_SCHEMA_VERSION: u32 = 14;
 
 /// Maximum number of affected-but-not-in-diff paths sampled into
 /// [`ImpactClosureFacts::affected_not_shown`].
@@ -139,7 +140,7 @@ pub struct ImpactClosureFacts {
     /// representative files, NEVER to enumerate the blast radius or to infer its
     /// shape. Because it is a prefix of the sorted set, it clusters in whichever
     /// directory sorts first. To reconstruct the full set, run
-    /// `fallow check --impact-closure <path>` once per changed file and union the
+    /// `fallow dead-code --impact-closure <path>` once per changed file and union the
     /// results: that flag seeds from a single file, so no single command
     /// reproduces this changeset-wide union.
     pub affected_not_shown: Vec<String>,

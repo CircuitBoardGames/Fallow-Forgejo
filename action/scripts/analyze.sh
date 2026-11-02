@@ -277,6 +277,7 @@ build_command_args() {
       [ -n "${INPUT_MAX_CYCLOMATIC:-}" ] && ARGS+=(--max-cyclomatic "$INPUT_MAX_CYCLOMATIC")
       [ -n "${INPUT_MAX_COGNITIVE:-}" ] && ARGS+=(--max-cognitive "$INPUT_MAX_COGNITIVE")
       [ -n "${INPUT_MAX_CRAP:-}" ] && ARGS+=(--max-crap "$INPUT_MAX_CRAP")
+      [ -n "${INPUT_MAX_FILE_LINES:-}" ] && ARGS+=(--max-file-lines "$INPUT_MAX_FILE_LINES")
       [ -n "${INPUT_COVERAGE:-}" ] && ARGS+=(--coverage "$INPUT_COVERAGE")
       [ -n "${INPUT_PRODUCTION_COVERAGE:-}" ] && ARGS+=(--runtime-coverage "$INPUT_PRODUCTION_COVERAGE")
       [ -n "${INPUT_COVERAGE_ROOT:-}" ] && ARGS+=(--coverage-root "$INPUT_COVERAGE_ROOT")
@@ -546,6 +547,7 @@ fi
 
 for name_val in "min-tokens:${INPUT_MIN_TOKENS:-}" "min-lines:${INPUT_MIN_LINES:-}" \
                "max-cyclomatic:${INPUT_MAX_CYCLOMATIC:-}" "max-cognitive:${INPUT_MAX_COGNITIVE:-}" \
+               "max-file-lines:${INPUT_MAX_FILE_LINES:-}" \
                "top:${INPUT_TOP:-}" "min-commits:${INPUT_MIN_COMMITS:-}" "threads:${INPUT_THREADS:-}" \
                "min-invocations-hot:${INPUT_MIN_INVOCATIONS_HOT:-}" "min-observation-volume:${INPUT_MIN_OBSERVATION_VOLUME:-}"; do
   name="${name_val%%:*}"; val="${name_val#*:}"
@@ -1061,7 +1063,9 @@ read_all_staleness_fields "$RESULTS_FILE"
 # True when every channel that narrowed the run is one this script added, so
 # removing them can produce a run that CAN judge the baseline. Production mode
 # and workspace scoping are the user's own choice about what to analyze, are
-# never removed, and make the re-read pointless.
+# never removed, and make the re-read pointless. The binary reports production
+# only when the run and the file differ, so a production run stays eligible when
+# the file was saved in production mode. The re-read keeps --production.
 #
 # Driven by the run's own scope_reasons when the binary reports them, so
 # scoping smuggled through the 'args' input is visible here instead of sending

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "3.37.0"
+version = "3.38.1"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -14,17 +14,18 @@ keywords = ["typescript", "javascript", "lint", "static-analysis", "code-quality
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-fallow-api = { version = "3.37.0", path = "crates/api" }
-fallow-core = { version = "3.37.0", path = "crates/core" }
-fallow-config = { version = "3.37.0", path = "crates/config" }
-fallow-extract = { version = "3.37.0", path = "crates/extract" }
-fallow-engine = { version = "3.37.0", path = "crates/engine" }
-fallow-graph = { version = "3.37.0", path = "crates/graph" }
-fallow-mutation = { version = "3.37.0", path = "crates/mutation" }
-fallow-output = { version = "3.37.0", path = "crates/output" }
-fallow-process = { version = "3.37.0", path = "crates/process" }
-fallow-security = { version = "3.37.0", path = "crates/security" }
-fallow-types = { version = "3.37.0", path = "crates/types" }
+fallow-api = { version = "3.38.1", path = "crates/api" }
+fallow-core = { version = "3.38.1", path = "crates/core" }
+fallow-config = { version = "3.38.1", path = "crates/config" }
+fallow-extract = { version = "3.38.1", path = "crates/extract" }
+fallow-engine = { version = "3.38.1", path = "crates/engine" }
+fallow-graph = { version = "3.38.1", path = "crates/graph" }
+fallow-mutation = { version = "3.38.1", path = "crates/mutation" }
+fallow-output = { version = "3.38.1", path = "crates/output" }
+fallow-process = { version = "3.38.1", path = "crates/process" }
+fallow-report-protocol = { version = "3.38.1", path = "crates/report-protocol" }
+fallow-security = { version = "3.38.1", path = "crates/security" }
+fallow-types = { version = "3.38.1", path = "crates/types" }
 
 # Parsing & analysis
 oxc_allocator = "0.155"
@@ -115,8 +116,8 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # LSP
 ls-types = "0.0.6"
 tower-lsp-server = "0.23"
-# `io-util` matches the feature that rmcp (fallow-mcp) enables; see the serde note.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util", "process", "signal", "time"] }
+# `io-util` and `net` match the features that rmcp (fallow-mcp) enables; see the serde note.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util", "net", "process", "signal", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 
 # File watching

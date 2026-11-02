@@ -467,7 +467,7 @@ fn add_type_aware_abstention_metric_definitions(meta: &mut fallow_types::envelop
             "type_aware.abstention_reasons.svelte_virtual_module_exports".to_owned(),
             type_aware_metric(
                 "Svelte Virtual-module Export Abstention Count",
-                "Candidates retained because TypeScript-Go could not resolve named Svelte virtual-module exports.",
+                "Candidates retained because the type checker could not resolve named Svelte virtual-module exports.",
                 "[0, type_aware.unresolved_count]",
                 "zero means no candidate depended on unavailable Svelte virtual-module exports",
             ),
@@ -1340,12 +1340,8 @@ mod tests {
             fallow_output::ARCHITECTURE_SCHEMA_VERSION
         );
         assert_eq!(output["_meta"]["docs"], fallow_output::ARCHITECTURE_DOCS);
-        assert!(output["_meta"]["rules"].get("unused-file").is_none());
-        assert!(
-            output["_meta"]["rules"]
-                .get("circular-dependency")
-                .is_some()
-        );
+        // Architecture tests cover the rules of a run with findings.
+        assert!(output["_meta"].get("rules").is_none());
     }
 
     #[test]
@@ -1362,12 +1358,11 @@ mod tests {
                 signals: Vec::new(),
                 summary: RuntimeCoverageSummary {
                     data_source: RuntimeCoverageDataSource::Local,
-                    last_received_at: None,
-                    functions_tracked: 3,
+                    functions_tracked: Some(3),
                     functions_hit: 1,
-                    functions_unhit: 1,
+                    functions_unhit: Some(1),
                     functions_untracked: 1,
-                    coverage_percent: 33.3,
+                    coverage_percent: Some(33.3),
                     trace_count: 2_847_291,
                     period_days: 30,
                     deployments_seen: 14,
@@ -1377,6 +1372,7 @@ mod tests {
                         lazy_parse_warning: true,
                         untracked_ratio_percent: 42.5,
                     }),
+                    ..Default::default()
                 },
                 findings: vec![RuntimeCoverageFinding {
                     id: "fallow:prod:deadbeef".to_owned(),
@@ -2438,7 +2434,7 @@ mod tests {
         .expect("should serialize");
 
         assert!(output["_meta"]["docs"].is_string());
-        assert!(output["_meta"]["rules"].is_object());
+        assert!(output["_meta"].get("rules").is_none());
     }
 
     #[test]

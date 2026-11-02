@@ -1,6 +1,6 @@
 {
   "name": "fallow",
-  "version": "3.37.0",
+  "version": "3.38.1",
   "manifest_version": "1",
   "description": "Codebase analyzer for TypeScript/JavaScript: unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations",
   "global_flags": [
@@ -62,6 +62,26 @@
       "type": "bool",
       "required": false,
       "description": "Indent JSON output for manual inspection. Requires the final output format to be JSON",
+      "possible_values": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "--lean",
+      "type": "bool",
+      "required": false,
+      "description": "Trim JSON for agent context: leave out empty arrays and zero dead-code summary counts, group workspace diagnostics, cap health tables, and move repeated action text to `_meta.actions`. Requires JSON output. Applies to dead-code, health and the combined report; other commands reject it. Run without `--lean` for the full diagnostic list and the complete tables",
+      "possible_values": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "--full-tables",
+      "type": "bool",
+      "required": false,
+      "description": "With `--lean`, keep every row of the health tables (`hotspots`, `file_scores`, `large_functions`)",
       "possible_values": [
         "true",
         "false"
@@ -1227,7 +1247,7 @@
           "name": "--runtime",
           "type": "string",
           "required": false,
-          "description": "The JavaScript runtime (default from PATH: `node` for node:test, `bun` for bun test, and `node`, then `bun`, for Vitest)"
+          "description": "The JavaScript runtime: a name on PATH such as `node`, or a file path (default from PATH: `node` for node:test, `bun` for bun test, and `node`, then `bun`, for Vitest)"
         },
         {
           "name": "--allow-dirty",
@@ -1300,6 +1320,16 @@
           ]
         },
         {
+          "name": "--kill-matrix",
+          "type": "bool",
+          "required": false,
+          "description": "Collect all killing tests and report redundant-test candidates for individual review. Run every covering test without stopping at a failure",
+          "possible_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "paths",
           "type": "string",
           "required": false,
@@ -1342,8 +1372,29 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "--cloud",
+          "type": "bool",
+          "required": false,
+          "description": "OPT-IN: attach Fallow Cloud production evidence for a `--file` target as the `cloud` evidence section: calls, errors, CPU and never-run branches per function. The API key is $FALLOW_API_KEY, else the key that `fallow cloud login` stored. A missing key, a plan gate or an unreachable cloud is a section status, never a failed run",
+          "possible_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "--repo",
+          "type": "string",
+          "required": false,
+          "description": "Fallow Cloud repository for `--cloud`. Precedence: this flag > $FALLOW_REPO > the `origin` git remote"
         }
       ]
+    },
+    {
+      "name": "cloud",
+      "description": "Connect this machine to Fallow Cloud",
+      "flags": []
     },
     {
       "name": "trace",
@@ -1850,6 +1901,12 @@
           "type": "string",
           "required": false,
           "description": "Maximum CRAP score threshold (overrides config, default 30.0). Functions meeting or exceeding this score are reported alongside complexity findings. Pair with `--coverage` for accurate scoring"
+        },
+        {
+          "name": "--max-file-lines",
+          "type": "string",
+          "required": false,
+          "description": "Maximum physical lines per file (overrides config `health.maxFileLines`, default 0 = off). A longer file is reported as a complexity finding with `exceeded: \"file_lines\"`"
         },
         {
           "name": "--top",
@@ -4795,6 +4852,36 @@
       "docs_url": "https://fallow.tools/docs/explanations/health/#crap-score"
     },
     {
+      "id": "long-file",
+      "rule_id": "fallow/long-file",
+      "command": "health",
+      "category": "Health",
+      "description": "File has more lines than the file-length threshold",
+      "label": null,
+      "config_key": null,
+      "registry_index": null,
+      "aliases": [],
+      "lsp": false,
+      "filter_flag": "--complexity",
+      "result_key": null,
+      "summary_label": null,
+      "summary_docs_anchor": null,
+      "sarif_rule_ids": null,
+      "codeclimate_check_names": null,
+      "ts_alias": null,
+      "counts_in_total": false,
+      "fixable": false,
+      "suppressible": true,
+      "suppress_comment": "// fallow-ignore-file complexity",
+      "default_severity": null,
+      "opt_in": null,
+      "frameworks": [],
+      "note": null,
+      "license": "free",
+      "license_note": null,
+      "docs_url": "https://fallow.tools/docs/explanations/health/#file-length"
+    },
+    {
       "id": "refactoring-target",
       "rule_id": "fallow/refactoring-target",
       "command": "health",
@@ -7048,7 +7135,7 @@
     "FALLOW_MAX_FILE_SIZE": "Per-file size ceiling in megabytes for source discovery (default 5; 0 = no limit). CLI --max-file-size flag overrides this.",
     "FALLOW_TYPE_AWARE": "Enable or disable TypeScript semantic (type-aware) analysis for the run (true/false/1/0/yes/no/on/off). Precedence: --type-aware/--no-type-aware CLI flags, then FALLOW_TYPE_AWARE, then the audit.typeAware config field, then typeAware.enabled.",
     "FALLOW_TYPE_AWARE_TIMEOUT_SECS": "Wall clock in seconds allowed for one TypeScript semantic sidecar request (default 120; unset, 0, or a non-numeric value keeps the default). Raise it for very large TypeScript programs, where a semantic query scans the whole program.",
-    "FALLOW_TYPE_AWARE_BACKEND": "Experimental. Type-checker backend for the TypeScript semantic sidecar: typescript-go (default) or tsrs. The tsrs backend needs the exact pinned tsrs npm package where fallow-type-aware can resolve it. An unknown value makes the type-aware pass unavailable.",
+    "FALLOW_TYPE_AWARE_BACKEND": "Experimental. Type-checker backend for the TypeScript semantic sidecar: typescript-go (default) or tsrs. The tsrs backend needs a tsrs npm package in the supported range of the type-aware protocol manifest, where fallow-type-aware can resolve it. An unknown value makes the type-aware pass unavailable.",
     "FALLOW_TYPE_AWARE_BIN": "Trusted executable override for the TypeScript semantic refinement sidecar used by dead-code --type-aware. Relative paths resolve from the caller's working directory before --root is applied; project node_modules and PATH are intentionally not searched. Default: sibling of the active Fallow executable.",
     "FALLOW_AUDIT_BASE": "Pins the fallow audit comparison base ref when no --base/--changed-since is passed (e.g. upstream/main).",
     "FALLOW_AUDIT_CACHE_MAX_AGE_DAYS": "GC threshold in days for reusable audit base-snapshot caches (default 30; 0 disables the sweep).",
@@ -7060,9 +7147,10 @@
     "FALLOW_COV_BIN": "Explicit path override for the fallow-cov runtime-coverage sidecar binary.",
     "FALLOW_COV_BINARY_PATH": "Secondary explicit path override for the fallow-cov sidecar, checked after FALLOW_COV_BIN (air-gapped installs, distro-packaged sidecars, shared Docker images).",
     "FALLOW_RUNTIME_COVERAGE_SOURCE": "Set to cloud to select cloud runtime coverage in fallow coverage analyze without passing --cloud.",
-    "FALLOW_REPO": "owner/repo fallback for fallow coverage analyze --cloud when --repo is not passed (otherwise parsed from the git origin remote).",
+    "FALLOW_REPO": "owner/repo fallback for fallow coverage analyze --cloud and fallow inspect --cloud when --repo is not passed (otherwise parsed from the git origin remote).",
     "FALLOW_API_URL": "Base URL override for Fallow Cloud API calls (license refresh, trial, coverage uploads).",
-    "FALLOW_API_KEY": "Fallow Cloud bearer token for coverage upload commands, and the fallback bearer for fallow license refresh when the stored license JWT is missing or too stale.",
+    "FALLOW_API_KEY": "Fallow Cloud bearer token for coverage upload and cloud read commands (wins over the key that fallow cloud login stored), and the fallback bearer for fallow license refresh when the stored license JWT is missing or too stale.",
+    "FALLOW_CREDENTIAL_STORE": "Credential store for the key that fallow cloud login writes: auto (default: OS keychain, else ~/.config/fallow/credentials), file (credentials file only) or none (no stored key is read or written).",
     "FALLOW_CA_BUNDLE": "Path to a PEM certificate bundle for Fallow Cloud and provider HTTP calls (replaces the default WebPKI roots).",
     "FALLOW_UPDATE_CHECK": "Set to off/0/false to disable the human-TTY upgrade nudge and its background version check.",
     "FALLOW_CLAUDE_CODE_HINT": "Set to off/0/false/no/disabled to suppress the one-line Claude Code plugin hint on stderr. Fallow writes the hint only inside a Claude Code session (CLAUDECODE or CLAUDE_CODE_CHILD_SESSION), for human output without --quiet, outside CI, and when no Fallow plugin or skill is set up for the project. Default on.",
@@ -7708,7 +7796,8 @@
         "key_params": [
           "target",
           "production",
-          "include_churn"
+          "include_churn",
+          "cloud"
         ],
         "license": "free",
         "license_note": null,

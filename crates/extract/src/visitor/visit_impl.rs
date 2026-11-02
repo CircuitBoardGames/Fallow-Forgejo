@@ -13,8 +13,8 @@ use crate::{
     AngularComponentFieldArrayTypeFact, AngularThisSpreadFact, ComputedEnumKeyUseFact,
     DefaultImportWholeObjectUseFact, DynamicCustomElementRenderFact, DynamicImportInfo,
     DynamicImportPattern, ExportInfo, ExportName, ImportInfo, ImportedName, MemberAccess,
-    ModuleLoadMechanism, PlaywrightFixtureUseFact, ReExportInfo, RequireCallInfo,
-    RequiredTypeMemberFact, SemanticFact, VisibilityTag,
+    ModuleLoadMechanism, PlaywrightFixtureUseFact, ReExportInfo, RequiredTypeMemberFact,
+    SemanticFact, VisibilityTag,
     js_text::{JsText, static_name_text},
 };
 use fallow_types::extract::{
@@ -44,7 +44,7 @@ use super::{
     ROUTE_LOADER_DATA_OBJECT, SideEffectRegistrationTarget, collect_static_import_specifiers,
     extract_import_expression, extract_promise_all_elements, is_unawaited_import,
     ssr_load_module_call, ssr_load_module_source, try_extract_arrow_wrapped_import,
-    try_extract_import_then_callback, try_extract_property_callback_import, try_extract_require,
+    try_extract_import_then_callback, try_extract_property_callback_import,
 };
 
 #[path = "visit_impl_callback_properties.rs"]
@@ -67,6 +67,8 @@ mod visit_helpers;
 mod visit_jsx_runtime;
 #[path = "visit_impl_member_destructuring.rs"]
 mod visit_member_destructuring;
+#[path = "visit_impl_module_require.rs"]
+mod visit_module_require;
 #[path = "visit_impl_node_runtime.rs"]
 mod visit_node_runtime;
 #[path = "visit_impl_object_bindings.rs"]
@@ -732,55 +734,6 @@ impl ModuleInfoExtractor {
             })
     }
 
-    fn preseed_class_array_fields(&mut self, class: &Class<'_>) {
-        for element in &class.body.body {
-            if let ClassElement::PropertyDefinition(prop) = element {
-                if prop.r#static {
-                    continue;
-                }
-                let name = prop.key.static_name().map_or_else(
-                    || match &prop.key {
-                        PropertyKey::PrivateIdentifier(id) => Some(format!("#{}", id.name)),
-                        _ => None,
-                    },
-                    |name| Some(name.text().into_owned()),
-                );
-                if let Some(name) = name
-                    && let Some(annotation) = prop.type_annotation.as_deref()
-                    && let Some(element_type) =
-                        array_element_type_from_type(&annotation.type_annotation)
-                {
-                    self.iterable_element_types
-                        .insert(self.this_member_key(&name), element_type);
-                }
-                continue;
-            }
-            let ClassElement::MethodDefinition(method) = element else {
-                continue;
-            };
-            if method.kind != MethodDefinitionKind::Constructor {
-                continue;
-            }
-            for param in &method.value.params.items {
-                if param.accessibility.is_none() && !param.readonly {
-                    continue;
-                }
-                let BindingPattern::BindingIdentifier(id) = &param.pattern else {
-                    continue;
-                };
-                let Some(annotation) = param.type_annotation.as_deref() else {
-                    continue;
-                };
-                if let Some(element_type) =
-                    array_element_type_from_type(&annotation.type_annotation)
-                {
-                    self.iterable_element_types
-                        .insert(self.this_member_key(id.name.as_str()), element_type);
-                }
-            }
-        }
-    }
-
     fn array_type_origin(ty: &TSType<'_>) -> Option<Span> {
         match ty {
             TSType::TSArrayType(array) => {
@@ -1139,23 +1092,6 @@ impl ModuleInfoExtractor {
                 self.record_path_sink_binding(id.name.as_str(), None);
                 self.record_path_relative_binding(id.name.as_str(), None);
             }
-        }
-    }
-
-    fn record_bare_require_call(&mut self, expr: &CallExpression<'_>) {
-        if let Expression::Identifier(ident) = &expr.callee
-            && ident.name == "require"
-            && let Some(Argument::StringLiteral(lit)) = expr.arguments.first()
-            && !self.handled_require_spans.contains(&expr.span)
-        {
-            self.require_calls.push(RequireCallInfo {
-                source: lit.value.text().into_owned(),
-                span: expr.span,
-                source_span: lit.span,
-                destructured_names: Vec::new(),
-                local_name: None,
-                is_type_only: false,
-            });
         }
     }
 
@@ -1619,6 +1555,8 @@ impl ModuleInfoExtractor {
                 &function.params,
                 body,
                 &self.package_resolution_function_args,
+                &self.create_require_aliases,
+                &self.module_require_aliases,
             )
         {
             self.package_resolution_function_args
@@ -1744,9 +1682,7 @@ impl ModuleInfoExtractor {
                             .map(|id| id.name.to_string()),
                     );
                 }
-                for declarator in nested_scope_declarators(var) {
-                    self.record_nested_declaration_names(declarator.id.get_binding_identifiers());
-                }
+                self.record_nested_scope_declarators(var);
                 self.record_non_instance_declarators(var);
             }
             Declaration::ClassDeclaration(class) => {
@@ -2677,6 +2613,7 @@ impl<'a> ModuleInfoExtractor {
         init: &Expression<'a>,
     ) {
         self.record_declarator_member_destructuring(declarator, init);
+        self.record_this_method_result_alias(declarator, init);
 
         // `a ?? new A()`, `f ? new A() : null` and similar inits hold the
         // class instance in one operand. Bind through that operand.
@@ -2993,7 +2930,7 @@ impl<'a> ModuleInfoExtractor {
             self.record_object_binding_targets(id.name.as_str(), obj);
         }
 
-        if let Some((call, source)) = try_extract_require(init) {
+        if let Some((call, source)) = self.try_extract_require(init) {
             self.record_dompurify_require_binding(declarator, &source);
             self.record_child_process_require_binding(declarator, &source);
             self.handle_require_declaration(declarator, call, &source);
@@ -3694,6 +3631,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 || visit_factory_properties::program_has_captured_callback(program);
         self.prepare_factory_property_imports(program);
         self.record_program_namespace_import_locals(program);
+        self.record_program_module_require_names(program);
         self.record_program_spy_api_locals(program);
         self.record_program_type_aliases(program);
         self.record_program_prologue(program);
@@ -3757,8 +3695,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
-        let previous_span = self.class_method_function_span.replace(method.value.span);
-        let previous_depth = std::mem::replace(&mut self.independent_this_depth, 0);
+        let (previous_span, previous_depth) = self.enter_method_definition(method);
         walk::walk_method_definition(self, method);
         self.independent_this_depth = previous_depth;
         self.class_method_function_span = previous_span;
@@ -3845,6 +3782,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.preseed_direct_object_binding_scope_roots(&stmt.body);
         if self.namespace_depth == 0 {
             self.nested_declaration_stack.push(FxHashSet::default());
+            self.scoped_require_aliases.push(FxHashSet::default());
             self.scoped_non_instance_bindings.push(FxHashSet::default());
             self.scoped_namespace_binding_names
                 .push(FxHashSet::default());
@@ -3870,6 +3808,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
         if self.namespace_depth == 0 {
             self.nested_declaration_stack.pop();
+            self.scoped_require_aliases.pop();
             self.scoped_non_instance_bindings.pop();
             self.scoped_namespace_binding_names.pop();
             self.scoped_array_binding_element_types.pop();
@@ -4649,7 +4588,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.record_angular_bootstrap_call(expr);
         self.record_angular_dynamic_providers(expr);
 
-        self.record_callee_use(expr);
+        self.record_callee_use(&expr.callee, expr.span.start, false);
         self.record_imported_call_site(expr);
 
         walk::walk_call_expression(self, expr);
@@ -4775,6 +4714,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
 
     fn visit_new_expression(&mut self, expr: &oxc_ast::ast::NewExpression<'a>) {
         self.record_queue_worker_constructor_param_sources(expr);
+        self.record_callee_use(&expr.callee, expr.span.start, true);
 
         if let Some(source) = new_url_import_source(expr) {
             // A speculative reference credits its target when it resolves, and
@@ -5349,8 +5289,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.class_scope_counter += 1;
         let class_scope_id = self.class_scope_counter;
         self.class_scope_stack.push(class_scope_id);
-        // Iteration consumers can precede their fields or constructor in source order.
-        self.preseed_class_array_fields(class);
+        // Iteration consumers and `this` method results can precede their
+        // fields, constructor or method in source order.
+        self.preseed_class_bindings(class);
         let direct_scope_roots = class
             .id
             .as_ref()
@@ -6255,20 +6196,19 @@ impl ModuleInfoExtractor {
         None
     }
 
-    /// Record the statically flattenable callee path of a call site, deduped
-    /// per unique path (first occurrence wins). Capture is unconditional
-    /// because extraction is config-blind; the `boundaries.calls.forbidden`
-    /// detector consumes these at analyze time. Computed members, dynamic
-    /// dispatch, and optional-chaining callees flatten to `None` and stay
-    /// uncaptured (documented false negatives).
-    fn record_callee_use(&mut self, expr: &CallExpression<'_>) {
-        let Some(callee_path) = flatten_callee_path(&expr.callee) else {
+    /// Record the statically flattenable callee path of a call or `new` site, deduped per path
+    /// and form (first occurrence wins). Capture is unconditional because extraction is
+    /// config-blind. Computed members, dynamic dispatch, and optional-chaining callees flatten
+    /// to `None` and stay uncaptured (documented false negatives).
+    fn record_callee_use(&mut self, callee: &Expression<'_>, span_start: u32, is_new: bool) {
+        let Some(callee_path) = flatten_callee_path(callee) else {
             return;
         };
-        if self.seen_callee_paths.insert(callee_path.clone()) {
+        if self.seen_callee_paths.insert((callee_path.clone(), is_new)) {
             self.callee_uses.push(CalleeUse {
                 callee_path,
-                span_start: expr.span.start,
+                span_start,
+                is_new,
             });
         }
     }

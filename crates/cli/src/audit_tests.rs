@@ -104,10 +104,10 @@ fn completeness_gate_uses_effective_metadata_requirement() {
     assert!(type_aware_meta_completeness_failed(Some(&meta)));
 }
 use crate::base_worktree::{
-    CacheMaxAgeSource, SweepDecision, SweepDisposition, SweepMode, SweepPass, SweepSizes,
-    canonical_root_hash, legacy_reusable_audit_worktree_path, reclaim_orphan_cache_entry,
-    remove_reusable_audit_caches, resolve_cache_max_age_with_source, sweep_old_reusable_caches_in,
-    sweep_reusable_caches_with_report,
+    CacheMaxAgeSource, SweepDecision, SweepDisposition, SweepMode, SweepPass, SweepScope,
+    SweepSizes, canonical_root_hash, full_sweep_marker_path, legacy_reusable_audit_worktree_path,
+    reclaim_orphan_cache_entry, remove_reusable_audit_caches, resolve_cache_max_age_with_source,
+    sweep_old_reusable_caches_in, sweep_reusable_caches_with_report,
 };
 use std::{fs, process::Command};
 
@@ -566,6 +566,91 @@ fn reusable_cache_gc_removes_old_entry_with_backdated_sidecar() {
     cleanup_reusable_worktree(&repo, &worktree_path);
 }
 
+/// Write the `.last-used` sidecar of a foreign cache entry whose directory is
+/// already gone, the cheapest candidate that the cross-repo pass reclaims.
+fn write_foreign_orphan_sidecar(scan_root: &Path) -> PathBuf {
+    let path = scan_root.join("fallow-audit-base-cache-3333333333333333-root-4444444444444444");
+    fs::write(
+        reusable_worktree_last_used_path(&path),
+        "/nonexistent/owner\n",
+    )
+    .expect("orphan sidecar should be written");
+    path
+}
+
+#[test]
+fn per_audit_sweep_skips_temp_dir_scan_within_interval() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-interval");
+    let max_age = Some(Duration::from_hours(30 * 24));
+    sweep_old_reusable_caches_in(&repo, max_age, true, tmp.path());
+    let orphan = write_foreign_orphan_sidecar(tmp.path());
+    let owned = create_unregistered_reusable_cache(&repo);
+    write_sidecar_with_age(&owned, Duration::from_hours(31 * 24));
+
+    sweep_old_reusable_caches_in(&repo, max_age, true, tmp.path());
+
+    assert!(
+        reusable_worktree_last_used_path(&orphan).exists(),
+        "a second audit within the interval must not scan the temp dir",
+    );
+    assert!(
+        !owned.exists(),
+        "the requested root's own entry is swept on every audit",
+    );
+
+    let marker = fs::OpenOptions::new()
+        .write(true)
+        .open(full_sweep_marker_path(tmp.path()))
+        .expect("marker should exist after the first sweep");
+    marker
+        .set_modified(SystemTime::now() - Duration::from_hours(2))
+        .expect("set_modified should succeed");
+
+    sweep_old_reusable_caches_in(&repo, max_age, true, tmp.path());
+
+    assert!(
+        !reusable_worktree_last_used_path(&orphan).exists(),
+        "the first audit after the interval scans the temp dir again",
+    );
+    cleanup_reusable_worktree(&repo, &owned);
+}
+
+#[test]
+fn per_audit_sweep_scans_when_marker_is_from_the_future() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-future-marker");
+    let marker = full_sweep_marker_path(tmp.path());
+    let file = fs::File::create(&marker).expect("marker should be created");
+    file.set_modified(SystemTime::now() + Duration::from_hours(24))
+        .expect("set_modified should succeed");
+    let orphan = write_foreign_orphan_sidecar(tmp.path());
+
+    sweep_old_reusable_caches_in(&repo, Some(Duration::from_hours(30 * 24)), true, tmp.path());
+
+    assert!(
+        !reusable_worktree_last_used_path(&orphan).exists(),
+        "a marker dated in the future must not suppress the sweep",
+    );
+}
+
+#[test]
+fn per_audit_sweep_ignores_marker_that_is_not_a_regular_file() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-gc-dir-marker");
+    fs::create_dir(full_sweep_marker_path(tmp.path())).expect("marker dir should be created");
+    let max_age = Some(Duration::from_hours(30 * 24));
+    sweep_old_reusable_caches_in(&repo, max_age, true, tmp.path());
+    let orphan = write_foreign_orphan_sidecar(tmp.path());
+
+    sweep_old_reusable_caches_in(&repo, max_age, true, tmp.path());
+
+    assert!(
+        !reusable_worktree_last_used_path(&orphan).exists(),
+        "an untrusted marker must not suppress the sweep",
+    );
+}
+
 #[test]
 fn reusable_cache_gc_keeps_fresh_entry() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
@@ -706,8 +791,9 @@ fn reusable_cache_gc_reclaims_sidecar_orphan_even_when_age_gc_disabled() {
     cleanup_reusable_worktree(&repo, &worktree_path);
 }
 
+#[cfg(unix)]
 #[test]
-fn reusable_cache_gc_preserves_lock_file_after_removal() {
+fn reusable_cache_gc_removes_lock_file_with_the_entry() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-gc-lockfile");
     let worktree_path = create_unregistered_reusable_cache(&repo);
@@ -729,10 +815,9 @@ fn reusable_cache_gc_preserves_lock_file_after_removal() {
         "sweep should still remove the worktree directory",
     );
     assert!(
-        lock_path.exists(),
-        "sweep MUST NOT delete the `.lock` file (lock-lifecycle invariant)",
+        !lock_path.exists(),
+        "sweep should unlink the `.lock` file of the entry it reclaims",
     );
-    let _ = fs::remove_file(&lock_path);
     cleanup_reusable_worktree(&repo, &worktree_path);
 }
 
@@ -893,6 +978,7 @@ fn sweep_report_classifies_aged_owned_entry() {
         tmp.path(),
         SweepMode::Apply,
         SweepSizes::Skip,
+        SweepScope::All,
     );
 
     let entry = report
@@ -934,6 +1020,7 @@ fn sweep_report_dry_run_previews_aged_entry_without_mutation() {
         tmp.path(),
         SweepMode::DryRun,
         SweepSizes::Measure,
+        SweepScope::All,
     );
 
     let entry = report
@@ -977,6 +1064,7 @@ fn sweep_report_dry_run_lists_legacy_registered_without_deregistering() {
         tmp.path(),
         SweepMode::DryRun,
         SweepSizes::Skip,
+        SweepScope::All,
     );
 
     assert!(
@@ -1021,6 +1109,7 @@ fn sweep_report_apply_keeps_deregistered_current_path_and_removes_released_sha()
         tmp.path(),
         SweepMode::Apply,
         SweepSizes::Measure,
+        SweepScope::All,
     );
 
     // Match by entry NAME: the report echoes the canonical paths git prints,
@@ -1071,6 +1160,87 @@ fn sweep_report_apply_keeps_deregistered_current_path_and_removes_released_sha()
     cleanup_reusable_worktree(&repo, &released_path);
 }
 
+#[cfg(unix)]
+#[test]
+fn sweep_reclaims_bare_lock_sidecar() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-report-lock-only");
+    let cache_path = tmp
+        .path()
+        .join("fallow-audit-base-cache-0123456789abcdef-root-fedcba9876543210");
+    let lock_path = reusable_worktree_lock_path(&cache_path);
+    fs::write(&lock_path, "").expect("bare lock sidecar should be written");
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::Apply,
+        SweepSizes::Skip,
+        SweepScope::All,
+    );
+
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == cache_path)
+        .expect("a bare lock sidecar must fold back into a reported candidate");
+    assert_eq!(entry.disposition, SweepDisposition::ReclaimedLockOnly);
+    assert_eq!(entry.pass, SweepPass::Foreign);
+    assert_eq!(entry.disposition.reason(), "orphaned-lock");
+    assert_eq!(
+        report.removed, 0,
+        "a lock sidecar does not count as a reclaimed cache in the stderr summary",
+    );
+    assert!(
+        !lock_path.exists(),
+        "a lock sidecar without a cache must be reclaimed",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sweep_reclaims_lock_sidecar_with_the_aged_entry() {
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let repo = init_throwaway_repo(tmp.path(), "repo-aged-lock");
+    let cache_path = tmp
+        .path()
+        .join("fallow-audit-base-cache-0123456789abcdef-root-0123456789abcdef");
+    fs::create_dir(&cache_path).expect("cache dir should be created");
+    let lock_path = reusable_worktree_lock_path(&cache_path);
+    fs::write(&lock_path, "").expect("lock sidecar should be written");
+    let last_used = reusable_worktree_last_used_path(&cache_path);
+    fs::write(&last_used, "").expect("last-used sidecar should be written");
+    let old = SystemTime::now() - Duration::from_hours(40 * 24);
+    fs::File::options()
+        .write(true)
+        .open(&last_used)
+        .and_then(|file| file.set_modified(old))
+        .expect("last-used mtime should be set");
+
+    let report = sweep_reusable_caches_with_report(
+        &repo,
+        Some(Duration::from_hours(30 * 24)),
+        tmp.path(),
+        SweepMode::Apply,
+        SweepSizes::Skip,
+        SweepScope::All,
+    );
+
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == cache_path)
+        .expect("the aged entry should be reported");
+    assert_eq!(entry.disposition, SweepDisposition::ReclaimedAged);
+    assert!(!cache_path.exists());
+    assert!(
+        !lock_path.exists(),
+        "the lock sidecar must go with the reclaimed entry, not stay as a lock-only leftover",
+    );
+}
+
+#[cfg(not(unix))]
 #[test]
 fn sweep_report_counts_bare_lock_sidecar_as_lock_only() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
@@ -1087,6 +1257,7 @@ fn sweep_report_counts_bare_lock_sidecar_as_lock_only() {
         tmp.path(),
         SweepMode::Apply,
         SweepSizes::Skip,
+        SweepScope::All,
     );
 
     let entry = report
@@ -1095,13 +1266,8 @@ fn sweep_report_counts_bare_lock_sidecar_as_lock_only() {
         .find(|entry| entry.path == cache_path)
         .expect("a bare lock sidecar must fold back into a reported candidate");
     assert_eq!(entry.disposition, SweepDisposition::KeptLockOnly);
-    assert_eq!(entry.pass, SweepPass::Foreign);
     assert_eq!(entry.disposition.reason(), "lock-only");
-    assert_eq!(report.removed, 0);
-    assert!(
-        lock_path.exists(),
-        "the `.lock` sidecar must never be deleted",
-    );
+    assert!(lock_path.exists(), "Windows keeps the `.lock` sidecar");
 }
 
 #[test]
@@ -1142,6 +1308,7 @@ fn foreign_owner_behind_dangling_symlink_is_dead() {
         tmp.path(),
         SweepMode::Apply,
         SweepSizes::Skip,
+        SweepScope::All,
     );
 
     let entry = report
@@ -1186,6 +1353,7 @@ fn foreign_owner_with_unprobeable_root_is_kept_unverifiable() {
         tmp.path(),
         SweepMode::Apply,
         SweepSizes::Skip,
+        SweepScope::All,
     );
 
     fs::set_permissions(&guarded_parent, fs::Permissions::from_mode(0o755))
@@ -1457,7 +1625,7 @@ fn failed_reusable_cache_rebuild_leaves_no_matching_readiness() {
 }
 
 #[test]
-fn retained_reusable_lock_makes_remove_skip_then_succeed_and_preserve_lock() {
+fn retained_reusable_lock_makes_remove_skip_then_succeed() {
     let tmp = tempfile::TempDir::new().expect("temp dir should be created");
     let repo = init_throwaway_repo(tmp.path(), "repo-remove-retained-lock");
     let base_sha = git_rev_parse(&repo, "HEAD").expect("HEAD should resolve");
@@ -1485,11 +1653,12 @@ fn retained_reusable_lock_makes_remove_skip_then_succeed_and_preserve_lock() {
     );
     assert!(!reusable_worktree_sha_path(&cache_path).exists());
     assert!(!reusable_worktree_last_used_path(&cache_path).exists());
-    assert!(
+    assert_eq!(
         lock_path.exists(),
-        "cache removal must preserve the lock file"
+        cfg!(windows),
+        "cache removal unlinks the lock file on Unix and keeps it on Windows",
     );
-    fs::remove_file(lock_path).expect("test lock file should be removable");
+    let _ = fs::remove_file(lock_path);
 }
 
 #[test]
@@ -1686,9 +1855,10 @@ fn root_removal_reclaims_legacy_sha_siblings_without_touching_unrelated_root() {
         !second.exists(),
         "uncontended legacy sibling must be removed"
     );
-    assert!(
+    assert_eq!(
         second_lock_path.exists(),
-        "legacy lock file must be preserved"
+        cfg!(windows),
+        "the removed sibling's lock file goes on Unix and stays on Windows",
     );
     assert!(
         unrelated.is_dir(),
@@ -1700,9 +1870,10 @@ fn root_removal_reclaims_legacy_sha_siblings_without_touching_unrelated_root() {
     assert!(!first.exists());
     assert!(!reusable_worktree_sha_path(&first).exists());
     assert!(!reusable_worktree_last_used_path(&first).exists());
-    assert!(
+    assert_eq!(
         first_lock_path.exists(),
-        "held legacy lock file must be preserved"
+        cfg!(windows),
+        "the lock file goes with the entry once its holder released it (Unix)",
     );
     assert!(
         unrelated.is_dir(),
@@ -2738,6 +2909,7 @@ fn audit_base_snapshot_cache_roundtrips_from_disk() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -2829,6 +3001,7 @@ fn audit_base_snapshot_cache_rejects_mismatched_key() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -2929,6 +3102,7 @@ fn audit_base_snapshot_cache_key_includes_extended_config() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -3020,6 +3194,7 @@ fn audit_gate_all_skips_base_snapshot() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::All,
@@ -3131,6 +3306,7 @@ fn audit_gate_new_only_skips_base_snapshot_for_docs_only_diff() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -3243,6 +3419,7 @@ fn audit_reuses_dead_code_parse_for_health_when_production_matches() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -3354,6 +3531,7 @@ fn audit_new_only_does_not_gate_reshaped_clone_group_without_added_lines() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -3536,6 +3714,7 @@ fn audit_new_only_still_gates_pasted_clone_as_introduced() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -3662,6 +3841,7 @@ fn audit_dupes_falls_back_to_own_discovery_when_health_off() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -3769,6 +3949,7 @@ fn audit_gate_new_only_inherits_pre_existing_duplicates_in_focused_files() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -3922,6 +4103,7 @@ export function App() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -4082,6 +4264,7 @@ export function App() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -4182,6 +4365,7 @@ fn audit_base_uses_new_explicit_config_without_hard_failure() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -4277,6 +4461,7 @@ fn audit_base_uses_current_discovered_config_for_attribution() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -4381,6 +4566,7 @@ fn audit_base_current_config_attribution_survives_cache_hit() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
@@ -4509,6 +4695,7 @@ fn audit_dupes_only_materializes_groups_touching_changed_files() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::All,
@@ -4688,6 +4875,7 @@ fn audit_envelope_states_a_failed_type_aware_completeness_gate() {
         health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
         fail_on_stale_baseline: false,
         max_crap: None,
+        file_lines_check: false,
         coverage: None,
         coverage_root: None,
         gate: AuditGate::All,

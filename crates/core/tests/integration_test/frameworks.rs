@@ -173,6 +173,57 @@ fn nextjs_special_file_exports_are_not_flagged() {
     }
 }
 
+/// Next.js re-exports every named export of a metadata image route into the
+/// generated route handler, so a `generateStaticParams` next to the image
+/// default export is read by the framework when the route sits under a dynamic
+/// segment. Only the unrelated helper stays reportable.
+#[test]
+fn nextjs_metadata_image_route_generate_static_params_is_not_flagged() {
+    let root = fixture_path("nextjs-project");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_exports: Vec<(String, String)> = results
+        .unused_exports
+        .iter()
+        .map(|e| {
+            (
+                e.export
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&e.export.path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                e.export.export_name.clone(),
+            )
+        })
+        .collect();
+
+    for file in [
+        "src/app/blog/[slug]/opengraph-image.tsx",
+        "src/app/blog/[slug]/twitter-image.tsx",
+        "src/app/blog/[slug]/icon.tsx",
+        "src/app/blog/[slug]/apple-icon.tsx",
+    ] {
+        for export in ["default", "size", "contentType", "generateStaticParams"] {
+            assert!(
+                !unused_exports
+                    .iter()
+                    .any(|(unused_file, unused_export)| unused_file == file
+                        && unused_export == export),
+                "{file}:{export} should be treated as framework-used, found: {unused_exports:?}"
+            );
+        }
+        assert!(
+            unused_exports
+                .iter()
+                .any(|(unused_file, unused_export)| unused_file == file
+                    && unused_export == "unusedImageHelper"),
+            "{file}:unusedImageHelper should still be reported, found: {unused_exports:?}"
+        );
+    }
+}
+
 #[test]
 fn nextjs_config_referenced_dependencies_are_not_flagged_unused() {
     let root = fixture_path("nextjs-config-deps");
@@ -1020,6 +1071,61 @@ fn vite_alias_replacement_through_local_path_helper_resolves() {
             "{file} must be reachable through the alias: {unused_file_paths:?}"
         );
     }
+}
+
+/// A Vite alias can use a regular expression as its `find` value. An anchored
+/// literal key and a `^prefix/(.*)$` capture with a `/$1` replacement map to
+/// the prefix alias model, so the replacement files are reachable.
+#[test]
+fn vite_alias_with_regex_find_resolves() {
+    let root = fixture_path("vite-alias-regex-find");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unlisted_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|u| u.dep.package_name.as_str())
+        .collect();
+    assert!(
+        !unlisted_names.contains(&"virtual-logger"),
+        "regex alias key must not be an unlisted dependency: {unlisted_names:?}"
+    );
+    let unresolved: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.import.specifier.as_str())
+        .collect();
+    assert!(
+        !unresolved.contains(&"@/format"),
+        "regex capture alias must resolve: {unresolved:?}"
+    );
+    assert!(
+        !unresolved.contains(&"~/pad"),
+        "regex slash prefix alias must resolve: {unresolved:?}"
+    );
+
+    let unused_file_paths: Vec<String> = results
+        .unused_files
+        .iter()
+        .filter_map(|f| f.file.path.strip_prefix(&root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    for file in [
+        "src/node-module-shim.ts",
+        "src/logger.ts",
+        "src/format.ts",
+        "src/lib/pad.ts",
+    ] {
+        assert!(
+            !unused_file_paths.contains(&file.to_string()),
+            "{file} must be reachable through the regex alias: {unused_file_paths:?}"
+        );
+    }
+    assert!(
+        unused_file_paths.contains(&"src/orphan.ts".to_string()),
+        "control file must stay unused: {unused_file_paths:?}"
+    );
 }
 
 #[test]

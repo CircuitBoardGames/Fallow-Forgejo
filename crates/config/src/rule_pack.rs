@@ -90,8 +90,8 @@ impl EffectKind {
 
 /// One declarative policy rule inside a rule pack.
 ///
-/// `callees` applies only to `banned-call` rules; `specifiers` and
-/// `ignoreTypeOnly` apply only to `banned-import` rules; `effects` applies
+/// `callees` applies only to `banned-call` rules; `specifiers`,
+/// `allowNames` and `ignoreTypeOnly` apply only to `banned-import` rules; `effects` applies
 /// only to `banned-effect` rules; `exports` applies only to `banned-export`
 /// rules. `allowedFiles` and `proofKinds` apply only to `gdp-proof-producer`
 /// rules. `zones` can scope any rule kind to files classified into one of the
@@ -106,11 +106,14 @@ pub struct RulePackRule {
     pub id: String,
     /// Which check this rule performs.
     pub kind: RulePackRuleKind,
-    /// Callee patterns to ban (`banned-call` only). Matching is segment-aware
-    /// and import-resolved, identical to `boundaries.calls.forbidden`:
-    /// `child_process.*` covers `import { exec } from "node:child_process"`,
-    /// the bare specifier, and namespace/default imports; `fetch` matches only
-    /// the global `fetch`; a leading `*.member` matches any object.
+    /// Callee patterns to ban (`banned-call` only). A pattern matches a call
+    /// (`Date()`) and a constructor call (`new Date()`). Matching is
+    /// segment-aware and import-resolved, identical to
+    /// `boundaries.calls.forbidden`: `child_process.*` covers
+    /// `import { exec } from "node:child_process"`, the bare specifier, and
+    /// namespace/default imports; a leading `*.member` matches any object. A
+    /// bare pattern matches the written name, so it also matches a local
+    /// function or class with that name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub callees: Vec<String>,
     /// Import specifiers to ban (`banned-import` only). Matched segment-aware
@@ -121,9 +124,28 @@ pub struct RulePackRule {
     /// (e.g. `npm:moment`) are not matched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub specifiers: Vec<String>,
+    /// Imported names that a matched specifier may still bind (`banned-import`
+    /// only). Each entry is an exact imported name, with no globs. `"default"`
+    /// allows a default import. The rule compares the source-side name, so
+    /// `import { Mesh as Vector3 }` binds `Mesh`. The list applies to every
+    /// `specifiers` entry and to its subpaths.
+    ///
+    /// A namespace import, a star re-export and a side-effect import always
+    /// report, because they cannot be proven to stay in the list. `allowNames`
+    /// does not cover `require()`, `import()` or `import x = require()`, because
+    /// `banned-import` does not read them.
+    ///
+    /// A nonempty list changes `matched` to `<specifier>: <binding>`, so it
+    /// changes the baseline keys of the rule. Empty or absent keeps the raw
+    /// specifier. For a deny list, use `banned-call` with `three.Mesh`.
+    /// `banned-call` reports calls and `new` expressions. It does not report the
+    /// import, a re-export, `extends Mesh` or a value reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_names: Vec<String>,
     /// Effect classes to ban (`banned-effect` only). Effects are derived from
     /// `security_matchers.toml` catalogue rows and matched against captured
-    /// call sites after import-resolution canonicalization.
+    /// call sites after import-resolution canonicalization. `banned-effect`
+    /// reads call expressions only. It does not read `new` expressions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<EffectKind>,
     /// Export names to ban (`banned-export` only). `"default"` matches the
@@ -534,6 +556,12 @@ fn validate_rule(rule: &RulePackRule, path: &Path, errors: &mut Vec<RulePackErro
         }
     }
 
+    if rule.kind != RulePackRuleKind::BannedImport && !rule.allow_names.is_empty() {
+        errors.push(err(
+            "`allowNames` applies only to banned-import rules".to_owned()
+        ));
+    }
+
     validate_rule_file_globs(rule, &err, errors);
 }
 
@@ -653,6 +681,16 @@ fn validate_banned_import_rule(
                 "specifier `{specifier}` contains `*`; specifier matching is \
                  segment-aware, not glob. List the package or path prefix; subpaths are \
                  covered automatically, or use a single trailing `/*` to match subpaths only"
+            )));
+        }
+    }
+    for name in &rule.allow_names {
+        if name.trim().is_empty() {
+            errors.push(err("`allowNames` entries must not be empty".to_owned()));
+        } else if name.contains('*') {
+            errors.push(err(format!(
+                "`allowNames` entry `{name}` contains `*`; entries are exact imported names, \
+                 not globs"
             )));
         }
     }
@@ -1174,6 +1212,66 @@ mod tests {
         assert!(joined.contains("`callees` applies only to banned-call"));
         assert!(joined.contains("`effects` applies only to banned-effect"));
         assert!(joined.contains("`exports` applies only to banned-export"));
+    }
+
+    #[test]
+    fn accepts_allow_names_on_banned_import_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pack(
+            dir.path(),
+            "policy.json",
+            r#"{ "version": 1, "name": "p", "rules": [
+                { "id": "a", "kind": "banned-import", "specifiers": ["three"],
+                  "allowNames": ["Vector3", "default"] }
+            ] }"#,
+        );
+        let packs = load_rule_packs(dir.path(), &[path]).unwrap();
+        assert_eq!(packs[0].rules[0].allow_names, ["Vector3", "default"]);
+    }
+
+    #[test]
+    fn rejects_allow_names_on_other_kinds_and_inexact_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pack(
+            dir.path(),
+            "policy.json",
+            r#"{ "version": 1, "name": "p", "rules": [
+                { "id": "a", "kind": "banned-call", "callees": ["fetch"], "allowNames": ["x"] },
+                { "id": "b", "kind": "banned-effect", "effects": ["network"], "allowNames": ["x"] },
+                { "id": "c", "kind": "banned-export", "exports": ["default"], "allowNames": ["x"] },
+                { "id": "d", "kind": "gdp-proof-producer", "allowedFiles": ["src/**"], "allowNames": ["x"] },
+                { "id": "e", "kind": "banned-import", "specifiers": ["three"],
+                  "allowNames": ["Vector*", "*", " "] }
+            ] }"#,
+        );
+        let errors = load_rule_packs(dir.path(), &[path]).unwrap_err();
+        let joined = errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for id in ["a", "b", "c", "d"] {
+            assert!(
+                joined.contains(&format!(
+                    "rule '{id}': `allowNames` applies only to banned-import rules"
+                )),
+                "{joined}"
+            );
+        }
+        assert!(
+            joined.contains(
+                "rule 'e': `allowNames` entry `Vector*` contains `*`; entries are exact imported names, not globs"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("rule 'e': `allowNames` entry `*` contains `*`"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("rule 'e': `allowNames` entries must not be empty"),
+            "{joined}"
+        );
     }
 
     #[test]

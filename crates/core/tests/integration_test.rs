@@ -43,6 +43,8 @@ mod class_factory_property_provenance;
 mod class_value_projections;
 #[path = "integration_test/class_value_source_shapes.rs"]
 mod class_value_source_shapes;
+#[path = "integration_test/config_function_locals.rs"]
+mod config_function_locals;
 #[path = "integration_test/config_glob_star_segment.rs"]
 mod config_glob_star_segment;
 #[path = "integration_test/css_in_js_styled.rs"]
@@ -240,6 +242,8 @@ mod capability_e_route_exports;
 mod computed_enum_key_members;
 #[path = "integration_test/config_file_loading.rs"]
 mod config_file_loading;
+#[path = "integration_test/create_require_inline.rs"]
+mod create_require_inline;
 #[path = "integration_test/css_modules_unused.rs"]
 mod css_modules_unused;
 #[path = "integration_test/dev_dep_in_prod.rs"]
@@ -660,6 +664,12 @@ mod issue_3490_entry_glob_star_segment;
 mod issue_3817_workspace_dist_src_exports;
 #[path = "integration_test/issue_3868_method_return_type_member.rs"]
 mod issue_3868_method_return_type_member;
+#[path = "integration_test/issue_3960_this_method_return_type_member.rs"]
+mod issue_3960_this_method_return_type_member;
+#[path = "integration_test/issue_3967_script_argument_entries.rs"]
+mod issue_3967_script_argument_entries;
+#[path = "integration_test/issue_4033_this_method_result_local_member.rs"]
+mod issue_4033_this_method_result_local_member;
 #[path = "integration_test/issue_609_velite.rs"]
 mod issue_609_velite;
 #[path = "integration_test/issue_704_auto_import_components.rs"]
@@ -708,5 +718,7 @@ mod vite_root_entries;
 mod vitest_include_scope;
 #[path = "integration_test/vitest_script_config_arg.rs"]
 mod vitest_script_config_arg;
+#[path = "integration_test/webpack_alias_replacement.rs"]
+mod webpack_alias_replacement;
 #[path = "integration_test/webpack_inline_loaders.rs"]
 mod webpack_inline_loaders;

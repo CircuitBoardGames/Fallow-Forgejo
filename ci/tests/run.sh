@@ -279,6 +279,11 @@ if [ "${MOCK_BASELINE_STALENESS:-}" = "1" ]; then
       *) found="$found package-baselines" ;;
     esac
   fi
+  # A production baseline under a production run: the real binary drops the
+  # reason when the run and the file use the same mode.
+  if [ "${MOCK_SAVED_PRODUCTION:-}" = "1" ]; then
+    found=$(printf '%s' "$found" | sed 's/ production//g')
+  fi
   if [ -n "${MOCK_SCOPE_REASONS:-}" ]; then
     found=$(printf '%s' "$MOCK_SCOPE_REASONS" | tr ',' ' ')
   fi
@@ -409,6 +414,7 @@ OUT=$(cd "$RUNNER_TMP" && env \
   FALLOW_MAX_CYCLOMATIC= \
   FALLOW_MAX_COGNITIVE= \
   FALLOW_MAX_CRAP= \
+  FALLOW_MAX_FILE_LINES= \
   FALLOW_COVERAGE=coverage/coverage-final.json \
   FALLOW_PRODUCTION_COVERAGE= \
   FALLOW_COVERAGE_ROOT=/ci/workspace \
@@ -501,6 +507,24 @@ assert_contains "$SELECTION_ARGS" "audit " "audit selection: the command is audi
 assert_contains "$SELECTION_ARGS" "--skip dead-code,dupes" "audit selection: FALLOW_SKIP reaches audit"
 rm -rf "$SELECTION_WORK"
 
+# --- Health forwards FALLOW_MAX_FILE_LINES ---
+
+FILE_LINES_WORK="$RUNNER_TMP/health-file-lines"
+mkdir -p "$FILE_LINES_WORK"
+run_generated_gitlab_fixture "$FILE_LINES_WORK" \
+  FALLOW_COMMAND=health \
+  FALLOW_MAX_FILE_LINES=800 >/dev/null
+FILE_LINES_ARGS=""
+while IFS= read -r -d '' arg; do
+  FILE_LINES_ARGS+="${arg} "
+done < "$FILE_LINES_WORK/fallow-analysis-args.bin"
+assert_contains "$FILE_LINES_ARGS" "--max-file-lines 800" "health: FALLOW_MAX_FILE_LINES reaches health"
+OUT=$(run_generated_gitlab_fixture "$FILE_LINES_WORK" \
+  FALLOW_COMMAND=health \
+  FALLOW_MAX_FILE_LINES=lots)
+assert_contains "$OUT" "max-file-lines must be a positive integer" "health: a non-numeric FALLOW_MAX_FILE_LINES fails early"
+rm -rf "$FILE_LINES_WORK"
+
 # --- Baseline staleness gate (issue #2673) ---
 
 STALE_WORK="$RUNNER_TMP/stale-baseline"
@@ -558,6 +582,27 @@ if [ "$cmd_status" -eq 1 ]; then
 else
   fail "stale gate: the merge-request re-run can fail the pipeline" "exit $cmd_status"
 fi
+
+# A production baseline under a production run with a base ref has the reason
+# changed-since only. The re-read keeps --production, or it comes back in another
+# mode and stays inert.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_SAVED_PRODUCTION=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_PRODUCTION=true \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+GATE_ARGV=$(sed -n '2p' "$STALE_LOG")
+assert_contains "$GATE_ARGV" "--production" \
+  "stale gate: the re-read of a same-mode production run keeps --production"
+assert_not_contains "$GATE_ARGV" "--changed-since" \
+  "stale gate: the re-read of a same-mode production run drops the base ref"
+assert_contains "$OUT" "ERROR: Fallow baseline gate failed" \
+  "stale gate: the re-read of a same-mode production run judges the file"
 
 # The advisory is not gated behind the variable: a merge-request pipeline
 # re-reads the baseline unscoped so the warning reaches a job that asked for no

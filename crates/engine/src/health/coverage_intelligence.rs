@@ -895,6 +895,7 @@ mod tests {
             contributions: Vec::new(),
             effective_thresholds: None,
             threshold_source: None,
+            max_file_lines: None,
         }
     }
 
@@ -926,7 +927,7 @@ mod tests {
             actionability_verdict: None,
             provenance: fallow_output::RuntimeCoverageProvenance::default(),
         };
-        report.summary.functions_tracked = 1;
+        report.summary.functions_tracked = Some(1);
         report
     }
 

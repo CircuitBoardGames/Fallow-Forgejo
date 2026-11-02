@@ -442,7 +442,10 @@ test("regular CI keeps affected checks on Ubuntu", () => {
     windowsRustJob.match(/^    if: (.+)$/m)?.[1],
   );
   assert.match(windowsDriftJob, /runs-on: windows-latest/);
-  assert.match(windowsDriftJob, /^[ \t]+run: cargo build -p fallow-mcp$/m);
+  assert.match(
+    windowsDriftJob,
+    /^[ \t]+run: cargo build -p fallow-cli -p fallow-mcp --bin fallow-mcp --test drift$/m,
+  );
   assert.match(
     windowsDriftJob,
     /^[ \t]+run: cargo test -p fallow-cli --test drift -- --include-ignored$/m,
@@ -737,7 +740,20 @@ test("release publication waits for the aggregate verification gate", () => {
   assert.match(similarCodeConformance, /needs: \[build, sign\]/);
   assert.match(similarCodeConformance, /permissions:\n\s+contents: read/);
   assert.doesNotMatch(similarCodeConformance, /id-token: write|contents: write/);
-  assert.match(similarCodeConformance, /fallow-similar-code-linux-x64-gnu/);
+  // The macOS binaries link Apple Accelerate, a separate numeric path from the
+  // Linux binary, so each one runs the conformance check on its own platform.
+  const conformanceLegs = Array.from(
+    similarCodeConformance.matchAll(/^\s+- npm_dir: (\S+)\n\s+os: (\S+)$/gmu),
+    (match) => `${match[1]}@${match[2]}`,
+  );
+  assert.deepEqual(conformanceLegs.toSorted(), [
+    "darwin-arm64@macos-latest",
+    "darwin-x64@macos-15-intel",
+    "linux-x64-gnu@ubuntu-26.04",
+  ]);
+  assert.match(similarCodeConformance, /runs-on: \$\{\{ matrix\.os \}\}/u);
+  assert.match(similarCodeConformance, /name: fallow-similar-code-\$\{\{ matrix\.npm_dir \}\}/u);
+  assert.doesNotMatch(similarCodeConformance, /stat --format/u);
   assert.match(similarCodeConformance, /verify-binary\.mjs/);
   assert.match(similarCodeConformance, /release_binary_max_bytes/);
   // The dependency audit lives in release validation, which `validate` calls.
@@ -907,6 +923,16 @@ test("release publishes no VSIX before the approved fallow root is public", () =
   assert.match(npmPublish, /^\s+id: publish$/mu);
   assert.match(npmPublish, /fallow_sha256: \$\{\{ steps\.publish\.outputs\.fallow_sha256 \}\}/u);
   assert.match(npmPublish, /echo "fallow_sha256=\$digest" >> "\$GITHUB_OUTPUT"/u);
+  // A rerun after the stage approval finds the root public and skips it.
+  // The digest must still reach the gate, or the wait fails with an empty
+  // expected sha256 and no rerun can recover the run (v3.38.0).
+  const digestOutput = npmPublish.indexOf('echo "fallow_sha256=$digest" >> "$GITHUB_OUTPUT"');
+  const publishedSkip = npmPublish.indexOf('if npm view "$name@$version" version');
+  assert.notEqual(publishedSkip, -1, "npm-publish must skip a published tarball");
+  assert.ok(
+    digestOutput < publishedSkip,
+    "npm-publish must write the root digest before it skips a published tarball",
+  );
   assert.match(gate, /^\s+needs: npm-publish$/mu);
   assert.match(gate, /permissions:\n\s+contents: read/u);
   assert.doesNotMatch(gate, /^\s+environment:|secrets\.|id-token: write|actions\/checkout/mu);
@@ -1347,6 +1373,35 @@ test("CI runs the mutation runner tests at the declared runtime floors", () => {
   );
   assert.match(job, /persist-credentials: false/u);
   assert.match(indentedBlock(workflow, "ci-ok", 2), /mutation-runner-floor/u);
+});
+
+test("CI runs clippy on the similar-code sidecar workspace", () => {
+  const workflow = readWorkflow(".github/workflows/ci.yml");
+  const job = indentedBlock(workflow, "similar-code-sidecar", 2);
+  const paths = listedPaths(indentedBlock(workflow, "similar-code-sidecar", 12));
+
+  // The sidecar is a separate Cargo workspace, so the workspace clippy run
+  // in check-lint does not lint it.
+  assert.match(
+    job,
+    /run: cargo clippy --locked --manifest-path tools\/similar-code-sidecar\/Cargo\.toml --target-dir target --all-targets -- -D warnings/u,
+  );
+  assert.match(job, /uses: \.\/\.github\/actions\/setup-rust\n\s+with:\n\s+components: clippy/u);
+  assert.match(job, /needs\.changes\.outputs\.similar-code-sidecar == 'true'/u);
+  assert.match(job, /persist-credentials: false/u);
+  // build.rs reads the protocol file, so a change there must lint too.
+  for (const path of [
+    "tools/similar-code-sidecar/**",
+    "crates/api/similar-code-protocol.json",
+    "rust-toolchain.toml",
+  ]) {
+    assert.ok(paths.includes(path), `the similar-code-sidecar filter must list ${path}`);
+  }
+  assert.match(
+    indentedBlock(workflow, "outputs", 4),
+    /similar-code-sidecar: \$\{\{ steps\.filter\.outputs\.similar-code-sidecar \}\}/u,
+  );
+  assert.match(indentedBlock(workflow, "ci-ok", 2), /needs: \[[^\n]*\bsimilar-code-sidecar\b/u);
 });
 
 test("the check job runs the end-to-end mutation tests instead of a skip", () => {
@@ -2325,6 +2380,26 @@ test("every workflow that runs tests turns off git automatic maintenance", () =>
 
 // A job-level or step-level `GIT_CONFIG_COUNT` replaces the top-level one, and
 // the jobs below it then run without the maintenance setting.
+test("the drift harness builds fallow-mcp and its test target in one invocation", () => {
+  // `fallow-cli` turns on more dependency features than `fallow-mcp`. A
+  // separate `cargo build -p fallow-mcp` resolves a smaller feature set, and
+  // the test step then compiles a second copy of most of the tree.
+  const single = "cargo build -p fallow-cli -p fallow-mcp --bin fallow-mcp --test drift";
+  let drift = 0;
+  for (const name of readdirSync(".github/workflows").filter((file) => /\.ya?ml$/.test(file))) {
+    const source = readWorkflow(join(".github/workflows", name));
+    assert.doesNotMatch(
+      source,
+      /cargo build -p fallow-mcp\s*$/m,
+      `${name} builds fallow-mcp alone`,
+    );
+    const runs = source.match(/cargo test -p fallow-cli --test drift/g)?.length ?? 0;
+    drift += runs;
+    assert.equal(source.split(single).length - 1, runs, `${name} must build each drift run once`);
+  }
+  assert.ok(drift >= 3, "the drift, Windows drift and release drift jobs run the harness");
+});
+
 test("only the top-level env of a workflow sets GIT_CONFIG variables", () => {
   for (const name of readdirSync(".github/workflows").filter((file) => /\.ya?ml$/.test(file))) {
     const source = readWorkflow(join(".github/workflows", name));
@@ -2344,7 +2419,9 @@ test("Miri runs the three crates in parallel with the same test selection", () =
   const toolchain = 'cargo +"$MIRI_TOOLCHAIN" miri test';
   for (const command of [
     `${toolchain} -p fallow-types --lib --tests -- --skip proptests`,
-    `${toolchain} -p fallow-graph --lib --tests -- --skip proptests`,
+    `${toolchain} -p fallow-graph --lib --tests -- "\${graph_shard_1[@]}" --skip proptests`,
+    `${toolchain} -p fallow-graph --lib --tests -- "\${graph_shard_2[@]}" --skip proptests`,
+    `${toolchain} -p fallow-graph --lib --tests -- "\${graph_shard_3[@]}" --skip proptests`,
     `${toolchain} -p fallow-extract --lib --tests css:: -- --skip sfc_css::`,
     `${toolchain} -p fallow-extract --lib --tests css_classes::`,
     `${toolchain} -p fallow-extract --lib --tests css_metrics::`,
@@ -2356,6 +2433,30 @@ test("Miri runs the three crates in parallel with the same test selection", () =
   for (const crate of ["fallow-types", "fallow-graph", "fallow-extract"]) {
     assert.ok(miri.includes(`${toolchain} -p ${crate} --lib --tests --no-run`));
   }
+  // Shard 3 skips every filter of shards 1 and 2, so each fallow-graph test
+  // runs in exactly one shard and a new module cannot fall out of the run.
+  assert.ok(
+    miri.includes(
+      'for filter in "${graph_shard_1[@]}" "${graph_shard_2[@]}"; do graph_shard_3+=(--skip "$filter"); done',
+    ),
+    "the last fallow-graph shard must skip exactly the filters of the other shards",
+  );
+  assert.match(miri, /^ {10}graph_shard_3=\(\)$/m);
+  // A filter matches a substring, so a filter inside another filter runs the
+  // same tests in shards 1 and 2.
+  const filters = ["graph_shard_1", "graph_shard_2"].flatMap((name) =>
+    miri.match(new RegExp(`^ {10}${name}=\\(([^)]+)\\)$`, "m"))[1].split(" "),
+  );
+  for (const filter of filters) {
+    const others = filters.filter((other) => other !== filter && other.includes(filter));
+    assert.deepEqual(others, [], `fallow-graph shard filter ${filter} overlaps ${others}`);
+  }
+  assert.ok(
+    miri.includes(
+      "crates=(fallow-types fallow-graph-1 fallow-graph-2 fallow-graph-3 fallow-extract)",
+    ),
+    "Miri must start every unit",
+  );
   const extract = miri.slice(
     miri.indexOf("fallow-extract)"),
     miri.indexOf(";;", miri.indexOf("fallow-extract)")),

@@ -108,6 +108,7 @@ Automation and CI:
 
 Runtime coverage:
   coverage       Set up or analyze runtime coverage data
+  cloud          Log in to Fallow Cloud and store a read-only API key
   license        Manage the paid-feature license
   telemetry      Manage opt-in product telemetry
 
@@ -187,9 +188,8 @@ pub struct Cli {
     )]
     pub format: Format,
 
-    /// Indent JSON output for manual inspection. Requires the final output format to be JSON.
-    #[arg(hide_short_help = true, long, global = true)]
-    pub pretty: bool,
+    #[command(flatten)]
+    pub json: crate::json_style::JsonPresentationArgs,
 
     /// Suppress progress output
     #[arg(short, long, global = true)]
@@ -441,8 +441,8 @@ pub struct Cli {
     /// which is published with or without this flag; the flag decides only
     /// whether that entry is `enforced`, and the exit code plus one stderr
     /// line. Inert when no baseline is loaded, on runs narrowed to part of
-    /// the project (including production mode), which cannot judge a
-    /// whole-project baseline, and under `health --report-only`, which never
+    /// the project, which cannot judge a baseline saved with another scope,
+    /// on `health` and `dupes` in production mode, and under `health --report-only`, which never
     /// fails a run; such a run prints why it stood down instead of passing
     /// quietly. `fallow audit` always analyzes only changed files, so the gate
     /// never fires there.
@@ -1035,6 +1035,33 @@ pub enum Command {
         /// hotspot subsystem. Default off to avoid git-history latency.
         #[arg(long)]
         churn: bool,
+
+        /// OPT-IN: attach Fallow Cloud production evidence for a `--file`
+        /// target as the `cloud` evidence section: calls, errors, CPU and
+        /// never-run branches per function. The API key is $FALLOW_API_KEY,
+        /// else the key that `fallow cloud login` stored. A missing key, a
+        /// plan gate or an unreachable cloud is a section status, never a
+        /// failed run.
+        #[arg(long, conflicts_with = "symbol")]
+        cloud: bool,
+
+        /// Fallow Cloud repository for `--cloud`. Precedence: this flag >
+        /// $FALLOW_REPO > the `origin` git remote.
+        #[arg(long, value_name = "OWNER/REPO", requires = "cloud")]
+        repo: Option<String>,
+    },
+
+    /// Connect this machine to Fallow Cloud.
+    ///
+    /// `login` runs the device flow: it shows a code and a URL, and after
+    /// you approve the code in the dashboard it stores a read-only API key
+    /// in the OS keychain (service `fallow-cloud`), or in
+    /// `~/.config/fallow/credentials` (mode 0600) when no keychain is
+    /// available. `--api-key` and $FALLOW_API_KEY still win over the
+    /// stored key. `logout` removes the stored key.
+    Cloud {
+        #[command(subcommand)]
+        subcommand: CloudCli,
     },
 
     /// Trace a symbol's call chain, or the shortest import path between two
@@ -1482,6 +1509,12 @@ pub enum Command {
         /// complexity findings. Pair with `--coverage` for accurate scoring.
         #[arg(long)]
         max_crap: Option<f64>,
+
+        /// Maximum physical lines per file (overrides config `health.maxFileLines`,
+        /// default 0 = off). A longer file is reported as a complexity finding
+        /// with `exceeded: "file_lines"`.
+        #[arg(long, value_name = "LINES")]
+        max_file_lines: Option<u32>,
 
         /// Show only the N most complex functions
         #[arg(long)]
@@ -2285,16 +2318,15 @@ pub enum BaselinesCli {
     /// Remove the baseline entries that match no current finding.
     ///
     /// Reads the files that `audit.deadCodeBaseline`, `audit.healthBaseline`
-    /// and `audit.dupesBaseline` name, runs one whole-project analysis, and
-    /// removes each entry that `--baseline` would no longer match. Prune never
-    /// adds an entry: a new finding stays outside the baseline, and the normal
-    /// gates report it. To record new findings on purpose, use
-    /// `fallow <dead-code|health|dupes> --save-baseline`.
+    /// and `audit.dupesBaseline` name, runs one analysis over the whole project,
+    /// in production mode with --production or config, and removes each entry
+    /// that `--baseline` would no longer match. Prune never adds an entry. To
+    /// record new findings on purpose, use `fallow <kind> --save-baseline`.
     ///
     /// Exit codes: 0 when the files are pruned or have nothing to prune, 1 with
     /// `--check` when an entry can be pruned, and 2 when a file cannot be read
-    /// or pruned. A file with an older key form is skipped with the command
-    /// that saves it again.
+    /// or pruned. A file with an older key form or another mode (`--production`,
+    /// `--include-entry-exports`) is skipped with the command to use.
     Prune {
         /// Report the entries that a prune would remove, and write nothing.
         #[arg(long)]
@@ -2370,62 +2402,6 @@ pub enum AuditCacheCli {
     },
 }
 
-#[derive(clap::Subcommand)]
-pub enum LicenseCli {
-    /// Activate a license JWT.
-    ///
-    /// JWT input precedence: positional arg > `--from-file` > stdin (`-`).
-    /// All paths normalize whitespace before crypto verification.
-    Activate {
-        /// JWT as a positional argument.
-        #[arg(value_name = "JWT")]
-        jwt: Option<String>,
-
-        /// Path to a file containing the JWT.
-        #[arg(long, value_name = "PATH")]
-        from_file: Option<PathBuf>,
-
-        /// Read JWT from stdin.
-        #[arg(long, conflicts_with_all = ["jwt", "from_file"])]
-        stdin: bool,
-
-        /// Start a 30-day email-gated trial in one step.
-        ///
-        /// The trial endpoint is rate-limited to 5 requests per hour per IP.
-        /// In CI or behind a shared NAT, start the trial from a developer
-        /// machine and set FALLOW_LICENSE (or FALLOW_LICENSE_PATH) on the
-        /// runner instead of re-running `activate --trial` per job.
-        #[arg(long, requires = "email")]
-        trial: bool,
-
-        /// Email address for the trial flow.
-        #[arg(long, value_name = "ADDR")]
-        email: Option<String>,
-    },
-    /// Show the active license tier, seats, features, and days remaining.
-    Status,
-    /// Fetch a fresh JWT from `api.fallow.cloud` (network-only).
-    ///
-    /// The stored license JWT is the primary identity proof. When it is
-    /// missing, or the cloud reports it as too stale to exchange, the request
-    /// is retried with a full-access API key.
-    Refresh {
-        /// Fallow Cloud API key (bearer token) used when the stored license
-        /// JWT cannot be refreshed.
-        ///
-        /// Precedence: this flag > $FALLOW_API_KEY. Generate at
-        /// <https://fallow.cloud/settings#api-keys>.
-        ///
-        /// Security: prefer $FALLOW_API_KEY on shared CI runners. Passing a
-        /// secret on the command line may be visible to other processes via
-        /// `ps` and can leak into shell history or process audit logs.
-        #[arg(long, value_name = "KEY")]
-        api_key: Option<String>,
-    },
-    /// Remove the local license file.
-    Deactivate,
-}
-
 #[derive(Clone, Copy, clap::Subcommand)]
 pub enum TelemetryCli {
     /// Show effective telemetry state, precedence, and controls.
@@ -2462,17 +2438,8 @@ pub enum CiTemplateCli {
 pub enum CoverageCli {
     /// Resumable first-run setup: license + sidecar + recipe + analysis.
     Setup {
-        /// Accept all prompts automatically.
-        #[arg(short = 'y', long)]
-        yes: bool,
-
-        /// Print instructions instead of prompting.
-        #[arg(long)]
-        non_interactive: bool,
-
-        /// Emit deterministic setup instructions as JSON. Implies --non-interactive.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: crate::coverage::CoverageSetupCli,
     },
     /// Analyze runtime coverage from a local artifact or explicit cloud source.
     ///
@@ -2490,7 +2457,7 @@ pub enum CoverageCli {
         #[arg(long, visible_alias = "runtime-coverage-cloud")]
         cloud: bool,
 
-        /// Fallow Cloud API key. Precedence: this flag > $FALLOW_API_KEY.
+        /// Fallow Cloud API key. Order: flag > $FALLOW_API_KEY > `fallow cloud login` key.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 
@@ -2597,6 +2564,12 @@ pub enum CoverageCli {
         #[arg(long, value_name = "SHA")]
         git_sha: Option<String>,
 
+        /// Bind the upload to a Vercel deployment. Defaults to $VERCEL_DEPLOYMENT_ID
+        /// only when $VERCEL=1. With Vercel OIDC authentication, the cloud verifies
+        /// the deployment against the supplied git SHA.
+        #[arg(long, value_name = "DEPLOYMENT_ID")]
+        vercel_deployment_id: Option<String>,
+
         /// Proceed even when the working tree has uncommitted changes.
         ///
         /// Warning: the inventory is generated from the working copy, so it
@@ -2611,18 +2584,9 @@ pub enum CoverageCli {
         #[arg(long, value_name = "GLOB", num_args = 0..)]
         exclude_paths: Vec<String>,
 
-        /// Prefix prepended to every emitted filePath so the static
-        /// inventory joins with the runtime beacon for your deployment.
-        /// Required for containerized deployments where the deployed
-        /// WORKDIR rebases paths at runtime. Default: none (paths emit
-        /// repo-relative, matching local runs and non-container CI).
-        ///
-        /// Common values: `/app` (typical Dockerfile), `/workspace`
-        /// (Buildpacks / Cloud Run), `/usr/src/app` (older Node images),
-        /// `/var/task` (Lambda), `/home/runner/work/<repo>/<repo>`
-        /// (GitHub Actions default checkout).
-        ///
-        /// Must start with `/` and use POSIX separators.
+        /// Prefix for inventory paths to match the runtime beacon, for example
+        /// `/app` for Docker or `/var/task` for Lambda. Defaults to repo-relative
+        /// paths. Must start with `/` and use POSIX separators.
         #[arg(long, value_name = "PREFIX")]
         path_prefix: Option<String>,
 
@@ -2646,16 +2610,9 @@ pub enum CoverageCli {
     },
     /// Upload JavaScript source maps to Fallow Cloud for bundled runtime coverage.
     ///
-    /// Scans a build output directory for `.map` files and uploads them under
-    /// the selected repo + git SHA. The production beacon reports bundled
-    /// paths; the cloud resolver uses these maps to remap runtime coverage back
-    /// to original source files.
-    ///
-    /// Each upload also carries the map's path relative to the repo root, so the
-    /// source-evidence viewer can resolve a monorepo sub-package map's relative
-    /// `sources[]` (e.g. `../../src/X`) to the package-prefixed source path
-    /// (e.g. `dashboard/src/X`). Run from the repo root so this prefix is
-    /// correct.
+    /// Uploads build `.map` files under the selected repo and git SHA so the
+    /// cloud can resolve bundled runtime paths to original sources. Run from
+    /// the repo root to preserve each map's repo-relative path and source base.
     UploadSourceMaps {
         /// Directory to scan recursively for source maps.
         #[arg(long, value_name = "PATH", default_value = "dist")]
@@ -2683,6 +2640,12 @@ pub enum CoverageCli {
         /// `git rev-parse HEAD`.
         #[arg(long, value_name = "SHA")]
         git_sha: Option<String>,
+
+        /// Bind the upload to a Vercel deployment. Defaults to $VERCEL_DEPLOYMENT_ID
+        /// only when $VERCEL=1. With Vercel OIDC authentication, the cloud verifies
+        /// the deployment against the supplied git SHA.
+        #[arg(long, value_name = "DEPLOYMENT_ID")]
+        vercel_deployment_id: Option<String>,
 
         /// Override the Fallow Cloud base URL.
         #[arg(long, value_name = "URL")]
@@ -2778,7 +2741,7 @@ pub enum CoverageCli {
     /// `--changed-since`), then $FALLOW_AUDIT_BASE, then the merge-base with
     /// the upstream or the remote default branch.
     ReviewPacket {
-        /// Fallow Cloud API key. Precedence: this flag > $FALLOW_API_KEY.
+        /// Fallow Cloud API key. Order: flag > $FALLOW_API_KEY > `fallow cloud login` key.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 
@@ -2821,7 +2784,7 @@ pub enum CoverageCli {
     /// base deployment commit with `--base <sha>`; without it, the cloud
     /// picks the previous deployment with production runtime.
     DeploymentChanges {
-        /// Fallow Cloud API key. Precedence: this flag > $FALLOW_API_KEY.
+        /// Fallow Cloud API key. Order: flag > $FALLOW_API_KEY > `fallow cloud login` key.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 
@@ -3107,73 +3070,12 @@ impl From<TypeAwareRequireArg> for fallow_config::TypeAwareRequire {
     }
 }
 
-/// Filter refactoring targets by effort level.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum EffortFilter {
-    Low,
-    Medium,
-    High,
-}
-
-impl EffortFilter {
-    /// Convert to the corresponding `EffortEstimate` for comparison.
-    pub(crate) const fn to_estimate(self) -> fallow_output::EffortEstimate {
-        match self {
-            Self::Low => fallow_output::EffortEstimate::Low,
-            Self::Medium => fallow_output::EffortEstimate::Medium,
-            Self::High => fallow_output::EffortEstimate::High,
-        }
-    }
-}
-
-/// CLI parser for the health severity gate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum HealthSeverityCli {
-    Moderate,
-    High,
-    Critical,
-}
-
-impl HealthSeverityCli {
-    /// Convert to the typed health output severity.
-    pub(crate) const fn to_health_severity(self) -> fallow_output::FindingSeverity {
-        match self {
-            Self::Moderate => fallow_output::FindingSeverity::Moderate,
-            Self::High => fallow_output::FindingSeverity::High,
-            Self::Critical => fallow_output::FindingSeverity::Critical,
-        }
-    }
-}
-
-/// Privacy mode for author emails emitted by `--ownership`.
-///
-/// CLI mirror of [`fallow_config::EmailMode`]. Kept as a separate enum so
-/// the help text controls rendering and we don't leak config-internal
-/// schema details into clap.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum EmailModeArg {
-    /// Show full email addresses as recorded in git history.
-    Raw,
-    /// Show local-part only (default). Unwraps GitHub-style noreply prefixes.
-    Handle,
-    /// Show stable non-cryptographic pseudonyms (`xxh3:<hex>`).
-    Anonymized,
-    /// Legacy spelling for anonymized output.
-    #[value(hide = true)]
-    Hash,
-}
-
-impl EmailModeArg {
-    /// Convert to the equivalent config-level mode.
-    pub(crate) const fn to_config(self) -> fallow_config::EmailMode {
-        match self {
-            Self::Raw => fallow_config::EmailMode::Raw,
-            Self::Handle => fallow_config::EmailMode::Handle,
-            Self::Anonymized => fallow_config::EmailMode::Anonymized,
-            Self::Hash => fallow_config::EmailMode::Hash,
-        }
-    }
-}
+#[path = "cli_args_health.rs"]
+mod health_args;
+pub use health_args::*;
+#[path = "cli_args_cloud.rs"]
+mod cloud_args;
+pub use cloud_args::*;
 
 /// CLI mirror of [`fallow_config::AuditGate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]

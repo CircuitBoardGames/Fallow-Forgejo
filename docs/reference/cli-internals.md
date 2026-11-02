@@ -599,6 +599,10 @@ line states exit code 0.
   with the number of wildcards in the file. `CodeOwners::parse` rejects a
   pattern with more than `MAX_RULE_WILDCARDS` wildcards and a file with more
   than `MAX_FILE_WILDCARDS`. Large public CODEOWNERS files use fewer than 400.
+  The `GlobSet` also builds an Aho-Corasick DFA over literal prefixes, and
+  that build time grows with the square of the pattern length.
+  `CodeOwners::parse` rejects a pattern longer than `MAX_RULE_BYTES`. Config
+  globs have the same limit, `MAX_GLOB_BYTES` in `glob_validation.rs`.
 
 - A stderr warning that repeats a `workspace_diagnostics[]` entry, or that
   describes the analysis inputs, uses the tracing target
@@ -876,14 +880,26 @@ Shared invariants (`crates/cli/src/base_worktree.rs`):
 - Both prune modes and the per-audit sweep share one decision code path
   (`sweep_reusable_caches_with_report`), so prune can never drift from what
   audits actually reclaim.
+- The per-audit sweep scans the temp dir for legacy and cross-repo entries
+  at most once per hour (`FULL_SWEEP_INTERVAL` in `crates/cli/src/base_worktree_scan.rs`). The mtime of the
+  `fallow-audit-cache-sweep-<euid>.stamp` marker in the temp dir records the
+  last scan. Audits inside the interval sweep only the requested root's own
+  entry and the git-registered legacy entries (`SweepScope::OwnedOnly`), so
+  their cost does not grow with the number of entries in the temp dir. A
+  missing, old, future-dated or untrusted marker gives a full scan. Prune
+  always scans (`SweepScope::All`) and does not read or write the marker.
 - `--dry-run` performs zero filesystem mutation: no cache removal, no
   `.lock` sidecar creation (acquiring a lock would create one), no
   `.last-used` grace seeding, and no git worktree deregistration. The legacy
   registered-cache pass is still enumerated read-only with the same
   `legacy-registered` / `legacy-deregistered` split an apply run reports.
-- `.lock` sidecars are permanent lock identities and are never deleted:
-  removing an unlinked-but-still-flocked inode while a racer re-creates the
-  path would split one lock across two inodes.
+- On Unix the sweep unlinks the `.lock` sidecar of a reclaimed entry while it
+  holds the flock, and reports a bare lock sidecar as `orphaned-lock`. This is
+  race-safe because `ReusableWorktreeLock::try_acquire` checks after the flock
+  that its fd is still the inode at the path, and opens the path again when
+  it is not. Without that check, a process that opened the old inode before
+  the unlink could hold a flock on it while another process locks the new
+  file. Windows keeps the `.lock` sidecar and reports `lock-only`.
 - Owner liveness for foreign entries is a NotFound-only probe on
   `std::fs::metadata`: only a definitive NotFound classifies the recorded
   owner root as dead. Every other probe error (EACCES, EIO, ENOTDIR) keeps

@@ -27,6 +27,7 @@ fn rule(id: &str, kind: RulePackRuleKind) -> RulePackRule {
         kind,
         callees: Vec::new(),
         specifiers: Vec::new(),
+        allow_names: Vec::new(),
         effects: Vec::new(),
         exports: Vec::new(),
         allowed_files: Vec::new(),
@@ -224,6 +225,14 @@ fn callee(path: &str, span_start: u32) -> CalleeUse {
     CalleeUse {
         callee_path: path.to_string(),
         span_start,
+        is_new: false,
+    }
+}
+
+fn new_callee(path: &str, span_start: u32) -> CalleeUse {
+    CalleeUse {
+        is_new: true,
+        ..callee(path, span_start)
     }
 }
 
@@ -342,6 +351,61 @@ fn banned_call_matches_import_resolved_canonical_path() {
         find_policy_violations(&graph, &modules, &config, &suppressions, &line_offsets);
     assert_eq!(violations.len(), 1);
     assert_eq!(violations[0].matched, "execSync");
+}
+
+#[test]
+fn banned_call_matches_new_form_and_reports_new_prefix() {
+    let root = PathBuf::from("/tmp/policy-test");
+    let config = make_config(
+        root.clone(),
+        vec![pack(vec![banned_call("no-clock", &["Date"])])],
+        Severity::Warn,
+    );
+    let graph = build_graph(&root, &["src/app.ts"]);
+    let modules = vec![module(
+        0,
+        vec![new_callee("Date", 0), callee("Date", 10)],
+        Vec::new(),
+    )];
+    let suppressions = SuppressionContext::empty();
+    let line_offsets = FxHashMap::default();
+
+    let violations =
+        find_policy_violations(&graph, &modules, &config, &suppressions, &line_offsets);
+    let matched: Vec<&str> = violations.iter().map(|v| v.matched.as_str()).collect();
+    assert_eq!(matched, vec!["new Date", "Date"]);
+}
+
+#[test]
+fn banned_effect_ignores_new_form() {
+    let root = PathBuf::from("/tmp/policy-test");
+    let config = make_config(
+        root.clone(),
+        vec![pack(vec![banned_effect(
+            "no-process",
+            &[EffectKind::Process],
+        )])],
+        Severity::Warn,
+    );
+    let graph = build_graph(&root, &["src/app.ts"]);
+    // The call form of `RegExp` is the positive control for this rule.
+    let modules = vec![module(
+        0,
+        vec![
+            new_callee("RegExp", 0),
+            new_callee("Array", 10),
+            new_callee("Function", 20),
+            callee("RegExp", 30),
+        ],
+        Vec::new(),
+    )];
+    let suppressions = SuppressionContext::empty();
+    let line_offsets = FxHashMap::default();
+
+    let violations =
+        find_policy_violations(&graph, &modules, &config, &suppressions, &line_offsets);
+    let matched: Vec<&str> = violations.iter().map(|v| v.matched.as_str()).collect();
+    assert_eq!(matched, vec!["process: RegExp"]);
 }
 
 #[test]
@@ -699,6 +763,170 @@ fn banned_import_covers_re_exports() {
 
     let violations = find_policy_violations(&graph, &[m], &config, &suppressions, &line_offsets);
     assert_eq!(violations.len(), 1);
+}
+
+fn banned_import_with_list(names: &[&str]) -> RulePackRule {
+    RulePackRule {
+        allow_names: names.iter().map(ToString::to_string).collect(),
+        ..banned_import("no-three", &["three"])
+    }
+}
+
+fn re_export(imported: &str, exported: &str) -> ReExportInfo {
+    ReExportInfo {
+        source: "three".to_string(),
+        imported_name: imported.to_string(),
+        exported_name: exported.to_string(),
+        is_type_only: false,
+        span: oxc_span::Span::new(0, 10),
+        statement_span: oxc_span::Span::new(0, 0),
+        source_span: oxc_span::Span::new(0, 0),
+    }
+}
+
+fn matched_values(rule: RulePackRule, m: ModuleInfo) -> Vec<String> {
+    let root = PathBuf::from("/tmp/policy-test");
+    let config = make_config(root.clone(), vec![pack(vec![rule])], Severity::Warn);
+    let graph = build_graph(&root, &["src/a.ts"]);
+    let suppressions = SuppressionContext::empty();
+    let line_offsets = FxHashMap::default();
+    find_policy_violations(&graph, &[m], &config, &suppressions, &line_offsets)
+        .into_iter()
+        .map(|violation| violation.matched)
+        .collect()
+}
+
+#[test]
+fn allow_names_reports_only_sites_that_bind_no_listed_name() {
+    let m = module(
+        0,
+        Vec::new(),
+        vec![
+            import(
+                "three",
+                ImportedName::Named("Vector3".to_string()),
+                "V",
+                false,
+            ),
+            import(
+                "three",
+                ImportedName::Named("Mesh".to_string()),
+                "Vector3",
+                false,
+            ),
+            import("three", ImportedName::Default, "D", false),
+            import("three", ImportedName::Namespace, "T", false),
+            import("three", ImportedName::SideEffect, "", false),
+        ],
+    );
+    assert_eq!(
+        matched_values(banned_import_with_list(&["Vector3"]), m),
+        [
+            "three: Mesh",
+            "three: default",
+            "three: *",
+            "three: side-effect"
+        ]
+    );
+}
+
+#[test]
+fn allow_names_star_forms_report_even_when_the_list_holds_the_star_text() {
+    // Pack validation rejects this entry. The matcher must still not depend on
+    // that check, because the re-export model spells a star as `*`.
+    let mut m = module(
+        0,
+        Vec::new(),
+        vec![import("three", ImportedName::Namespace, "T", false)],
+    );
+    m.re_exports.push(re_export("*", "*"));
+    m.re_exports.push(re_export("*", "NS"));
+    m.re_exports.push(re_export("Vector3", "Vector3"));
+    assert_eq!(
+        matched_values(banned_import_with_list(&["*", "Vector3"]), m),
+        ["three: *", "three: *", "three: *"]
+    );
+}
+
+#[test]
+fn allow_names_consumes_a_suppression_only_on_a_reported_site() {
+    let root = PathBuf::from("/tmp/policy-test");
+    let config = make_config(
+        root.clone(),
+        vec![pack(vec![banned_import_with_list(&["Vector3"])])],
+        Severity::Warn,
+    );
+    let graph = build_graph(&root, &["src/a.ts"]);
+    let consumed = |name: &str| {
+        let mut m = module(
+            0,
+            Vec::new(),
+            vec![import(
+                "three",
+                ImportedName::Named(name.to_string()),
+                name,
+                false,
+            )],
+        );
+        m.suppressions
+            .push(fallow_types::suppress::Suppression::issue(
+                1,
+                1,
+                crate::suppress::IssueKind::PolicyViolation,
+            ));
+        let modules = vec![m];
+        let suppressions = SuppressionContext::new(&modules);
+        let offsets: Vec<u32> = vec![0];
+        let mut line_offsets = FxHashMap::default();
+        line_offsets.insert(FileId(0), offsets.as_slice());
+        let violations =
+            find_policy_violations(&graph, &modules, &config, &suppressions, &line_offsets);
+        assert!(violations.is_empty(), "{violations:?}");
+        suppressions.used_count()
+    };
+    assert_eq!(consumed("Vector3"), 0, "an allowed site reports nothing");
+    assert_eq!(consumed("Mesh"), 1, "a reported site consumes the comment");
+}
+
+#[test]
+fn policy_finding_explains_the_list_only_for_a_rule_with_a_list() {
+    let root = PathBuf::from("/tmp/policy-test");
+    let config = make_config(
+        root.clone(),
+        vec![pack(vec![
+            banned_import_with_list(&["Vector3"]),
+            banned_import("no-moment", &["moment"]),
+        ])],
+        Severity::Warn,
+    );
+    let note = |rule_id: &str, matched: &str| {
+        let finding = super::policy_finding(
+            fallow_types::results::PolicyViolation {
+                path: root.join("src/a.ts"),
+                line: 1,
+                col: 0,
+                pack: "team-policy".to_string(),
+                rule_id: rule_id.to_string(),
+                kind: PolicyRuleKind::BannedImport,
+                matched: matched.to_string(),
+                severity: PolicyViolationSeverity::Warn,
+                message: None,
+            },
+            &config,
+        );
+        let fallow_types::output::IssueAction::Fix(fix) = &finding.actions[0] else {
+            panic!("first action is the fix");
+        };
+        fix.note.clone().expect("fix has a note")
+    };
+    assert!(
+        note("no-three", "three: Mesh")
+            .starts_with("Rule `team-policy/no-three` allows only listed names")
+    );
+    assert!(
+        note("no-moment", "moment")
+            .starts_with("Rule `team-policy/no-moment` from the configured rule packs bans")
+    );
 }
 
 #[test]

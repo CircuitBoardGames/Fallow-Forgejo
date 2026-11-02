@@ -13,6 +13,19 @@ use rustc_hash::FxHashSet;
 #[path = "config_parser_const_inline.rs"]
 mod const_inline;
 use const_inline::holds_one_stable_object;
+#[path = "config_parser_local_inline.rs"]
+mod local_inline;
+#[path = "config_parser_multi_config.rs"]
+mod multi_config;
+use multi_config::find_default_export_array;
+pub(crate) use multi_config::{
+    extract_each_config_entries, extract_each_config_path_aliases,
+    extract_each_config_require_strings, extract_each_config_shallow_strings, find_config_objects,
+};
+#[path = "config_parser_alias_constant.rs"]
+mod alias_constant;
+#[path = "config_parser_alias_entry.rs"]
+mod alias_entry;
 #[path = "config_parser_vite_plugin_call.rs"]
 mod vite_plugin_call;
 pub(crate) use vite_plugin_call::extract_vite_plugin_call_option_path;
@@ -548,7 +561,10 @@ pub(crate) fn extract_config_array_nested_aliases_kinded(
             if let Some(Expression::ObjectExpression(element_obj)) = element.as_expression()
                 && let Some(alias_expr) = get_nested_expression(element_obj, alias_path)
             {
-                results.extend(expression_to_alias_pairs_kinded(alias_expr));
+                results.extend(alias_constant::expression_to_alias_pairs_kinded(
+                    alias_expr,
+                    PathScope::Program(program),
+                ));
             }
         }
         (!results.is_empty()).then_some(results)
@@ -570,7 +586,10 @@ pub(crate) fn extract_default_export_array_aliases_kinded(
             if let Some(Expression::ObjectExpression(element_obj)) = element.as_expression()
                 && let Some(alias_expr) = get_nested_expression(element_obj, alias_path)
             {
-                results.extend(expression_to_alias_pairs_kinded(alias_expr));
+                results.extend(alias_constant::expression_to_alias_pairs_kinded(
+                    alias_expr,
+                    PathScope::Program(program),
+                ));
             }
         }
         (!results.is_empty()).then_some(results)
@@ -1174,6 +1193,9 @@ pub(crate) fn parent_relative_config_path(
 /// Before the extraction, a JavaScript or TypeScript program gets the literal
 /// value of each stable same-file constant in the property values and array
 /// elements that name it, so `projects: [UNIT]` reads like an inline object.
+/// An object spread of such a constant gets its properties. The values that an
+/// exported config callback returns also get the literal value of the stable
+/// locals of that callback, so `return { ...common, entry }` reads the same way.
 pub(crate) fn extract_from_source<T: Send>(
     source: &str,
     path: &Path,
@@ -1192,8 +1214,7 @@ pub(crate) fn extract_from_source<T: Send>(
     fallow_extract::parse_bounded(source, || {
         let allocator = oxc_allocator::Allocator::default();
         let mut parsed = oxc_parser::Parser::new(&allocator, source, source_type).parse();
-        const_inline::inline_value_constants(&allocator, &mut parsed.program, source.len());
-        extractor(&parsed.program)
+        const_inline::with_inlined_program(&allocator, &mut parsed.program, source.len(), extractor)
     })
     .flatten()
 }
@@ -2207,43 +2228,6 @@ fn join_path_segments(segments: &[String]) -> String {
     joined.to_string_lossy().replace('\\', "/")
 }
 
-/// Convert an alias object or `{ find, replacement }` array to alias tuples.
-///
-/// Each tuple carries a `replacement_is_bare_string_literal` flag. See
-/// [`extract_config_aliases_kinded`].
-fn expression_to_alias_pairs_kinded(expr: &Expression) -> Vec<(String, String, bool)> {
-    match expr {
-        Expression::ObjectExpression(obj) => obj
-            .properties
-            .iter()
-            .filter_map(|prop| {
-                let ObjectPropertyKind::ObjectProperty(prop) = prop else {
-                    return None;
-                };
-                let find = property_key_to_string(&prop.key)?;
-                let (replacement, is_bare) =
-                    alias_replacement_kinded(&prop.value, PathScope::Bare)?;
-                Some((find, replacement, is_bare))
-            })
-            .collect(),
-        Expression::ArrayExpression(arr) => arr
-            .elements
-            .iter()
-            .filter_map(|element| {
-                let Expression::ObjectExpression(obj) = element.as_expression()? else {
-                    return None;
-                };
-                let find = find_property(obj, "find")
-                    .and_then(|prop| expression_to_string(&prop.value))?;
-                let (replacement, is_bare) = find_property(obj, "replacement")
-                    .and_then(|prop| alias_replacement_kinded(&prop.value, PathScope::Bare))?;
-                Some((find, replacement, is_bare))
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// Extract an alias replacement string plus whether it was written as a plain
 /// bare string literal. A bare string literal (not starting with `./`/`../`/`/`)
 /// signals a potential package-to-package alias; a path expression
@@ -2273,7 +2257,8 @@ fn alias_replacement_kinded(expr: &Expression, scope: PathScope<'_>) -> Option<(
             .iter()
             .find_map(ArrayExpressionElement::as_expression)
             .and_then(|element| alias_replacement_kinded(element, scope)),
-        _ => path_string_in(expr, scope).map(|value| (value, false)),
+        Expression::Identifier(id) => alias_constant::constant_replacement(id.name.as_str(), scope),
+        _ => alias_entry::path_value(expr, scope).map(|value| (value, false)),
     }
 }
 
@@ -2397,14 +2382,10 @@ fn resolve_array_alias_pairs_kinded(
             }
             _ => {
                 if let Some(Expression::ObjectExpression(obj)) = element.as_expression()
-                    && let Some(find) = find_property(obj, "find")
-                        .and_then(|prop| expression_to_string(&prop.value))
-                    && let Some((replacement, is_bare)) = find_property(obj, "replacement")
-                        .and_then(|prop| {
-                            alias_replacement_kinded(&prop.value, PathScope::Program(program))
-                        })
+                    && let Some(pair) =
+                        alias_entry::object_alias_pair(obj, PathScope::Program(program))
                 {
-                    pairs.push((find, replacement, is_bare));
+                    pairs.push(pair);
                 }
             }
         }
@@ -2595,85 +2576,6 @@ pub(crate) fn resolve_sibling_module(
         }
     }
     None
-}
-
-/// Find a default-exported array config, the `defineWorkspace([...])` /
-/// `vitest.workspace.{ts,js}` shape. Handles `export default [...]` and
-/// `export default defineWorkspace([...])` / `defineConfig([...])` (the array as
-/// the call's first argument), function configs with a static array return, and
-/// parenthesised / `as` wrappers.
-fn find_default_export_array<'a>(program: &'a Program<'a>) -> Option<&'a ArrayExpression<'a>> {
-    for stmt in &program.body {
-        if let Statement::ExportDefaultDeclaration(decl) = stmt {
-            if let ExportDefaultDeclarationKind::FunctionDeclaration(function) = &decl.declaration {
-                if function.generator {
-                    return None;
-                }
-                return function.body.as_ref().and_then(|body| returned_array(body));
-            }
-            return decl
-                .declaration
-                .as_expression()
-                .and_then(array_from_config_expression);
-        }
-    }
-    None
-}
-
-/// Read only returns belonging to this callback, never nested helper functions.
-fn returned_array<'a>(body: &'a FunctionBody<'a>) -> Option<&'a ArrayExpression<'a>> {
-    body.statements
-        .iter()
-        .find_map(|statement| match statement {
-            Statement::ReturnStatement(returned) => Some(returned),
-            _ => None,
-        })
-        .and_then(|returned| returned.argument.as_ref())
-        .and_then(array_from_expression)
-}
-
-/// A config provider invokes its callback once; returned callbacks are values.
-fn array_from_config_expression<'a>(expr: &'a Expression<'a>) -> Option<&'a ArrayExpression<'a>> {
-    match expr {
-        Expression::ArrowFunctionExpression(arrow) => match &arrow.body {
-            ArrowFunctionBody::FunctionBody(body) => returned_array(body),
-            body => body.as_expression().and_then(array_from_expression),
-        },
-        Expression::FunctionExpression(function) => {
-            if function.generator {
-                return None;
-            }
-            function.body.as_ref().and_then(|body| returned_array(body))
-        }
-        Expression::ParenthesizedExpression(paren) => {
-            array_from_config_expression(&paren.expression)
-        }
-        Expression::TSAsExpression(ts_as) => array_from_config_expression(&ts_as.expression),
-        Expression::TSSatisfiesExpression(ts_sat) => {
-            array_from_config_expression(&ts_sat.expression)
-        }
-        Expression::CallExpression(call) => call
-            .arguments
-            .first()
-            .and_then(Argument::as_expression)
-            .and_then(array_from_config_expression),
-        _ => array_from_expression(expr),
-    }
-}
-
-fn array_from_expression<'a>(expr: &'a Expression<'a>) -> Option<&'a ArrayExpression<'a>> {
-    match expr {
-        Expression::ArrayExpression(arr) => Some(arr),
-        Expression::ParenthesizedExpression(paren) => array_from_expression(&paren.expression),
-        Expression::TSAsExpression(ts_as) => array_from_expression(&ts_as.expression),
-        Expression::TSSatisfiesExpression(ts_sat) => array_from_expression(&ts_sat.expression),
-        Expression::CallExpression(call) => call
-            .arguments
-            .first()
-            .and_then(Argument::as_expression)
-            .and_then(array_from_expression),
-        _ => None,
-    }
 }
 
 pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {

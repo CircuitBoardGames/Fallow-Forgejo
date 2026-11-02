@@ -23,8 +23,10 @@ use super::{MutationProgress, MutationProgressSink};
 use reserve::PhaseDeadline;
 use retry_set::{confirmation_tests, fastest_first, retry_extra_ms, whole_files};
 
+mod classification;
 pub(super) mod control;
 mod retry_set;
+use classification::{attempt_record, classify, kill_kind, matrix_evidence};
 mod stored;
 
 pub use stored::{CachedResult, OutcomeJournal, ResultLookup};
@@ -32,7 +34,8 @@ use stored::{FirstRuns, job_key, journal_first_run, journal_retry, record_stored
 
 use control::{
     CONFIRMATION_RUN_FAILURE, CONTROL_RUN_FAILURE, ControlCheck, ControlMemo, ControlOutcome,
-    ControlVerdict, FailedTest, control_fault, first_line, sorted_tests,
+    ControlVerdict, FailedTest, bounded_test_error, control_fault, first_line,
+    note_control_failures, note_restarted_baseline_failure, sorted_tests,
 };
 
 /// The extra wait of the watchdog after `timeout_ms` (section 8).
@@ -85,6 +88,8 @@ pub struct ScheduleConfig {
     pub runner: RunnerRange,
     /// The number of companions that run mutants.
     pub concurrency: usize,
+    /// Collect exact test-to-mutant kill evidence without bail.
+    pub kill_matrix: bool,
     /// The timeout of `init` and the first `dry_run`. It is also the minimum
     /// dry-run timeout of a respawned companion.
     pub runner_timeout: Duration,
@@ -102,6 +107,10 @@ pub struct ScheduleConfig {
 pub struct MutantOutcome {
     pub status: MutantStatus,
     pub killed_by: Option<String>,
+    /// All observed failing tests, sorted. Timeouts do not count.
+    pub killing_tests: Vec<String>,
+    /// True only for exact requested membership with terminal pass or fail results.
+    pub kill_matrix_complete: bool,
     pub covering_tests: Vec<String>,
     pub static_mutant: bool,
     pub duration_ms: Option<u64>,
@@ -122,6 +131,8 @@ impl MutantOutcome {
         Self {
             status: MutantStatus::NoCoverage,
             killed_by: None,
+            killing_tests: Vec::new(),
+            kill_matrix_complete: false,
             covering_tests: Vec::new(),
             static_mutant: false,
             duration_ms: None,
@@ -146,11 +157,6 @@ pub struct BaselineFailure {
     pub mutant_ids: Vec<String>,
 }
 
-/// The message of a covering test that did not pass in the dry run of a
-/// restarted companion.
-const RESTARTED_DRY_RUN_FAILURE: &str =
-    "the test did not pass in the dry run of a restarted companion";
-
 /// An error that did not stop the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleIssue {
@@ -174,6 +180,8 @@ pub struct ScheduleTimings {
 pub struct ScheduleOutcome {
     pub ready: Option<Ready>,
     pub results: FxHashMap<String, MutantOutcome>,
+    /// Current baseline test files, keyed by opaque runner test id.
+    pub test_files: FxHashMap<String, String>,
     pub baseline_failures: Vec<BaselineFailure>,
     pub unloaded_paths: Vec<String>,
     /// The static test files that the runner does not list, in plan order. Their
@@ -199,6 +207,7 @@ impl ScheduleOutcome {
         Self {
             ready: None,
             results: FxHashMap::default(),
+            test_files: FxHashMap::default(),
             baseline_failures: Vec::new(),
             unloaded_paths: Vec::new(),
             undiscovered_test_files: Vec::new(),
@@ -335,6 +344,10 @@ impl Job {
 struct Attempt {
     status: MutantStatus,
     killed_by: Option<String>,
+    /// All observed failing tests, sorted. Timeouts do not count.
+    killing_tests: Vec<String>,
+    /// True only for exact requested membership with terminal pass or fail results.
+    kill_matrix_complete: bool,
     duration_ms: Option<u64>,
     /// How the run detected the mutant, when the runner states it.
     failure_kind: Option<MutantFailureKind>,
@@ -352,6 +365,8 @@ impl Attempt {
         Self {
             status: MutantStatus::RuntimeError,
             killed_by: None,
+            killing_tests: Vec::new(),
+            kill_matrix_complete: false,
             duration_ms: None,
             failure_kind: None,
             issue: Some(ScheduleIssue {
@@ -371,6 +386,8 @@ impl Attempt {
         Self {
             status: MutantStatus::NoCoverage,
             killed_by: None,
+            killing_tests: Vec::new(),
+            kill_matrix_complete: false,
             duration_ms: None,
             failure_kind: None,
             issue: None,
@@ -391,6 +408,8 @@ impl Attempt {
         Self {
             status,
             killed_by,
+            killing_tests: Vec::new(),
+            kill_matrix_complete: false,
             duration_ms,
             failure_kind,
             issue: None,
@@ -414,106 +433,6 @@ fn scaled_ms(duration_ms: f64) -> u64 {
 /// `timeout_ms = 1.5 * covering-test duration + 5000`, rounded up.
 fn timeout_ms(total_duration_ms: f64) -> u64 {
     scaled_ms(total_duration_ms) + TIMEOUT_BASE_MS
-}
-
-/// Maps a `run_result` to a status with the fail-closed rules 5 and 6.
-/// `tests` are the test ids of the request: the covering tests of `job`
-/// without the tests that a restarted companion dropped.
-///
-/// An `Err` is a runtime error with its reason.
-fn classify(
-    job: &Job,
-    tests: &[String],
-    result: &RunResult,
-) -> Result<(MutantStatus, Option<String>), String> {
-    if result.mutant_id.as_deref() != Some(job.id.as_str()) {
-        return Err(format!(
-            "the run result names mutant `{}`, expected `{}`",
-            result.mutant_id.as_deref().unwrap_or("null"),
-            job.id
-        ));
-    }
-    let requested: FxHashSet<&str> = tests.iter().map(String::as_str).collect();
-    match result.status {
-        RunStatus::Killed => match &result.killed_by {
-            Some(test) if requested.contains(test.as_str()) => {
-                Ok((MutantStatus::Killed, Some(test.clone())))
-            }
-            Some(test) => Err(format!(
-                "the run result names killer `{test}`, which was not requested"
-            )),
-            None if !result.unhandled_errors.is_empty() => Ok((MutantStatus::Killed, None)),
-            None => Err("the run result is `killed` with no failed test and no error".to_owned()),
-        },
-        RunStatus::Timeout => Ok((MutantStatus::Timeout, None)),
-        RunStatus::RuntimeError => Err("the companion reported a runtime error".to_owned()),
-        RunStatus::Survived => {
-            if result.tests_executed == 0 {
-                return Err("zero tests ran".to_owned());
-            }
-            if result.tests_executed != tests.len() {
-                return Err(format!(
-                    "{} of {} requested tests ran",
-                    result.tests_executed,
-                    tests.len()
-                ));
-            }
-            if !result.unhandled_errors.is_empty() {
-                return Err("the run result is `survived` with an unhandled error".to_owned());
-            }
-            let passed: FxHashSet<&str> = result
-                .tests
-                .iter()
-                .filter(|test| test.status == TestStatus::Pass)
-                .map(|test| test.test_id.as_str())
-                .collect();
-            let all_pass = result.tests.iter().all(|test| {
-                test.status == TestStatus::Pass && requested.contains(test.test_id.as_str())
-            });
-            if !all_pass || requested.iter().any(|test| !passed.contains(test)) {
-                return Err(
-                    "the run result is `survived` but a requested test did not pass".to_owned(),
-                );
-            }
-            Ok((MutantStatus::Survived, None))
-        }
-    }
-}
-
-/// How a `killed` run detected the mutant: the failure kind of the killing
-/// test, or `error` for a kill by an error outside each test.
-fn kill_kind(
-    result: &RunResult,
-    status: MutantStatus,
-    killed_by: Option<&str>,
-) -> Option<MutantFailureKind> {
-    if status != MutantStatus::Killed {
-        return None;
-    }
-    let Some(killer) = killed_by else {
-        return Some(MutantFailureKind::Error);
-    };
-    result
-        .tests
-        .iter()
-        .find(|test| test.test_id == killer)
-        .and_then(|test| test.failure_kind.as_deref())
-        .and_then(MutantFailureKind::from_wire)
-}
-
-/// The evidence of one run, for the attempt history of a retried mutant.
-fn attempt_record(attempt: &Attempt) -> MutantAttempt {
-    let detail = (attempt.status == MutantStatus::RuntimeError)
-        .then_some(attempt.issue.as_ref())
-        .flatten()
-        .map(|issue| first_line(&issue.message).to_owned());
-    MutantAttempt {
-        status: attempt.status,
-        duration_ms: attempt.duration_ms,
-        killed_by: attempt.killed_by.clone(),
-        failure_kind: attempt.failure_kind,
-        detail,
-    }
 }
 
 /// True for a kill with no executed test: an error outside each test is the
@@ -639,6 +558,11 @@ impl<'a> Worker<'a> {
             };
             match link.request(&request, self.dry_run_timeout) {
                 Ok(Response::DryRun(result)) => {
+                    for test in &result.tests {
+                        if let (TestStatus::Fail, Some(error)) = (test.status, &test.message) {
+                            self.memo.note_restarted_dry_run_error(&test.test_id, error);
+                        }
+                    }
                     self.known_tests = result
                         .tests
                         .into_iter()
@@ -694,7 +618,7 @@ impl<'a> Worker<'a> {
             mutant_id: Some(job.id.clone()),
             test_ids: tests.clone(),
             timeout_ms: job.timeout_ms,
-            bail: true,
+            bail: !self.config.kill_matrix,
         });
         let watchdog = Duration::from_millis(job.watchdog_ms());
         let Some(link) = self.link.as_mut() else {
@@ -711,7 +635,14 @@ impl<'a> Worker<'a> {
                     load_kill = is_load_kill(&result, status, killed_by.as_ref());
                     let kind = kill_kind(&result, status, killed_by.as_deref());
                     let decided = Attempt::decided(status, killed_by, round_ms(result.duration_ms));
+                    let (killing_tests, kill_matrix_complete) = if self.config.kill_matrix {
+                        matrix_evidence(&tests, &result)
+                    } else {
+                        (Vec::new(), false)
+                    };
                     Attempt {
+                        killing_tests,
+                        kill_matrix_complete: kill_matrix_complete && dropped_tests.is_empty(),
                         failure_kind: kind.or(decided.failure_kind),
                         ..decided
                     }
@@ -1138,7 +1069,7 @@ fn read_dry_run(
             TestStatus::Fail => baseline.push(BaselineFailure {
                 file: Some(test.file.clone()),
                 test_id: Some(test.test_id.clone()),
-                message: None,
+                message: test.message.as_deref().and_then(bounded_test_error),
                 mutant_ids: Vec::new(),
             }),
             TestStatus::Pass if !excluded_files.contains(&test.file) => {
@@ -1224,6 +1155,7 @@ fn covering_tests(
 /// The facts of the first companion that the jobs read.
 struct JobContext<'a> {
     dry_files: &'a [String],
+    kill_matrix: bool,
     ready: &'a Ready,
     cache: Option<&'a dyn ResultLookup>,
     journal: Option<&'a dyn OutcomeJournal>,
@@ -1321,7 +1253,7 @@ fn build_jobs(
         if map_miss {
             outcome.issues.push(static_map_miss_issue(mutant));
         }
-        let confirmation = (!static_mutant && caps.test_filter)
+        let confirmation = (!context.kill_matrix && !static_mutant && caps.test_filter)
             .then(|| confirmation_tests(facts, &tests))
             .flatten();
         let (tests, total) = fastest_first(facts, tests);
@@ -1517,7 +1449,13 @@ fn run_phase(
     Ok((phase.attempts.into_inner().unwrap_or_default(), workers))
 }
 
-fn record(outcome: &mut ScheduleOutcome, facts: &DryRunFacts, job: Job, attempt: Attempt) {
+fn record(
+    outcome: &mut ScheduleOutcome,
+    facts: &DryRunFacts,
+    memo: &ControlMemo,
+    job: Job,
+    attempt: Attempt,
+) {
     if let Some(issue) = attempt.issue {
         outcome.issues.push(issue);
     }
@@ -1526,7 +1464,7 @@ fn record(outcome: &mut ScheduleOutcome, facts: &DryRunFacts, job: Job, attempt:
     let partial_survivor =
         attempt.status == MutantStatus::Survived && !attempt.dropped_tests.is_empty();
     for test in attempt.dropped_tests {
-        note_restarted_baseline_failure(outcome, facts, test, &job.id);
+        note_restarted_baseline_failure(outcome, facts, memo, test, &job.id);
     }
     // `job.tests` is in measured fastest-first order. The report must not
     // depend on durations, so it lists the covering tests by id. A survivor
@@ -1552,6 +1490,8 @@ fn record(outcome: &mut ScheduleOutcome, facts: &DryRunFacts, job: Job, attempt:
         job.id,
         MutantOutcome {
             status: attempt.status,
+            killing_tests: attempt.killing_tests,
+            kill_matrix_complete: attempt.kill_matrix_complete,
             killed_by: attempt.killed_by,
             covering_tests,
             static_mutant: job.static_mutant,
@@ -1576,30 +1516,6 @@ fn retry_status(first: MutantStatus, job: &Job, retry: &Attempt) -> MutantStatus
     } else {
         retried_status(first, retry.status)
     }
-}
-
-/// Records `test` as a baseline failure of a restarted companion that
-/// affected `mutant_id`. The mutant ran with its other covering tests.
-fn note_restarted_baseline_failure(
-    outcome: &mut ScheduleOutcome,
-    facts: &DryRunFacts,
-    test: String,
-    mutant_id: &str,
-) {
-    if let Some(failure) = outcome
-        .baseline_failures
-        .iter_mut()
-        .find(|failure| failure.test_id.as_deref() == Some(test.as_str()))
-    {
-        failure.mutant_ids.push(mutant_id.to_owned());
-        return;
-    }
-    outcome.baseline_failures.push(BaselineFailure {
-        file: facts.passing.get(&test).map(|(file, _)| file.clone()),
-        test_id: Some(test),
-        message: Some(RESTARTED_DRY_RUN_FAILURE.to_owned()),
-        mutant_ids: vec![mutant_id.to_owned()],
-    });
 }
 
 /// The hint for a setup watchdog fault of a restarted companion. The run
@@ -1787,6 +1703,7 @@ const fn retried_status(first: MutantStatus, retry: MutantStatus) -> MutantStatu
 fn record_first_runs(
     outcome: &mut ScheduleOutcome,
     facts: &DryRunFacts,
+    memo: &ControlMemo,
     attempts: Vec<(Job, Attempt)>,
 ) -> (Vec<Job>, FxHashMap<String, MutantAttempt>) {
     let mut suspects = Vec::new();
@@ -1801,7 +1718,7 @@ fn record_first_runs(
             first_runs.insert(job.id.clone(), attempt_record(&attempt));
             suspects.push(suspect);
         }
-        record(outcome, facts, job, attempt);
+        record(outcome, facts, memo, job, attempt);
     }
     (suspects, first_runs)
 }
@@ -1868,6 +1785,7 @@ fn retry_suspects(
         record(
             outcome,
             facts,
+            runner.memo,
             job,
             Attempt {
                 status,
@@ -1919,26 +1837,6 @@ fn drop_failed_tests(facts: &mut DryRunFacts, failed: &[FailedTest]) {
     }
     facts.covering.retain(|_, tests| !tests.is_empty());
     facts.baseline.sort();
-}
-
-/// Adds each test that failed in a control run during the mutant runs as a
-/// baseline failure. [`record`] then adds the mutants that ran without it.
-fn note_control_failures(outcome: &mut ScheduleOutcome, facts: &DryRunFacts, memo: &ControlMemo) {
-    for (test, message) in memo.failed() {
-        if outcome
-            .baseline_failures
-            .iter()
-            .any(|failure| failure.test_id.as_deref() == Some(test.as_str()))
-        {
-            continue;
-        }
-        outcome.baseline_failures.push(BaselineFailure {
-            file: facts.passing.get(&test).map(|(file, _)| file.clone()),
-            test_id: Some(test),
-            message: Some(message),
-            mutant_ids: Vec::new(),
-        });
-    }
 }
 
 /// The issue tracker that the self-check error names.
@@ -2153,9 +2051,15 @@ pub fn run_schedule_with_progress(
             return Err(error);
         }
     };
+    outcome.test_files = dry
+        .tests
+        .iter()
+        .map(|test| (test.test_id.clone(), test.file.clone()))
+        .collect();
     outcome.unloaded_paths = dry.unloaded_paths;
     let context = JobContext {
         dry_files: &dry_files,
+        kill_matrix: config.kill_matrix,
         ready: &ready,
         cache: config.cache.as_deref(),
         journal: config.journal.as_deref(),
@@ -2175,7 +2079,7 @@ pub fn run_schedule_with_progress(
     outcome.workers = workers;
     outcome.timings.mutants = mutants_started.elapsed();
     note_control_failures(&mut outcome, &facts, &memo);
-    let (suspects, first_runs) = record_first_runs(&mut outcome, &facts, attempts);
+    let (suspects, first_runs) = record_first_runs(&mut outcome, &facts, &memo, attempts);
     if !suspects.is_empty() {
         let retry_started = Instant::now();
         retry_suspects(runner, &facts, suspects, first_runs, &mut outcome)?;

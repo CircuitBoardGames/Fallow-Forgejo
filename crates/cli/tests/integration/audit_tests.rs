@@ -446,9 +446,10 @@ fn audit_cache_prune_applies_policy_and_closes_counts() {
     assert!(!aged_path.exists(), "the aged entry must be removed");
     assert!(!cache_sidecar(&aged_path, ".sha").exists());
     assert!(!cache_sidecar(&aged_path, ".last-used").exists());
-    assert!(
+    assert_eq!(
         cache_sidecar(&aged_path, ".lock").exists(),
-        "the `.lock` sidecar must never be deleted",
+        cfg!(windows),
+        "the `.lock` sidecar goes with the entry on Unix and stays on Windows",
     );
     assert!(fresh_path.is_dir(), "a fresh entry must be kept");
     assert!(
@@ -506,8 +507,13 @@ fn audit_cache_prune_human_output_lists_rows_and_hints() {
         stdout.contains("owner live: "),
         "live-owner rows should name the owner: {stdout}"
     );
+    let lock_line = if cfg!(unix) {
+        "would remove 1 lock sidecar with no cache"
+    } else {
+        "1 lock sidecar with no cache remain (harmless)"
+    };
     assert!(
-        stdout.contains("1 lock sidecar with no cache remain (harmless, kept by design)"),
+        stdout.contains(lock_line),
         "lock-only entries should aggregate into one line: {stdout}"
     );
     assert!(
@@ -519,6 +525,10 @@ fn audit_cache_prune_human_output_lists_rows_and_hints() {
     assert!(
         stdout.contains("would reclaim "),
         "dry-run summary should use would-reclaim wording: {stdout}"
+    );
+    assert!(
+        stdout.contains(" across 1 of 2 entries"),
+        "the summary counts caches only; lock sidecars have their own line: {stdout}"
     );
 }
 
@@ -909,7 +919,11 @@ fn audit_gc_debug_diagnostics_require_explicit_rust_log() {
     assert!(
         // ANSI styling may sit between the field name and its value, so match
         // the reason value alone.
-        with_debug.stderr.contains("\"lock-only\""),
+        with_debug.stderr.contains(if cfg!(unix) {
+            "\"orphaned-lock\""
+        } else {
+            "\"lock-only\""
+        }),
         "the decision line should carry the reason field: {}",
         with_debug.stderr
     );
@@ -936,7 +950,7 @@ fn cache_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn audit_cache_remove_requires_explicit_root_and_removes_sidecars_but_keeps_locks() {
+fn audit_cache_remove_requires_explicit_root_and_removes_sidecars() {
     let fixture = create_audit_fixture("cache-remove");
     let root = fixture.path();
     let base_sha = "0123456789abcdef0123456789abcdef01234567";
@@ -1030,9 +1044,12 @@ fn audit_cache_remove_requires_explicit_root_and_removes_sidecars_but_keeps_lock
         assert!(!path.exists(), "cache directory should be removed");
         assert!(!cache_sidecar(path, ".sha").exists());
         assert!(!cache_sidecar(path, ".last-used").exists());
-        assert!(cache_sidecar(path, ".lock").exists());
-        fs::remove_file(cache_sidecar(path, ".lock"))
-            .expect("test lock sidecar should be removable");
+        assert_eq!(
+            cache_sidecar(path, ".lock").exists(),
+            cfg!(windows),
+            "the `.lock` sidecar goes on Unix and stays on Windows",
+        );
+        let _ = fs::remove_file(cache_sidecar(path, ".lock"));
     }
 }
 
@@ -1283,6 +1300,353 @@ fn audit_css_selector_complexity_new_only_ignores_inherited_styling() {
             .iter()
             .any(|finding| finding["line"] == 1 && finding["introduced"] == false),
         "inherited selector should be explicitly attributed: {findings:#?}"
+    );
+}
+
+/// Issue #3956: a line added above an unchanged CSS rule must not turn its
+/// styling finding into an introduced finding. A repeated selector in the
+/// same file keeps one identity per occurrence.
+#[test]
+fn audit_css_styling_finding_survives_line_shift() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-line-shift"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"rules":{"css-selector-complexity":"error"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/index.ts"), "import './styles.css';\n").unwrap();
+    let rule = "#app .legacy .title { color: red; }\n";
+    fs::write(root.join("src/styles.css"), format!("{rule}{rule}")).unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    let audit = |extra: &[&str]| {
+        let mut args = vec![
+            "audit",
+            "--root",
+            root.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--no-cache",
+            "--quiet",
+        ];
+        args.extend_from_slice(extra);
+        run_fallow_raw(&args)
+    };
+
+    fs::write(
+        root.join("src/styles.css"),
+        format!("/* added */\n.plain {{ color: blue; }}\n{rule}{rule}"),
+    )
+    .unwrap();
+    let shifted = audit(&["--format", "json"]);
+    assert_eq!(
+        shifted.code, 0,
+        "shifted inherited styling should not fail new-only audit. stdout: {}\nstderr: {}",
+        shifted.stdout, shifted.stderr
+    );
+    let json = parse_json(&shifted);
+    assert_eq!(json["attribution"]["styling_introduced"], 0);
+    assert_eq!(json["attribution"]["styling_inherited"], 2);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    assert_eq!(findings.len(), 2, "{findings:#?}");
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["introduced"] == false && finding["line"] != 1),
+        "shifted findings should stay inherited: {findings:#?}"
+    );
+    let human = audit(&[]);
+    assert!(
+        human.stdout.contains("inherited styling debt"),
+        "human output should label the shifted finding inherited: {}",
+        human.stdout
+    );
+    assert!(
+        !human.stdout.contains("introduced design-system drift"),
+        "human output should not label the shifted finding introduced: {}",
+        human.stdout
+    );
+
+    fs::write(
+        root.join("src/styles.css"),
+        format!("/* added */\n{rule}{rule}{rule}"),
+    )
+    .unwrap();
+    let repeated = audit(&["--format", "json"]);
+    assert_eq!(
+        repeated.code, 1,
+        "a third copy of the selector is a new finding. stdout: {}\nstderr: {}",
+        repeated.stdout, repeated.stderr
+    );
+    let json = parse_json(&repeated);
+    assert_eq!(json["attribution"]["styling_introduced"], 1);
+    assert_eq!(json["attribution"]["styling_inherited"], 2);
+}
+
+/// Issue #3956: a new rule with the same styling value above an unchanged
+/// rule is the introduced finding. The unchanged rule stays inherited.
+#[test]
+fn audit_css_new_equal_value_rule_above_marks_the_new_rule_introduced() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-equal-value"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"rules":{"css-selector-complexity":"error"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/index.ts"), "import './styles.css';\n").unwrap();
+    let base = ".a { color: blue; }\n.b { color: blue; }\n.c { color: blue; }\n#app .legacy .title { color: red; }\n";
+    fs::write(root.join("src/styles.css"), base).unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    fs::write(
+        root.join("src/styles.css"),
+        format!("#nav .menu .item {{ color: green; }}\n{base}"),
+    )
+    .unwrap();
+    let audit = |extra: &[&str]| {
+        let mut args = vec![
+            "audit",
+            "--root",
+            root.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--no-cache",
+            "--quiet",
+        ];
+        args.extend_from_slice(extra);
+        run_fallow_raw(&args)
+    };
+    let output = audit(&["--format", "json"]);
+    let json = parse_json(&output);
+    assert_eq!(json["attribution"]["styling_introduced"], 1);
+    assert_eq!(json["attribution"]["styling_inherited"], 1);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    let introduced_at = |line: u64| {
+        findings
+            .iter()
+            .find(|finding| finding["line"] == line)
+            .map(|finding| finding["introduced"].clone())
+    };
+    assert_eq!(
+        introduced_at(1),
+        Some(serde_json::json!(true)),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        introduced_at(5),
+        Some(serde_json::json!(false)),
+        "{findings:#?}"
+    );
+
+    let human = audit(&[]);
+    let line_of = |needle: &str| {
+        human
+            .stdout
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle}: {}", human.stdout))
+    };
+    let label_after = |needle: &str| {
+        let start = line_of(needle);
+        human
+            .stdout
+            .lines()
+            .skip(start)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        label_after("styles.css:1").contains("introduced design-system drift"),
+        "line 1 should be labeled introduced: {}",
+        human.stdout
+    );
+    assert!(
+        label_after("styles.css:5").contains("inherited styling debt"),
+        "line 5 should be labeled inherited: {}",
+        human.stdout
+    );
+}
+
+/// Issue #3956: a rule with a new selector replaces a removed rule with the
+/// same specificity. The new rule is introduced, and the new-only gate fails.
+#[test]
+fn audit_css_replaced_selector_with_equal_value_is_introduced() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-replaced-selector"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"rules":{"css-selector-complexity":"error"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/index.ts"), "import './styles.css';\n").unwrap();
+    let plain = ".a { color: blue; }\n.b { color: blue; }\n.c { color: blue; }\n";
+    fs::write(
+        root.join("src/styles.css"),
+        format!("{plain}#app .legacy .title {{ color: red; }}\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    fs::write(
+        root.join("src/styles.css"),
+        format!("/* one */\n/* two */\n{plain}#nav .menu .item {{ color: green; }}\n"),
+    )
+    .unwrap();
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        root.to_str().unwrap(),
+        "--base",
+        "HEAD",
+        "--no-cache",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert_eq!(
+        output.code, 1,
+        "a new complex selector should fail the new-only gate. stdout: {}\nstderr: {}",
+        output.stdout, output.stderr
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["attribution"]["styling_introduced"], 1);
+    assert_eq!(json["attribution"]["styling_inherited"], 0);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["line"] == 6 && finding["introduced"] == true),
+        "{findings:#?}"
+    );
+}
+
+/// Issue #3956: an edit inside an existing rule keeps the selector, so the
+/// finding of the rule stays inherited.
+#[test]
+fn audit_css_edit_inside_rule_keeps_finding_inherited() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-edit-rule"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"rules":{"css-selector-complexity":"error"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/index.ts"), "import './styles.css';\n").unwrap();
+    fs::write(
+        root.join("src/styles.css"),
+        "#app .legacy .title { color: red; }\n",
+    )
+    .unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    fs::write(
+        root.join("src/styles.css"),
+        "/* added */\n#app .legacy .title { color: green; } /* edited */\n",
+    )
+    .unwrap();
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        root.to_str().unwrap(),
+        "--base",
+        "HEAD",
+        "--no-cache",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert_eq!(
+        output.code, 0,
+        "an edited rule should not fail the new-only gate. stdout: {}\nstderr: {}",
+        output.stdout, output.stderr
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["attribution"]["styling_introduced"], 0);
+    assert_eq!(json["attribution"]["styling_inherited"], 1);
+}
+
+/// Issue #3956 reproduction: a comment line above an unchanged `:where()`
+/// rule keeps its default-severity styling finding inherited.
+#[test]
+fn audit_css_where_selector_stays_inherited_after_comment_line() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("node_modules")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"repro","private":true}"#,
+    )
+    .unwrap();
+    fs::write(root.join("index.js"), "import \"./style.css\";\n").unwrap();
+    let rule = ".a :where(h1, h2, h3, h4) { color: red; }\n";
+    fs::write(root.join("style.css"), rule).unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "baseline");
+
+    fs::write(root.join("style.css"), format!("/* added */\n{rule}")).unwrap();
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        root.to_str().unwrap(),
+        "--base",
+        "HEAD",
+        "--no-cache",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    let json = parse_json(&output);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    assert!(
+        findings.iter().any(|finding| {
+            finding["code"] == "css-selector-complexity" && finding["line"] == 2
+        }),
+        "the shifted selector finding should be reported: {findings:#?}"
+    );
+    assert_eq!(json["attribution"]["styling_introduced"], 0);
+    assert_eq!(
+        json["attribution"]["styling_inherited"],
+        findings.len(),
+        "{findings:#?}"
     );
 }
 
@@ -7947,7 +8311,7 @@ fn audit_embeds_a_health_baseline_staleness_that_agrees_with_the_stood_down_gate
     ]);
     let envelope = parse_json(&output);
     assert_eq!(
-        envelope["schema_version"], 13,
+        envelope["schema_version"], 14,
         "the embedded staleness object is additive, so the audit envelope does not bump: {}",
         output.stdout
     );
@@ -8401,7 +8765,7 @@ fn audit_cache_prune_reports_and_removes_aged_snapshot_files() {
     let root = fixture.path();
     let scan = TempDir::new().expect("scan root should be created");
     // The current `AUDIT_BASE_SNAPSHOT_CACHE_VERSION` directory.
-    let snapshot_dir = root.join(".fallow/cache/audit-base-v17");
+    let snapshot_dir = root.join(".fallow/cache/audit-base-v19");
     fs::create_dir_all(&snapshot_dir).unwrap();
     let aged = snapshot_dir.join("00000000000000aa.bin");
     let fresh = snapshot_dir.join("00000000000000bb.bin");

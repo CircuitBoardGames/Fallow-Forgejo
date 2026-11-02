@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-api"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "dunce",
  "fallow-config",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-benchmarks"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "codspeed-criterion-compat",
  "fallow-api",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-cli"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "base64",
  "bitcode",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-config"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "deser-value",
  "deser-yaml",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-core"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "codspeed-criterion-compat",
  "dunce",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-engine"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "bitcode",
  "codspeed-criterion-compat",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-extract"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "bitcode",
  "cssparser",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-graph"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "dashmap",
  "dunce",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-license"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-lsp"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "dunce",
  "fallow-api",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-mcp"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "fallow-api",
  "fallow-output",
@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-multicall"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "fallow-cli",
  "fallow-lsp",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-mutation"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "insta",
  "oxc_allocator",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-node"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "fallow-api",
  "fallow-types",
@@ -1501,9 +1501,10 @@ dependencies = [
 
 [[package]]
 name = "fallow-output"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "fallow-config",
+ "fallow-report-protocol",
  "fallow-types",
  "rustc-hash",
  "schemars",
@@ -1514,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-process"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "libc",
  "rustc-hash",
@@ -1524,8 +1525,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fallow-report-protocol"
+version = "3.38.1"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fallow-security"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "fallow-config",
  "fallow-types",
@@ -1538,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-types"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "bitcode",
  "oxc_span",
@@ -1552,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "fallow-v8-coverage"
-version = "3.37.0"
+version = "3.38.1"
 dependencies = [
  "proptest",
  "serde",
@@ -3832,14 +3842,15 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.5.1"
+version = "3.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350"
+checksum = "ceb42e9e47443cd83a834dea57b5816d35481417bae72ade5dc5615c59122e26"
 dependencies = [
  "base64",
  "chrono",
  "futures",
  "indexmap",
+ "libc",
  "pastey 0.2.1",
  "pin-project-lite",
  "rmcp-macros",
@@ -3855,9 +3866,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.5.1"
+version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1da498700030856ba63114bceefa30ba21f5e278cb975e5b9de3529fe842b40"
+checksum = "8b0748e054a5f5598b3213cf72099ae6b2745ba4d996c59ccf455150a7dbb839"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -4269,6 +4280,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
 
 [[package]]
+name = "socket2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4588,6 +4609,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
+ "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]

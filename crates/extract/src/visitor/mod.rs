@@ -993,6 +993,13 @@ pub(crate) struct ModuleInfoExtractor {
     loop_string_bindings: Vec<FxHashMap<String, Vec<String>>>,
     loop_object_property_values: Vec<FxHashMap<String, FxHashMap<String, Vec<String>>>>,
     package_resolution_function_args: FxHashMap<String, usize>,
+    /// Other local names of `createRequire` from `node:module`.
+    create_require_aliases: FxHashSet<String>,
+    /// Module-level bindings of `createRequire(<this file>)`.
+    module_require_aliases: FxHashSet<String>,
+    /// Per `nested_declaration_stack` frame: the bindings of
+    /// `createRequire(<this file>)` declared there.
+    scoped_require_aliases: Vec<FxHashSet<String>>,
     nested_declaration_stack: Vec<FxHashSet<String>>,
     /// Per `nested_declaration_stack` frame: the names declared there that
     /// provably hold no class instance, such as `const service = { m() {} }` or
@@ -1073,8 +1080,8 @@ pub(crate) struct ModuleInfoExtractor {
     /// Dedup guard for `callee_uses`. Working state only: not persisted and
     /// not merged across SFC script blocks (each block dedups independently;
     /// the detector matches per unique path, so cross-block duplicates only
-    /// cost one extra entry).
-    seen_callee_paths: FxHashSet<String>,
+    /// cost one extra entry). The second element is the `is_new` form.
+    seen_callee_paths: FxHashSet<(String, bool)>,
     /// `"use client"` / `"use server"` directive strings written as expression
     /// statements in `program.body` (misplaced, NOT in the leading
     /// prologue), so the RSC bundler silently ignores them. Captured by
@@ -4158,24 +4165,6 @@ pub(crate) fn extend_whole_object_uses(info: &mut ModuleInfo, extra: Vec<String>
         }
     }
     info.whole_object_uses = uses.into();
-}
-
-fn try_extract_require<'a, 'b>(
-    init: &'b Expression<'a>,
-) -> Option<(&'b CallExpression<'a>, std::borrow::Cow<'b, str>)> {
-    let Expression::CallExpression(call) = init else {
-        return None;
-    };
-    let Expression::Identifier(callee) = &call.callee else {
-        return None;
-    };
-    if callee.name != "require" {
-        return None;
-    }
-    let Some(Argument::StringLiteral(lit)) = call.arguments.first() else {
-        return None;
-    };
-    Some((call, lit.value.text()))
 }
 
 /// Collect every statically-resolvable module specifier from a dynamic

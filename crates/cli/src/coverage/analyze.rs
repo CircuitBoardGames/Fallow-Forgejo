@@ -30,9 +30,8 @@ use fallow_output::{
     RUNTIME_STALE_AFTER_DAYS, RuntimeCoverageAction, RuntimeCoverageCaptureQuality,
     RuntimeCoverageConfidence, RuntimeCoverageDataSource, RuntimeCoverageEvidence,
     RuntimeCoverageFinding, RuntimeCoverageHotPath, RuntimeCoverageMessage,
-    RuntimeCoverageProvenance, RuntimeCoverageReport, RuntimeCoverageReportVerdict,
-    RuntimeCoverageRiskBand, RuntimeCoverageSchemaVersion, RuntimeCoverageSummary,
-    RuntimeCoverageVerdict,
+    RuntimeCoverageProvenance, RuntimeCoverageReport, RuntimeCoverageRiskBand,
+    RuntimeCoverageSchemaVersion, RuntimeCoverageVerdict,
 };
 
 const RUNTIME_COVERAGE_SCHEMA_VERSION: &str = "1";
@@ -283,7 +282,11 @@ fn local_health_options<'a>(
 }
 
 fn run_cloud(args: &AnalyzeArgs, ctx: &RunContext<'_>) -> ExitCode {
-    let api_key = match resolve_api_key(args.api_key.as_deref(), CloudCommand::Analyze) {
+    let api_key = match resolve_api_key(
+        args.api_key.as_deref(),
+        args.api_endpoint.as_deref(),
+        CloudCommand::Analyze,
+    ) {
         Ok(api_key) => api_key,
         Err(err) => return emit_cloud_error(&err, ctx.output),
     };
@@ -357,18 +360,12 @@ fn runtime_coverage_source_env_is_cloud() -> bool {
 
 pub(super) fn resolve_api_key(
     explicit: Option<&str>,
+    api_endpoint: Option<&str>,
     command: CloudCommand,
 ) -> Result<String, CloudError> {
-    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(value.to_owned());
-    }
-    if let Ok(value) = std::env::var("FALLOW_API_KEY") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_owned());
-        }
-    }
-    Err(CloudError::Auth(cloud_api_key_missing_message(command)))
+    crate::coverage::credentials::resolve_api_key(explicit, api_endpoint)
+        .map(|resolved| resolved.key)
+        .ok_or_else(|| CloudError::Auth(cloud_api_key_missing_message(command)))
 }
 
 pub(super) fn resolve_repo(explicit: Option<&str>, root: &Path) -> Result<String, CloudError> {
@@ -873,9 +870,12 @@ fn merge_cloud_snapshot(
 
     let report = RuntimeCoverageReport {
         schema_version: RuntimeCoverageSchemaVersion::V1,
-        verdict: cloud_report_verdict(&findings),
+        verdict: super::partial_capture::report_verdict(snapshot, &findings),
         signals: Vec::new(),
-        summary: cloud_report_summary(snapshot),
+        summary: super::partial_capture::cloud_report_summary(
+            snapshot,
+            cloud_capture_quality(snapshot),
+        ),
         findings,
         hot_paths,
         blast_radius,
@@ -910,30 +910,6 @@ fn sort_cloud_runtime_entries(
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.function.cmp(&right.function))
     });
-}
-
-fn cloud_report_verdict(findings: &[RuntimeCoverageFinding]) -> RuntimeCoverageReportVerdict {
-    if findings.is_empty() {
-        RuntimeCoverageReportVerdict::Clean
-    } else {
-        RuntimeCoverageReportVerdict::ColdCodeDetected
-    }
-}
-
-fn cloud_report_summary(snapshot: &CloudRuntimeContext) -> RuntimeCoverageSummary {
-    RuntimeCoverageSummary {
-        data_source: RuntimeCoverageDataSource::Cloud,
-        last_received_at: snapshot.summary.last_received_at.clone(),
-        functions_tracked: snapshot.summary.functions_tracked,
-        functions_hit: snapshot.summary.functions_hit,
-        functions_unhit: snapshot.summary.functions_unhit,
-        functions_untracked: snapshot.summary.functions_untracked,
-        coverage_percent: snapshot.summary.coverage_percent,
-        trace_count: snapshot.summary.trace_count,
-        period_days: snapshot.window.period_days,
-        deployments_seen: snapshot.summary.deployments_seen,
-        capture_quality: cloud_capture_quality(snapshot),
-    }
 }
 
 struct RuntimeTrustOutput {
@@ -1925,15 +1901,7 @@ fn print_runtime_human(
     root: &Path,
 ) -> ExitCode {
     let display_limit = args.top.unwrap_or(HUMAN_DEFAULT_DISPLAY_LIMIT);
-    println!("Runtime coverage: {}", report.verdict);
-    println!(
-        "  {} tracked, {} hit, {} unhit, {} untracked ({:.1}% covered)",
-        report.summary.functions_tracked,
-        report.summary.functions_hit,
-        report.summary.functions_unhit,
-        report.summary.functions_untracked,
-        report.summary.coverage_percent,
-    );
+    super::partial_capture::print_runtime_summary(report);
     println!(
         "  based on {} traces over {} days ({} deployments)",
         report.summary.trace_count, report.summary.period_days, report.summary.deployments_seen
@@ -2022,6 +1990,7 @@ fn print_runtime_importance(report: &RuntimeCoverageReport, display_limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fallow_output::RuntimeCoverageReportVerdict;
     use fallow_output::{
         RuntimeCoverageBlastRadiusEntry, RuntimeCoverageCostBasis, RuntimeCoverageImportanceEntry,
     };
@@ -2119,7 +2088,7 @@ mod tests {
     #[test]
     fn resolve_api_key_prefers_trimmed_explicit_value() {
         assert_eq!(
-            resolve_api_key(Some("  fallow_live_token  "), CloudCommand::Analyze)
+            resolve_api_key(Some("  fallow_live_token  "), None, CloudCommand::Analyze)
                 .expect("explicit key should resolve"),
             "fallow_live_token"
         );
@@ -2265,6 +2234,7 @@ mod tests {
         function.hit_count = Some(20_000);
         function.deployments_observed = 4;
         let snapshot = CloudRuntimeContext {
+            capture_policy: None,
             repo: "acme/web".to_owned(),
             actionable: None,
             actionability_reason: None,
@@ -2956,6 +2926,7 @@ export const createStore = (rows: string[]) => {
     #[test]
     fn cloud_warnings_dedupe_server_and_cli_no_runtime_data() {
         let snapshot = CloudRuntimeContext {
+            capture_policy: None,
             repo: "nonexistent-repo".to_owned(),
             actionable: None,
             actionability_reason: None,
@@ -2998,6 +2969,7 @@ export const createStore = (rows: string[]) => {
     #[test]
     fn cloud_warnings_dedupe_when_server_message_includes_project_id() {
         let snapshot = CloudRuntimeContext {
+            capture_policy: None,
             repo: "fallow-cloud".to_owned(),
             actionable: None,
             actionability_reason: None,
@@ -3039,6 +3011,7 @@ export const createStore = (rows: string[]) => {
     #[test]
     fn cloud_capture_quality_reports_untracked_ratio_only_when_data_exists() {
         let mut snapshot = CloudRuntimeContext {
+            capture_policy: None,
             repo: "acme/web".to_owned(),
             actionable: None,
             actionability_reason: None,
@@ -3139,7 +3112,7 @@ export const createStore = (rows: string[]) => {
             schema_version: RuntimeCoverageSchemaVersion::V1,
             verdict: RuntimeCoverageReportVerdict::Clean,
             signals: Vec::new(),
-            summary: RuntimeCoverageSummary::default(),
+            summary: fallow_output::RuntimeCoverageSummary::default(),
             findings: vec![
                 runtime_finding("fallow:prod:00000001"),
                 runtime_finding("fallow:prod:00000002"),
@@ -3343,6 +3316,7 @@ export const createStore = (rows: string[]) => {
 
     fn cloud_context(functions_tracked: usize, functions_untracked: usize) -> CloudRuntimeContext {
         CloudRuntimeContext {
+            capture_policy: None,
             repo: "acme/web".to_owned(),
             actionable: None,
             actionability_reason: None,

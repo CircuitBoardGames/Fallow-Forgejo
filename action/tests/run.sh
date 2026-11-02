@@ -1049,6 +1049,21 @@ ARGS=$(cat "$ANALYZE_TMP/work/fallow-analysis-args.sh")
 assert_contains "$ARGS" "--coverage coverage/coverage-final.json" "analyze: forwards coverage to default combined command"
 assert_contains "$ARGS" "--coverage-root /ci/workspace" "analyze: forwards coverage-root to default combined command"
 
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="health" INPUT_FORMAT="json" INPUT_MAX_FILE_LINES="800" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+ARGS=$(cat "$ANALYZE_TMP/work/fallow-analysis-args.sh")
+assert_contains "$ARGS" "--max-file-lines 800" "analyze: forwards max-file-lines to health"
+
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="health" INPUT_FORMAT="json" INPUT_MAX_FILE_LINES="lots" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+assert_contains "$OUT" "max-file-lines must be a positive integer" "analyze: rejects a non-numeric max-file-lines"
+
 cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output" "$ANALYZE_TMP/github-env"
 OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
   GITHUB_ENV="$ANALYZE_TMP/github-env" INPUT_ROOT="." INPUT_COMMAND="dead-code" \
@@ -1725,6 +1740,12 @@ assert_contains "$OUT" "moderate" "moderate severity in table"
 
 OUT_CLEAN=$(jq -r -f "$JQ_DIR/summary-health.jq" "$FIXTURES/health-clean.json" 2>&1)
 assert_contains "$OUT_CLEAN" "No functions exceed" "clean: no functions exceed"
+
+echo "  summary-health.jq (partial capture footer):"
+OUT_PARTIAL=$(jq '.findings = [] | .runtime_coverage = {findings: [{path: "src/a.ts", function: "a", line: 1, verdict: "coverage_unavailable", invocations: null, confidence: "none"}], hot_paths: [], summary: {functions_tracked: null, functions_hit: 3, functions_unhit: null, functions_untracked: 5, coverage_percent: null, capture_policy: "positive_only"}}' "$FIXTURES/health-clean.json" | jq -r -f "$JQ_DIR/summary-health.jq" 2>&1)
+assert_contains "$OUT_PARTIAL" "Partial capture: **3** functions with positive execution evidence, **5** untracked" "partial capture: shows positive evidence only"
+assert_not_contains "$OUT_PARTIAL" "tracked functions" "partial capture: no tracked total"
+assert_not_contains "$OUT_PARTIAL" "unhit" "partial capture: no unhit total"
 
 echo "  summary-health.jq (delta header with trend):"
 assert_contains "$OUT" "Health: B (72.3)" "delta: shows grade and score"
@@ -3941,6 +3962,11 @@ done
 if [ -n "${FALLOW_DIFF_FILE:-}" ]; then
   found="$found diff"
 fi
+# A production baseline under a production run: the real binary drops the reason
+# when the run and the file use the same mode.
+if [ "${MOCK_SAVED_PRODUCTION:-}" = "1" ]; then
+  found=$(printf '%s' "$found" | sed 's/ production//g')
+fi
 if [ -n "${MOCK_SCOPE_REASONS:-}" ]; then
   found=$(printf '%s' "$MOCK_SCOPE_REASONS" | tr ',' ' ')
 fi
@@ -4237,6 +4263,20 @@ assert_contains "$STALE_STDOUT" "only part of the project (production mode or wo
   "stale gate: a binary without the member falls back to the input-based reason"
 assert_contains "$(cat "$STALE_OUTPUT_FILE")" "baseline_scope_reasons=" \
   "stale gate: the output is published empty rather than omitted"
+
+# 7g. A production baseline under a production run with a base ref has the reason
+# changed-since only, so the job pays for the re-read. The re-read keeps
+# --production, or it comes back in another mode and stays inert.
+run_stale_analyze INPUT_COMMAND="dead-code" INPUT_BASELINE="baseline.json" \
+  INPUT_CHANGED_SINCE="abc123" INPUT_PRODUCTION="true" \
+  INPUT_FAIL_ON_STALE_BASELINE="true" MOCK_SAVED_PRODUCTION="1"
+STALE_REREAD=$(printf '%s\n' "$STALE_ANALYSIS_LOG" | grep '^analysis ' | sed -n '2p')
+assert_contains "$STALE_REREAD" "--production" \
+  "stale gate: the re-read of a same-mode production run keeps --production"
+assert_not_contains "$STALE_REREAD" "--changed-since" \
+  "stale gate: the re-read of a same-mode production run drops the base ref"
+assert_contains "$STALE_STDOUT" "::error::Fallow baseline gate failed" \
+  "stale gate: the re-read of a same-mode production run judges the file"
 
 # 8. The re-run exits 1 on findings, which is not an error here.
 run_stale_analyze INPUT_COMMAND="dead-code" INPUT_BASELINE="baseline.json" \

@@ -114,7 +114,7 @@ A row's `outstanding[]` names every dimension on which the matched unit still pr
 
 Each entry carries `status` (`pass`, `warn`, `fail`, or `skipped`) and `enforced` (whether a `fail` from it makes the CLI exit non-zero). It also carries `observed` and `threshold` where the gate compared a number. A gate failed the run only when `status` is `fail` and `enforced` is true. A passed gate can still be enforced. Read both `status` and `enforced`.
 
-A baselined run also carries `baseline_staleness`. Read `gate_trips` for the `--fail-on-stale-baseline` rule. Check `change_scoped` before dividing `matched_entries` by `baseline_entries`. Read `scope_reasons` for the channels that narrowed the run.
+A baselined run also carries `baseline_staleness`. Read `gate_trips` for the `--fail-on-stale-baseline` rule. Check `change_scoped` before dividing `matched_entries` by `baseline_entries`. Read `scope_reasons` for the channels that stop the run from judging the file.
 
 The MCP server converts the CLI's exit 1 into a successful result so the findings reach you. Read `gate_outcomes` and `baseline_staleness` for the verdict. Every entry that reported `fail` or `warn`, and a baseline that matched less than it was saved with, is also restated as a plain sentence in the result's root `warnings` array.",
     },
@@ -147,9 +147,9 @@ const GET_CLOUD_RUNTIME_CONTEXT_SECTIONS: &[ToolGuideSection] = &[
     ToolGuideSection {
         topic: "FALLOW_API_KEY",
         summary: "Where the key comes from and what an absent one returns.",
-        detail: r#"The key is read from `FALLOW_API_KEY` in the MCP server process environment. Configure it where the server is launched; it never travels in a tool call. A whitespace-only key counts as absent. Restart the server after exporting a new value. The server does not inherit later changes to its launch environment.
+        detail: r#"The key never travels in a tool call. The CLI that the tool runs reads `FALLOW_API_KEY` in the MCP server process environment, else the key that `fallow cloud login` stored on the machine. A whitespace-only key counts as absent. Restart the server after exporting a new value. The server does not inherit later changes to its launch environment.
 
-A call without a key is refused before any subprocess starts. It returns `isError` and a body carrying `error: true`, `exit_code: 2`, `code: "cloud_api_key_missing"`, and the same remediation sentence the CLI prints for `coverage analyze --cloud`. This refusal does not justify retrying with different parameters: the tool cannot answer without a key. Use the local `check_runtime_coverage` with a `coverage` path as the alternative."#,
+A call without a key stops before the analysis starts. It returns `isError` and a body carrying `error: true`, `exit_code: 2`, `code: "cloud_api_key_missing"`, and the same remediation sentence the CLI prints for `coverage analyze --cloud`. This refusal does not justify retrying with different parameters: the tool cannot answer without a key. Use the local `check_runtime_coverage` with a `coverage` path as the alternative."#,
     },
     ToolGuideSection {
         topic: "root",
@@ -199,6 +199,29 @@ const IMPACT_CLOSURE_SECTIONS: &[ToolGuideSection] = &[ToolGuideSection {
     summary: "Which gap consumers a text search for the symbol names does not find.",
     detail: r"Each coordination gap carries `search_visibility`, `reason`, and `search_as` for the consumed symbols. When a consumer uses more than one symbol, the worst level wins: `missed`, then `renamed`, then `found`. `search_symbol` names the entry of `consumed_symbols` that the three fields describe, `default` for a default export. The levels and reasons are the same as for `trace_export`: read fallow://tools/trace_export for their meaning.",
 }];
+
+const INSPECT_TARGET_SECTIONS: &[ToolGuideSection] = &[
+    ToolGuideSection {
+        topic: "cloud",
+        summary: "What cloud=true adds, where the key comes from, and the section statuses.",
+        detail: r"Set `cloud: true` on a file target to add `evidence.cloud`, the same section as `fallow inspect --file <path> --cloud`. The tool refuses `cloud: true` with a symbol target, and `repo` without `cloud: true`. The call sends the repository and the file path to Fallow Cloud. The key never travels in a tool call: the CLI that the tool runs reads `FALLOW_API_KEY` in the MCP server environment, else the key that `fallow cloud login` stored on the machine. `repo` (`owner/repo`) wins over `FALLOW_REPO` in the server environment, which wins over the `origin` git remote.
+
+The section `status` is one of these values:
+
+- `ok`: `functions[]` pairs each local function with its deployed function (`match` is `stable_id` or `name_ordinal`) and carries state, calls, error groups, CPU milliseconds per hour and never-run branch ranges. `unpaired_local[]` lists local functions without a pair in this read. Each entry has a `note`. A function without a pair can still have production data when the cloud withheld never_called rows or cut its answer to fit a size limit; `message` then says so.
+- `no_key`: no key, or the cloud refused the key. Run `fallow cloud login`, or set `FALLOW_API_KEY` and restart the server.
+- `plan_required`: the organization of the key has no plan that includes production data.
+- `unavailable`: the cloud did not answer, or the repository is unknown or cannot be resolved. The read has one attempt and a 2 second limit.
+- `untracked`: the cloud has no production data for this file.
+
+A status other than `ok` does not fail the call: `isError` stays false, and the cloud status does not change the other evidence sections. Read the `status` of each section on its own. A `null` count means not measured, never zero.",
+    },
+    ToolGuideSection {
+        topic: "format",
+        summary: "When to ask for the compact text instead of the JSON bundle.",
+        detail: r#"`format: "compact"` returns the plain text of `fallow inspect --format compact`: about 1 KB, one line per item, no JSON. The lines are a `fallow <path>` header, `finding <kind> <path:line> <text>`, `prod <name:line> <text>` for the functions with production data, `cloud <status>: <text>` for a status other than `ok`, and `truncated <n> more` when the byte cap cuts lines. The text leaves out the trace, the impact closure, scopes, warnings and identities. Use it to put a short summary into the context, and use the default `json` when the next step reads fields. When the run requires complete type-aware evidence and does not get it, the call fails with `code: "FALLOW_TYPE_AWARE_INCOMPLETE"` and the text in `output`."#,
+    },
+];
 
 const AUDIT_SECTIONS: &[ToolGuideSection] = &[
     ToolGuideSection {
@@ -293,6 +316,10 @@ pub const TOOL_GUIDES: &[ToolGuide] = &[
     ToolGuide {
         tool: "impact_closure",
         sections: IMPACT_CLOSURE_SECTIONS,
+    },
+    ToolGuide {
+        tool: "inspect_target",
+        sections: INSPECT_TARGET_SECTIONS,
     },
 ];
 

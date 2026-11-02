@@ -909,6 +909,7 @@ fn exceeded_compact_label(exceeded: fallow_output::ExceededThreshold) -> &'stati
         fallow_output::ExceededThreshold::CyclomaticCrap => "cyclomatic_crap",
         fallow_output::ExceededThreshold::CognitiveCrap => "cognitive_crap",
         fallow_output::ExceededThreshold::All => "all",
+        fallow_output::ExceededThreshold::FileLines => "file_lines",
     }
 }
 
@@ -934,12 +935,16 @@ fn push_health_findings_compact(
             }
             None => String::new(),
         };
+        let file_lines_suffix = finding
+            .max_file_lines
+            .map(|max| format!(",line_count={},max_file_lines={max}", finding.line_count))
+            .unwrap_or_default();
         // The `high-complexity:` row prefix is deliberately kept even for a
         // CRAP-only breach (other machine formats route that to
         // `fallow/high-crap-score`): renaming a line prefix breaks grep-based CI
         // consumers, and `exceeded=` carries the dimension instead (issue #2163).
         lines.push(format!(
-            "high-complexity:{}:{}:{}:cyclomatic={},cognitive={},severity={},exceeded={}{}",
+            "high-complexity:{}:{}:{}:cyclomatic={},cognitive={},severity={},exceeded={}{}{}",
             relative,
             finding.line,
             finding.name,
@@ -948,6 +953,7 @@ fn push_health_findings_compact(
             severity,
             exceeded_compact_label(finding.exceeded),
             crap_suffix,
+            file_lines_suffix,
         ));
     }
 }
@@ -1158,13 +1164,17 @@ fn build_runtime_coverage_compact_lines(
     production: &fallow_output::RuntimeCoverageReport,
     root: &Path,
 ) -> Vec<String> {
+    let summary = &production.summary;
+    let null_or = |count: Option<usize>| count.map_or_else(|| "null".to_owned(), |n| n.to_string());
     let mut lines = vec![format!(
-        "runtime-coverage-summary:functions_tracked={},functions_hit={},functions_unhit={},functions_untracked={},coverage_percent={:.1},trace_count={},period_days={},deployments_seen={}",
-        production.summary.functions_tracked,
-        production.summary.functions_hit,
-        production.summary.functions_unhit,
-        production.summary.functions_untracked,
-        production.summary.coverage_percent,
+        "runtime-coverage-summary:functions_tracked={},functions_hit={},functions_unhit={},functions_untracked={},coverage_percent={},trace_count={},period_days={},deployments_seen={}",
+        null_or(summary.functions_tracked),
+        summary.functions_hit,
+        null_or(summary.functions_unhit),
+        summary.functions_untracked,
+        summary
+            .coverage_percent
+            .map_or_else(|| "null".to_owned(), |percent| format!("{percent:.1}")),
         production.summary.trace_count,
         production.summary.period_days,
         production.summary.deployments_seen,
@@ -1712,6 +1722,7 @@ mod tests {
         let root = PathBuf::from("/project");
         let report = fallow_output::HealthReport {
             styling_findings: vec![fallow_output::StylingFinding {
+                internal: fallow_output::StylingFindingInternal::default(),
                 code: "css-token-drift".to_string(),
                 sub_kind: "tailwind-arbitrary-value".to_string(),
                 path: "/project/src/app.css".to_string(),

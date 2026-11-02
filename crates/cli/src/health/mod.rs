@@ -812,6 +812,7 @@ fn report_loaded_baseline(result: &mut HealthResult, baseline_path: Option<&std:
         return;
     };
     crate::output_runtime::set_loaded_baseline(crate::output_runtime::LoadedBaselineRecheck {
+        saved_mode: fallow_output::BaselineMode::default(),
         command: "health",
         path: path.display().to_string(),
         baseline_entries: staleness.baseline_entries,
@@ -1039,6 +1040,7 @@ mod tests {
             contributions: Vec::new(),
             effective_thresholds: None,
             threshold_source: None,
+            max_file_lines: None,
         }
     }
 
@@ -1071,15 +1073,15 @@ mod tests {
         fallow_output::RuntimeCoverageSummary {
             data_source: fallow_output::RuntimeCoverageDataSource::Local,
             last_received_at: None,
-            functions_tracked: tracked,
+            functions_tracked: Some(tracked),
             functions_hit: hit,
-            functions_unhit: unhit,
+            functions_unhit: Some(unhit),
             functions_untracked: untracked,
-            coverage_percent,
+            coverage_percent: Some(coverage_percent),
             trace_count: 512,
             period_days: 7,
             deployments_seen: 2,
-            capture_quality: None,
+            ..Default::default()
         }
     }
 

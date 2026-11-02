@@ -27,8 +27,9 @@ description: Land completed Fallow work after review, run pre-push parity, monit
    companion change into the default branch of its repository (for example
    fallow-docs `main`). A pushed feature branch is not enough: the release
    then must merge it. When the merged change touches `npm/fallow/skills`,
-   run `node scripts/sync-skills-companion.mjs` and push the fallow-skills
-   commit that it prepares.
+   run `node scripts/sync-skills-companion.mjs --pin <merge commit>` right
+   after the merge. Publish its commit with the commands that it prints.
+   `ship-wait-checks.mjs` prints this step for such a change.
 4. Create signed conventional commits only.
 5. Merge with pinned auto-merge. Do not wait for the checks in the
    foreground:
@@ -190,6 +191,14 @@ Use these scripts for each pull request, one at a time:
    GitHub starts no `pull_request` workflow for a pull request that
    conflicts with its base. The script then stops with exit code 3.
    Update the branch, push, and wait again.
+
+   GitHub does not start the workflows of some pull requests from a fork
+   until a maintainer approves them. Pinned auto-merge then never merges,
+   and the few checks that ran can look complete. The script stops with
+   exit code 5 and lists each run. Read all of the code of the pull request
+   first, because the approved runs execute it. Then approve each listed
+   run with `gh api -X POST repos/<owner>/<repo>/actions/runs/<run id>/approve`,
+   and wait again. Each new push of the fork needs a new approval.
 
    The script compares each failed check with the same check name on the
    newest completed run of `main`. A check that also fails on `main` gets

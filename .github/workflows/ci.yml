@@ -55,6 +55,7 @@ jobs:
       action-current: ${{ steps.filter.outputs.action-current }}
       viz: ${{ steps.filter.outputs.viz }}
       mutation-runner: ${{ steps.filter.outputs.mutation-runner }}
+      similar-code-sidecar: ${{ steps.filter.outputs.similar-code-sidecar }}
       # A failed or skipped selector step never publishes partial output.
       heavy-runner: ${{ steps.heavy-runner.outcome == 'success' && steps.heavy-runner.outputs.runner || 'ubuntu-26.04' }}
       miri-runner: ${{ steps.miri-runner.outcome == 'success' && steps.miri-runner.outputs.runner || 'ubuntu-26.04' }}
@@ -90,6 +91,7 @@ jobs:
             # trigger the gate:
             #   - crates/types/src/                       (analysis and base payload types)
             #   - crates/output/src/                      (health, action, and envelope wire shapes)
+            #   - crates/report-protocol/src/             (error document and gate outcome wire shapes)
             #   - crates/api/src/                         (programmatic and attribution wrappers)
             #   - crates/cli/src/bin/schema_emit.rs       (derived definition registry and schema assembly)
             #   - crates/config/src/config/              (FallowConfig + RulesConfig + presets, source of schema.json)
@@ -141,6 +143,7 @@ jobs:
               - 'deny.toml'
               - '.clippy.toml'
               - '.config/nextest.toml'
+              - 'scripts/nextest-run-tmpdir.sh'
               - 'rust-toolchain.toml'
             windows-rust:
               - 'crates/core/src/discover/walk.rs'
@@ -177,23 +180,29 @@ jobs:
               - 'crates/engine/src/write_guard.rs'
               - 'crates/engine/Cargo.toml'
               - 'crates/engine/src/health/scoring.rs'
+              - 'crates/engine/src/health/scoring_tests.rs'
               - 'crates/engine/src/health/coverage_v8/**'
               - 'crates/engine/src/trace_error.rs'
               - 'crates/cli/src/signal/**'
+              - 'crates/cli/src/coverage/credentials.rs'
               - 'crates/cli/src/write_scope.rs'
               - 'crates/cli/Cargo.toml'
               - 'crates/process/src/scoped_child.rs'
               - 'crates/process/src/process_tree.rs'
               - 'crates/process/src/registry.rs'
               - 'crates/cli/tests/drift/**'
+              - 'crates/cli/tests/integration/audit_tests.rs'
               - 'crates/cli/tests/integration/exit_code_tests.rs'
               - 'crates/cli/src/agent_install/mcp.rs'
               - 'crates/cli/src/agent_install/mod.rs'
               - 'crates/cli/src/agent_install/status.rs'
               - 'crates/cli/src/audit_tests.rs'
               - 'crates/cli/src/base_worktree.rs'
+              - 'crates/cli/src/base_worktree_scan.rs'
+              - 'crates/cli/src/base_worktree_lock.rs'
               - 'crates/cli/src/ci_template.rs'
               - 'crates/cli/src/coverage/mod.rs'
+              - 'crates/cli/src/coverage/mod_tests.rs'
               - 'crates/cli/src/coverage/upload_source_maps.rs'
               - 'crates/cli/src/health/coverage.rs'
               - 'crates/cli/src/report/sink.rs'
@@ -339,6 +348,16 @@ jobs:
             mutation-runner:
               - 'tools/mutation-runner/**'
               - 'crates/api/mutation-runner-protocol.json'
+              - '.github/workflows/ci.yml'
+              - 'scripts/workflow-policy.test.mjs'
+            # `similar-code-sidecar` gates the lint job of the similar-code
+            # companion. It is a separate Cargo workspace, so the workspace
+            # clippy run in `check-lint` does not cover it.
+            similar-code-sidecar:
+              - 'tools/similar-code-sidecar/**'
+              - 'crates/api/similar-code-protocol.json'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
               - '.github/workflows/ci.yml'
               - 'scripts/workflow-policy.test.mjs'
 
@@ -704,9 +723,12 @@ jobs:
           cache-key: drift
 
       # The harness drives the MCP server as a separate binary and fails when
-      # it is missing, so build it before the test target.
+      # it is missing, so build it before the test target. One invocation for
+      # both packages resolves one feature set, so the test step reuses every
+      # artifact. A separate `cargo build -p fallow-mcp` resolves fewer
+      # dependency features and builds a second copy of most of the tree.
       - name: Build fallow-mcp
-        run: cargo build -p fallow-mcp
+        run: cargo build -p fallow-cli -p fallow-mcp --bin fallow-mcp --test drift
 
       # Fixed seed: a failure on a pull request reproduces locally with the
       # same command. See docs/development/drift-contract.md.
@@ -815,8 +837,10 @@ jobs:
       # The drift harness builds git fixtures, spawns the CLI and the MCP
       # server, and compares root-relative paths. A harness change must pass
       # here on Windows before it merges.
+      # One invocation for both packages builds each crate once. See the
+      # Build fallow-mcp step of the drift job.
       - name: Build fallow-mcp for the drift harness
-        run: cargo build -p fallow-mcp
+        run: cargo build -p fallow-cli -p fallow-mcp --bin fallow-mcp --test drift
       - name: Test drift harness on Windows
         run: cargo test -p fallow-cli --test drift -- --include-ignored
 
@@ -1494,6 +1518,32 @@ jobs:
       - name: Format
         run: cargo fmt --check --manifest-path editors/zed/Cargo.toml
 
+  # The similar-code companion is a separate Cargo workspace with its own
+  # lockfile. Release builds compile it, but no other pull request job lints
+  # it, so a clippy failure there stays hidden until a release. The root
+  # target directory is the one that the rust cache saves. The job runs on
+  # Linux only, so code for macOS only is not linted here.
+  similar-code-sidecar:
+    name: Similar-code sidecar clippy
+    needs: changes
+    if: needs.changes.outputs.similar-code-sidecar == 'true' || (github.event_name == 'push' && needs.changes.outputs.main-full != 'false')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+          cache-key: similar-code-sidecar
+
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path tools/similar-code-sidecar/Cargo.toml --target-dir target --all-targets -- -D warnings
+
   test-gitlab-ci:
     name: Test GitLab CI scripts
     needs: changes
@@ -1645,10 +1695,15 @@ jobs:
           cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests --no-run
 
       # The Miri interpreter runs on one core, and `cargo miri test` runs the
-      # tests of a crate one after the other. The three crates run as three
-      # parallel processes, so the job takes as long as the slowest crate, not
-      # the sum of the three. `cargo miri nextest run` is slower: it starts a
-      # new Miri process for each test, and each start costs seconds.
+      # tests of a crate one after the other. Each unit below runs as its own
+      # parallel process, so the job takes as long as the slowest unit, not
+      # the sum. `cargo miri nextest run` is slower: it starts a new Miri
+      # process for each test, and each start costs seconds.
+      #
+      # fallow-graph takes about three times as long as the other crates, so
+      # it runs as three shards of about equal time. A test name filter matches
+      # a substring, and shard 3 skips every filter of shards 1 and 2. Thus
+      # each test runs in exactly one shard, and a new module goes to shard 3.
       #
       # Only suppress, CSS helpers, and visitor helpers of fallow-extract run
       # under Miri (pure data logic). Parser-heavy modules have no unsafe code
@@ -1663,6 +1718,10 @@ jobs:
       - name: Run Miri tests (fallow-types, fallow-graph, fallow-extract in parallel)
         run: |
           set -u
+          graph_shard_1=(graph::cycles graph::reachability)
+          graph_shard_2=(graph::re_exports graph::namespace_re_exports resolve::specifier)
+          graph_shard_3=()
+          for filter in "${graph_shard_1[@]}" "${graph_shard_2[@]}"; do graph_shard_3+=(--skip "$filter"); done
           run_crate() {
             local crate="$1"
             local start="$SECONDS"
@@ -1671,8 +1730,14 @@ jobs:
               fallow-types)
                 cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-types --lib --tests -- --skip proptests || status=1
                 ;;
-              fallow-graph)
-                cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-graph --lib --tests -- --skip proptests || status=1
+              fallow-graph-1)
+                cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-graph --lib --tests -- "${graph_shard_1[@]}" --skip proptests || status=1
+                ;;
+              fallow-graph-2)
+                cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-graph --lib --tests -- "${graph_shard_2[@]}" --skip proptests || status=1
+                ;;
+              fallow-graph-3)
+                cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-graph --lib --tests -- "${graph_shard_3[@]}" --skip proptests || status=1
                 ;;
               fallow-extract)
                 export MIRIFLAGS=-Zmiri-tree-borrows
@@ -1688,7 +1753,7 @@ jobs:
           }
           logs="$RUNNER_TEMP/miri"
           mkdir -p "$logs"
-          crates=(fallow-types fallow-graph fallow-extract)
+          crates=(fallow-types fallow-graph-1 fallow-graph-2 fallow-graph-3 fallow-extract)
           pids=()
           # Stream each crate live with a prefix, so a run that hits the job
           # timeout still shows which test hung. The exit status goes to a file,
@@ -1740,7 +1805,7 @@ jobs:
   ci-ok:
     name: CI
     if: always()
-    needs: [changes, docker, check, check-lint, napi, drift, windows-rust, windows-drift, windows-type-aware, doc, typos, js-lint, npm-package, action-current, fallow-self-analyze, vscode, vscode-package-targets, vscode-target-host, zed, test-gitlab-ci, audit, deny, shear, zizmor, msrv, miri, skills-vendor, viz-frontend, mutation-runner-floor]
+    needs: [changes, docker, check, check-lint, napi, drift, windows-rust, windows-drift, windows-type-aware, doc, typos, js-lint, npm-package, action-current, fallow-self-analyze, vscode, vscode-package-targets, vscode-target-host, zed, test-gitlab-ci, audit, deny, shear, zizmor, msrv, miri, skills-vendor, viz-frontend, mutation-runner-floor, similar-code-sidecar]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions: {}

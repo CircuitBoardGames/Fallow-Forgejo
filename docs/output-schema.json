@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Fallow JSON Output Schemas",
-  "description": "Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field.",
+  "description": "Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field. A `--lean` document is not a root branch: it validates against `LeanOutput`.",
   "oneOf": [
     {
       "$ref": "#/definitions/FallowOutput"
@@ -401,6 +401,17 @@
             "type": "string"
           },
           "description": "Non-fatal problems encountered during detection."
+        },
+        "cloud": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CoverageSetupCloud"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Fallow Cloud plan, present only for `fallow coverage setup --cloud`."
         },
         "_meta": {
           "description": "`_meta` block with docs and field definitions, when requested."
@@ -2239,24 +2250,33 @@
           "description": "Timestamp of the newest runtime payload included in the report. Null for\nlocal single-capture artifacts that do not carry cloud receipt metadata."
         },
         "functions_tracked": {
-          "type": "integer",
-          "description": "Number of functions the sidecar could observe in the V8 or Istanbul\ndump."
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Number of functions the sidecar could observe in the V8 or Istanbul\ndump. Null for a positive-only capture, which cannot observe a\nfunction that did not run."
         },
         "functions_hit": {
           "type": "integer",
           "description": "Tracked functions that received at least one invocation."
         },
         "functions_unhit": {
-          "type": "integer",
-          "description": "Tracked functions that were never invoked."
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Tracked functions that were never invoked. Null for a positive-only\ncapture."
         },
         "functions_untracked": {
           "type": "integer",
           "description": "Functions the sidecar could not track (lazy-parsed, worker thread,\ndynamic code, unresolved source map)."
         },
         "coverage_percent": {
-          "type": "number",
-          "description": "Ratio of functions_hit / functions_tracked, expressed as a percent."
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Ratio of functions_hit / functions_tracked, expressed as a percent.\nNull for a positive-only capture."
         },
         "trace_count": {
           "type": "integer",
@@ -2280,15 +2300,23 @@
             }
           ],
           "description": "Capture-quality telemetry. `None` for protocol-0.2 sidecars; protocol-0.3+\nsidecars always populate it. Fuels the human-output short-window warning\nand the quantified trial CTA, and is passed through to JSON consumers so\nagent pipelines can surface the same signal."
+        },
+        "capture_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RuntimeCoverageCapturePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Capture policy of the runtime evidence. Absent for a full capture.\n`positive_only` means the tracked and unhit totals and the coverage\npercent are null."
         }
       },
       "required": [
         "data_source",
-        "functions_tracked",
         "functions_hit",
-        "functions_unhit",
         "functions_untracked",
-        "coverage_percent",
         "trace_count",
         "period_days",
         "deployments_seen"
@@ -3367,7 +3395,7 @@
         },
         "functions_above_threshold": {
           "type": "integer",
-          "description": "Functions exceeding at least one complexity or CRAP threshold."
+          "description": "Complexity findings before `--top`: functions exceeding at least one\ncomplexity or CRAP threshold, plus file-length findings\n(`exceeded: \"file_lines\"`)."
         },
         "max_cyclomatic_threshold": {
           "type": "integer",
@@ -3395,6 +3423,13 @@
         "max_unit_size_threshold": {
           "type": "integer",
           "description": "Effective global unit-size ceiling (`health.maxUnitSize`, maximum\nfunction length in lines) for this run. Sits alongside the other three\n`max_*_threshold` siblings so a consumer reading the summary sees every\nconfigured threshold. Per-file `thresholdOverrides` are not reflected\nhere; this is the global default."
+        },
+        "max_file_lines_threshold": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Global file-length ceiling (`health.maxFileLines` or\n`--max-file-lines`) in physical lines. Absent when the file-length\ncheck is off."
         },
         "files_scored": {
           "type": [
@@ -3518,11 +3553,11 @@
         },
         "name": {
           "type": "string",
-          "description": "Function name, or a synthesized name for anonymous functions."
+          "description": "Function name, or a synthesized name for anonymous functions. A\nfile-length finding has the name `<file>`."
         },
         "line": {
           "type": "integer",
-          "description": "1-based line the function starts on."
+          "description": "1-based line the function starts on. A file-length finding has `1`."
         },
         "col": {
           "type": "integer",
@@ -3545,7 +3580,7 @@
         },
         "line_count": {
           "type": "integer",
-          "description": "Lines of code in the function body."
+          "description": "Lines of code in the function body. On a file-length finding, the\nphysical line count of the file."
         },
         "param_count": {
           "type": "integer",
@@ -3686,6 +3721,13 @@
             }
           ],
           "description": "Source of the effective thresholds. Omitted when thresholds are global."
+        },
+        "max_file_lines": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "File-length ceiling in physical lines that the file exceeded. Present\nonly on a file-level finding (`exceeded: \"file_lines\"`), where\n`line_count` holds the physical line count of the file."
         },
         "actions": {
           "type": "array",
@@ -8037,6 +8079,11 @@
           "type": "string",
           "const": "all",
           "description": "Cyclomatic, cognitive, and CRAP all exceeded."
+        },
+        {
+          "type": "string",
+          "const": "file_lines",
+          "description": "The file has more physical lines than `health.maxFileLines`. The\nfinding describes the whole file: `name` is `<file>`, `line_count` is\nthe line count of the file, and `max_file_lines` is the ceiling."
         }
       ],
       "description": "Which complexity threshold was exceeded."
@@ -9114,12 +9161,17 @@
         {
           "type": "string",
           "const": "suppress-file",
-          "description": "Suppress with an HTML comment at the top of the template. Used for\nsynthetic Angular `<template>` findings on `.html` files where a\nline suppression cannot be expressed."
+          "description": "Suppress for the whole file. Used for synthetic Angular `<template>`\nfindings on `.html` files where a line suppression cannot be\nexpressed (an HTML comment at the top of the template), and for\nfile-length findings (`// fallow-ignore-file complexity` at the top of\nthe file)."
         },
         {
           "type": "string",
           "const": "suppress-line",
           "description": "Suppress with a next-line comment above the reported line: the\ninline `// fallow-ignore-next-line complexity` form above a function\nor Angular decorator, or the markup\n`<!-- fallow-ignore-next-line complexity -->` form for synthetic\n`<template>` findings in `.svelte`, `.vue`, and `.astro` files."
+        },
+        {
+          "type": "string",
+          "const": "split-file",
+          "description": "Split a file that exceeds `health.maxFileLines` into smaller modules.\nEmitted only on a file-length finding (`exceeded: \"file_lines\"`)."
         }
       ],
       "description": "Discriminant for [`HealthFindingAction::kind`]. Mirrors the action types\nemitted by `build_health_finding_actions`. A single finding's `actions`\narray may carry multiple entries of different types: a finding that\nexceeded both cyclomatic and CRAP at `coverage_tier: partial` will get\nBOTH `increase-coverage` AND `refactor-function`, plus the trailing\n`suppress-line`."
@@ -9798,7 +9850,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -9838,7 +9895,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -9992,7 +10054,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -10032,7 +10099,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -12198,11 +12270,11 @@
         },
         "name": {
           "type": "string",
-          "description": "Function name, or a synthesized name for anonymous functions."
+          "description": "Function name, or a synthesized name for anonymous functions. A\nfile-length finding has the name `<file>`."
         },
         "line": {
           "type": "integer",
-          "description": "1-based line the function starts on."
+          "description": "1-based line the function starts on. A file-length finding has `1`."
         },
         "col": {
           "type": "integer",
@@ -12225,7 +12297,7 @@
         },
         "line_count": {
           "type": "integer",
-          "description": "Lines of code in the function body."
+          "description": "Lines of code in the function body. On a file-length finding, the\nphysical line count of the file."
         },
         "param_count": {
           "type": "integer",
@@ -12366,6 +12438,13 @@
             }
           ],
           "description": "Source of the effective thresholds. Omitted when thresholds are global."
+        },
+        "max_file_lines": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "File-length ceiling in physical lines that the file exceeded. Present\nonly on a file-level finding (`exceeded: \"file_lines\"`), where\n`line_count` holds the physical line count of the file."
         }
       },
       "required": [
@@ -12803,6 +12882,11 @@
           "type": "string",
           "const": "2",
           "description": "Expands the required semantic omission reason-code enum."
+        },
+        {
+          "type": "string",
+          "const": "3",
+          "description": "Makes the runtime summary totals `functions_tracked`, `functions_unhit`\nand `coverage_percent` nullable (null for a positive-only capture) and\nadds `summary.capture_policy`."
         }
       ],
       "description": "Schema-version discriminator for [`CoverageAnalyzeOutput`]."
@@ -13584,6 +13668,37 @@
             "pattern"
           ],
           "description": "An `ignorePatterns` glob excluded no file that the run would otherwise\nanalyze (issue #3824). Never a `!` exception, a glob that names a\nhidden directory, or a `--production` run. A glob for build output has\nan effect only after a build. `path` is the root. Not degraded."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "override-rule-ineffective"
+            },
+            "rule": {
+              "type": "string",
+              "description": "The canonical rule name, also when the config uses an alias."
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "The `overrides[].files` globs, as written in the config."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why the rule has no effect, as a kebab-case token."
+            }
+          },
+          "required": [
+            "kind",
+            "rule",
+            "files",
+            "reason"
+          ],
+          "description": "An `overrides` rule cannot change the result (issue #4065). `reason` is\n`project-level` (fallow reads only the top-level severity of the rule)\nor `base-rule-off` (the top-level rule is off after CLI flags, so its\ndetector does not run). The token set is open. `path` is the root. Not\ndegraded, and no finding or exit code changes."
         },
         {
           "type": "object",
@@ -16394,7 +16509,7 @@
         },
         "callee": {
           "type": "string",
-          "description": "The callee path as written at the call site (e.g. `cp.exec`)."
+          "description": "The callee path as written (e.g. `cp.exec`), with the prefix `new ` for a `new` expression."
         },
         "pattern": {
           "type": "string",
@@ -16477,7 +16592,7 @@
         },
         "matched": {
           "type": "string",
-          "description": "What matched: the written callee path for `banned-call` (e.g.\n`cp.exec`), the raw import specifier for `banned-import` (e.g.\n`moment/locale/nl`), `<effect>: <callee>` for `banned-effect`, or the\nexported name for `banned-export`. For `gdp-proof-producer`, the canonical\nfactory with its JSON-quoted literal label or `...` for a dynamic label."
+          "description": "What matched: the written callee path for `banned-call` (e.g. `cp.exec`, or `new Date` for a `new` expression), `<effect>: <callee>` for `banned-effect`,\nor the exported name for `banned-export`. For `gdp-proof-producer`, the canonical factory with its JSON-quoted literal label or `...` for a dynamic label.\nFor `banned-import`: the raw import specifier (e.g. `moment/locale/nl`), or `<specifier>: <binding>` when the rule sets `allowNames`.\n`<binding>` is the source-side imported name, `default`, `*` for a namespace or star form,\nor `side-effect`."
         },
         "severity": {
           "description": "Effective severity for this finding (per-rule `severity`, else the\n`rules.\"policy-violation\"` master).",
@@ -16534,7 +16649,7 @@
         {
           "type": "string",
           "const": "banned-call",
-          "description": "A call site matched a `banned-call` rule's callee patterns."
+          "description": "A call or `new` expression matched a `banned-call` rule's callee patterns."
         },
         {
           "type": "string",
@@ -16776,6 +16891,13 @@
             "null"
           ],
           "description": "Unit-size ceiling set by the override, when it sets one."
+        },
+        "max_file_lines": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "File-length ceiling set by the override, when it sets one."
         }
       },
       "description": "Threshold values configured by a single override entry."
@@ -18198,7 +18320,7 @@
         "important_count",
         "nesting_depth"
       ],
-      "description": "Structural CSS metrics for a single style rule, computed from the parsed CSS\nsyntax tree. A rule is recorded only when it crosses a structural floor (an\nid selector, a complex selector, a `!important` declaration, or deep\nnesting), so the vector stays bounded on normal stylesheets.\n\nNot persisted in the extraction cache: `fallow health` computes these\non demand from the CSS source, so there is no `bitcode` derive."
+      "description": "Structural CSS metrics for one style rule of the parsed CSS. Only a rule\nover a structural floor (an id selector, a complex selector, `!important`,\nor deep nesting) is recorded, so the vector stays bounded. Not cached:\n`fallow health` computes these from the CSS source (no `bitcode` derive)."
     },
     "CssAnalyticsSummary": {
       "type": "object",
@@ -19929,6 +20051,17 @@
             }
           ],
           "description": "Test entry points reachable from the exact symbol, with provenance.\nPresent only for a symbol target in type-aware mode."
+        },
+        "cloud": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InspectCloudEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "OPT-IN Fallow Cloud production evidence for a file target. Present\nonly when `--cloud` was requested. A missing key, a plan gate or an\nunreachable cloud is a section status, never a failed run."
         }
       },
       "required": [
@@ -20317,7 +20450,7 @@
     },
     "ReviewBriefSchemaVersion": {
       "type": "integer",
-      "const": 13,
+      "const": 14,
       "description": "Independently-versioned wire-version newtype for the brief envelope.\nSerializes as the integer `REVIEW_BRIEF_SCHEMA_VERSION`."
     },
     "RiskClass": {
@@ -20435,7 +20568,7 @@
           "items": {
             "type": "string"
           },
-          "description": "A capped, path-sorted sample of the affected root-relative paths (at most\n[`AFFECTED_SAMPLE_CAP`]), deduped. The full count lives in\n[`affected_count`](Self::affected_count) and the distribution in\n[`affected_by_dir`](Self::affected_by_dir); use this list to jump to\nrepresentative files, NEVER to enumerate the blast radius or to infer its\nshape. Because it is a prefix of the sorted set, it clusters in whichever\ndirectory sorts first. To reconstruct the full set, run\n`fallow check --impact-closure <path>` once per changed file and union the\nresults: that flag seeds from a single file, so no single command\nreproduces this changeset-wide union."
+          "description": "A capped, path-sorted sample of the affected root-relative paths (at most\n[`AFFECTED_SAMPLE_CAP`]), deduped. The full count lives in\n[`affected_count`](Self::affected_count) and the distribution in\n[`affected_by_dir`](Self::affected_by_dir); use this list to jump to\nrepresentative files, NEVER to enumerate the blast radius or to infer its\nshape. Because it is a prefix of the sorted set, it clusters in whichever\ndirectory sorts first. To reconstruct the full set, run\n`fallow dead-code --impact-closure <path>` once per changed file and union the\nresults: that flag seeds from a single file, so no single command\nreproduces this changeset-wide union."
         },
         "affected_by_dir": {
           "type": "array",
@@ -25673,12 +25806,12 @@
     },
     "HealthSchemaVersion": {
       "type": "integer",
-      "const": 12,
+      "const": 13,
       "description": "Exact schema version for [`HealthOutput`]."
     },
     "AuditSchemaVersion": {
       "type": "integer",
-      "const": 13,
+      "const": 14,
       "description": "Schema projection for the audit envelope's exact version."
     },
     "CheckSchemaVersion": {
@@ -25688,7 +25821,7 @@
     },
     "CombinedSchemaVersion": {
       "type": "integer",
-      "const": 14,
+      "const": 15,
       "description": "Schema projection for the combined envelope's exact version."
     },
     "DupesSchemaVersion": {
@@ -28458,7 +28591,7 @@
         },
         "change_scoped": {
           "type": "boolean",
-          "description": "True when this run analyzed only part of the project, so a whole-project\nbaseline matches less of it for reasons that are not rot. The channels\ndiffer per command and include a diff, a base ref, `--changed-since`,\n`--workspace`, `--changed-workspaces`, `--scope`, `--file`, an\nissue-type filter, and production mode. Both `stale` and `gate_trips`\nare false whenever this is true. `scope_reasons` names the channels\nthat fired."
+          "description": "True when this run cannot judge the loaded baseline, because its scope\ndiffers from the scope the file records. `scope_reasons` names each\nchannel that differs, so on `dead-code` production can appear when only\nthe file used production mode. On `dupes` and `health` this is true when\nthe run analyzed only part of the project, and production mode always\ncounts. The channels differ per command and include a diff, a base ref,\n`--changed-since`, `--workspace`, `--changed-workspaces`, `--scope`,\n`--file`, an issue-type filter, and production mode. Both `stale` and\n`gate_trips` are false whenever this is true."
         },
         "stale": {
           "type": "boolean",
@@ -28494,7 +28627,7 @@
           "items": {
             "$ref": "#/definitions/ScopeReason"
           },
-          "description": "Which channels narrowed this run, present and non-empty exactly when\n`change_scoped` is true. Both members are derived from one function, so\nthe boolean and the array cannot disagree.\n\nRead it to decide whether the narrowing is removable: a run narrowed\nonly by `diff`, `changed-since`, `changed-files`, `scope`, `file` or\n`issue-type-filter` can be repeated unscoped to judge the baseline,\nwhile `production`, `workspace` and `changed-workspaces` are the\ncaller's own choice about what to analyze and an unscoped repeat would\ncontradict it.\n\nThe name set is OPEN and the names a command can emit differ per\ncommand; see [`ScopeReason`]."
+          "description": "Which channels stop this run from judging the file, present and\nnon-empty exactly when `change_scoped` is true. Both members are derived\nfrom one function, so the boolean and the array cannot disagree.\n\nOn `dead-code`, `production` and `include-entry-exports` appear only when\nthe run and the file differ on that channel, and `issue-type-filter`\nappears only when the file holds a category that the run does not report.\n\nRead it to decide whether the narrowing is removable: a run narrowed\nonly by `diff`, `changed-since`, `changed-files`, `scope`, `file` or\n`issue-type-filter` can be repeated unscoped to judge the baseline,\nwhile `production`, `workspace` and `changed-workspaces` are the\ncaller's own choice about what to analyze and an unscoped repeat would\ncontradict it.\n\nThe name set is OPEN and the names a command can emit differ per\ncommand; see [`ScopeReason`]."
         }
       },
       "required": [
@@ -28508,7 +28641,7 @@
         "gate_trips",
         "moved_entries"
       ],
-      "description": "One run's machine-readable view of a loaded baseline.\n\n`stale` and `gate_trips` answer different questions and legitimately\ndisagree. `stale` mirrors the unasked-for stderr advisory, which stays silent\nbelow a quarter of the baseline and on a run that produced no findings at\nall, because a cleaned project and a rotted baseline look identical from\nthere. `gate_trips` mirrors the opt-in `--fail-on-stale-baseline` rule, which\na repository asks for precisely to catch those cases, so it fires on any\nstale entry. A rotted baseline on a cleaned project reports\n`stale: false` with `gate_trips: true`; that is the contract, not a defect.\n\n`change_scoped` is the member a consumer must read before dividing\n`matched_entries` by `baseline_entries`. A run narrowed to part of the\nproject compares a whole-project baseline against a slice of it and can\nreport `matched_entries: 0` while the baseline is perfectly healthy, so both\n`stale` and `gate_trips` are false there by construction. The remedy for a\ntripped gate is always the same: re-save the baseline from a whole-project\nrun with `--save-baseline`."
+      "description": "One run's machine-readable view of a loaded baseline.\n\n`stale` and `gate_trips` answer different questions and legitimately\ndisagree. `stale` mirrors the unasked-for stderr advisory, which stays silent\nbelow a quarter of the baseline and on a run that produced no findings at\nall, because a cleaned project and a rotted baseline look identical from\nthere. `gate_trips` mirrors the opt-in `--fail-on-stale-baseline` rule, which\na repository asks for precisely to catch those cases, so it fires on any\nstale entry. A rotted baseline on a cleaned project reports\n`stale: false` with `gate_trips: true`; that is the contract, not a defect.\n\n`change_scoped` is the member a consumer must read before dividing\n`matched_entries` by `baseline_entries`. A run whose scope differs from the\nfile compares the file against another set of findings and can report\n`matched_entries: 0` while the baseline is perfectly healthy, so both `stale`\nand `gate_trips` are false there by construction. The remedy for a tripped\ngate is always the same: remove the stale entries with\n`fallow baselines prune`, or re-save the baseline in the same mode with\n`--save-baseline`."
     },
     "BaselineStalenessAdvisory": {
       "oneOf": [
@@ -28862,7 +28995,7 @@
           "description": "`--include-entry-exports` or the `includeEntryExports` config key. It\nchanges which exports `unused-exports` reports, so the run judges a\ndifferent export surface than a run without it."
         }
       ],
-      "description": "One channel that narrowed a run to part of the project.\n\nSerialized as kebab-case inside `scope_reasons` and published as an OPEN\nset, the same tolerate-unknown contract `gate_outcomes` keys carry: a name\nthis build does not emit means \"some narrowing\", not an error.\n\nWhich names a command can emit differs per command, because the three\nnarrowing predicates see different state. `dead-code` reads the flags\nthemselves and can name every channel. `dupes` and `health` see an already\nresolved changed-file set and report `changed-files`, because at that point\nthe flag that produced it is gone. `health` reports `workspace` for both\n`--workspace` and `--changed-workspaces` for the same reason. A consumer\nmust therefore not assume a given command emits a given name."
+      "description": "One channel that narrows a run, or that differs between a run and a saved\nbaseline.\n\nSerialized as kebab-case inside `scope_reasons` and published as an OPEN\nset, the same tolerate-unknown contract `gate_outcomes` keys carry: a name\nthis build does not emit means \"some narrowing\", not an error.\n\nWhich names a command can emit differs per command, because the three\nnarrowing predicates see different state. `dead-code` reads the flags\nthemselves and can name every channel. `dupes` and `health` see an already\nresolved changed-file set and report `changed-files`, because at that point\nthe flag that produced it is gone. `health` reports `workspace` for both\n`--workspace` and `--changed-workspaces` for the same reason. A consumer\nmust therefore not assume a given command emits a given name."
     },
     "CombinedDupesSection": {
       "type": "object",
@@ -32669,6 +32802,10 @@
           "description": "Whether the result is conclusive.",
           "$ref": "#/definitions/MutationCompletion"
         },
+        "kill_matrix": {
+          "description": "The observed kill matrix and candidate review signals.",
+          "$ref": "#/definitions/MutationKillMatrix"
+        },
         "scope": {
           "description": "The mutated code.",
           "$ref": "#/definitions/MutationScopeOutput"
@@ -32806,6 +32943,7 @@
         "version",
         "elapsed_ms",
         "completion",
+        "kill_matrix",
         "scope",
         "summary",
         "mutants",
@@ -33053,6 +33191,17 @@
             "null"
           ],
           "description": "The test that killed the mutant in the run of the report."
+        },
+        "killing_tests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "All observed failing tests, sorted. Timeouts do not count. Empty\noutside `--kill-matrix`; `killed_by` keeps the first killer."
+        },
+        "kill_matrix_complete": {
+          "type": "boolean",
+          "description": "True only for exact requested membership with terminal pass or fail results."
         }
       },
       "required": [
@@ -33066,7 +33215,9 @@
         "span",
         "operator",
         "covering_tests",
-        "static_test_files"
+        "static_test_files",
+        "killing_tests",
+        "kill_matrix_complete"
       ],
       "description": "The envelope of `fallow mutation inspect`. It runs no user code."
     },
@@ -33096,8 +33247,8 @@
       "oneOf": [
         {
           "type": "string",
-          "const": "1",
-          "description": "Initial independent contract."
+          "const": "2",
+          "description": "Adds complete kill matrix evidence."
         }
       ],
       "description": "Version singleton for a mutation report."
@@ -33116,8 +33267,8 @@
       "oneOf": [
         {
           "type": "string",
-          "const": "1",
-          "description": "Initial independent contract."
+          "const": "2",
+          "description": "Adds complete kill matrix evidence."
         }
       ],
       "description": "Version singleton for a mutation inspect packet."
@@ -33523,7 +33674,18 @@
             "string",
             "null"
           ],
-          "description": "The test that killed the mutant in this run. Absent for a kill by an\nerror outside a test.\n\nThis is evidence of one run, not a stable fact. A run stops at the\nfirst failing test, and it runs the fastest covering test first, so a\nsecond run on the same code can name another covering test. No\nfingerprint or baseline comparison uses this field.\n\nThe retry of a survivor also runs the other tests of its test files,\nso this test can be absent from `covering_tests`."
+          "description": "The test that killed the mutant in this run. Absent for a kill by an\nerror outside a test.\n\nThis is evidence of one run, not a stable fact. A normal run stops at\nthe first failing test. A kill matrix run retains each failing test\nin `killing_tests`. Tests run in measured fastest-first order, so a\nsecond run on the same code can name another first killer. No\nfingerprint or baseline comparison uses this field.\n\nThe retry of a survivor also runs the other tests of its test files,\nso this test can be absent from `covering_tests`."
+        },
+        "killing_tests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "All observed failing tests, sorted. Timeouts do not count. Empty\noutside `--kill-matrix`; `killed_by` keeps the first killer."
+        },
+        "kill_matrix_complete": {
+          "type": "boolean",
+          "description": "True only for exact requested membership with terminal pass or fail results."
         },
         "covering_tests": {
           "type": "array",
@@ -33588,7 +33750,9 @@
         "column",
         "span",
         "operator",
-        "status"
+        "status",
+        "killing_tests",
+        "kill_matrix_complete"
       ],
       "description": "One mutant of a run."
     },
@@ -33706,7 +33870,7 @@
             "string",
             "null"
           ],
-          "description": "The error message, for an error outside a test, or the reason for a\ntest that did not pass in the dry run of a restarted companion."
+          "description": "The error message. For an error outside a test, the error. For a test\nthat failed in the first dry run, the first error of the test. For a\ntest that failed in a control run or in the dry run of a restarted\ncompanion, the reason, then `: ` and the first error of the test. A\ntest error has its name and message on the first line and the stack\nframes of the project after it. Absent for a test of the first dry\nrun when the companion sent no error."
         },
         "mutant_ids": {
           "type": "array",
@@ -34495,6 +34659,17 @@
           ],
           "description": "The test that killed the mutant in this run."
         },
+        "killing_tests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "All observed failing tests, sorted. Timeouts do not count. Empty\noutside `--kill-matrix`; `killed_by` keeps the first killer."
+        },
+        "kill_matrix_complete": {
+          "type": "boolean",
+          "description": "True only for exact requested membership with terminal pass or fail results."
+        },
         "failure_kind": {
           "anyOf": [
             {
@@ -34515,7 +34690,9 @@
         }
       },
       "required": [
-        "status"
+        "status",
+        "killing_tests",
+        "kill_matrix_complete"
       ],
       "description": "One run of a retried mutant."
     },
@@ -34742,6 +34919,759 @@
         "rejected"
       ],
       "description": "The resume facts of a `--resume` run."
+    },
+    "CoverageSetupCi": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "description": "CI provider the steps are written for.",
+          "$ref": "#/definitions/CoverageSetupCiProvider"
+        },
+        "workflows_detected": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Existing workflow files that look like a deploy workflow, relative to\nthe project root."
+        },
+        "steps": {
+          "type": "string",
+          "description": "Workflow steps to add to the job that builds and deploys."
+        },
+        "instructions": {
+          "type": "string",
+          "description": "Where the steps go and what they need."
+        }
+      },
+      "required": [
+        "provider",
+        "workflows_detected",
+        "steps",
+        "instructions"
+      ],
+      "description": "CI steps of a Fallow Cloud setup plan."
+    },
+    "CoverageSetupCloud": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Fallow Cloud project id (`owner/repo`), or null when it was not detected."
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Commit SHA that `--wait` checks: `--git-sha`, else `HEAD` of the\nworking tree, or null outside a git repository."
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "Fallow Cloud API base URL."
+        },
+        "api_key_env": {
+          "type": "string",
+          "description": "Environment variable that holds the full API key in CI and on the server."
+        },
+        "browser_key_env": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Environment variable that holds the ingest-only browser key, when a\nmember runs in the browser."
+        },
+        "commit_sha_env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Environment variables the server snippets read the deployed commit SHA\nfrom, in order."
+        },
+        "ci": {
+          "description": "CI steps that upload the inventory and source maps and register the\ndeployment.",
+          "$ref": "#/definitions/CoverageSetupCi"
+        },
+        "source_maps": {
+          "description": "Whether the production build needs a source map upload.",
+          "$ref": "#/definitions/CoverageSetupSourceMaps"
+        },
+        "activation_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Activation endpoint that reports each setup step, or null without a\nproject id."
+        },
+        "wait_command": {
+          "type": "string",
+          "description": "Command that waits until the cloud reports every step as done."
+        },
+        "wait": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CoverageSetupWait"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Result of `--wait`, present only when the command waited."
+        }
+      },
+      "required": [
+        "endpoint",
+        "api_key_env",
+        "commit_sha_env",
+        "ci",
+        "source_maps",
+        "wait_command"
+      ],
+      "description": "Fallow Cloud plan of `fallow coverage setup --cloud`.\n\nThe beacon, the inventory, the source maps and the deployment registration\nmust all carry the same commit SHA. The plan names only the environment\nvariable names of keys, never a key value."
+    },
+    "CoverageSetupSourceMaps": {
+      "type": "object",
+      "properties": {
+        "needed": {
+          "type": "boolean",
+          "description": "Whether the CI steps upload source maps."
+        },
+        "dirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Build output directories the maps are uploaded from, one per bundled\nworkspace member, relative to the project root. Empty when no upload\nis needed."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the upload is or is not needed."
+        }
+      },
+      "required": [
+        "needed",
+        "dirs",
+        "reason"
+      ],
+      "description": "Source map guidance of a Fallow Cloud setup plan."
+    },
+    "CoverageSetupWait": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "description": "How the wait ended.",
+          "$ref": "#/definitions/CoverageSetupWaitOutcome"
+        },
+        "activation": {
+          "description": "The last activation response body (`data`) from the cloud, unchanged,\nor null when no read succeeded. New step ids and states can appear."
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Error text when the outcome is `error`."
+        }
+      },
+      "required": [
+        "outcome"
+      ],
+      "description": "Result of `fallow coverage setup --cloud --wait`."
+    },
+    "CoverageSetupCiProvider": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "github_actions",
+          "description": "GitHub Actions workflow steps."
+        }
+      ],
+      "description": "CI provider of a Fallow Cloud setup plan."
+    },
+    "CoverageSetupWaitOutcome": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "complete",
+          "description": "The cloud reported every step as done."
+        },
+        {
+          "type": "string",
+          "const": "timeout",
+          "description": "The wait timed out before every step was done."
+        },
+        {
+          "type": "string",
+          "const": "error",
+          "description": "The activation endpoint could not be read."
+        }
+      ],
+      "description": "Outcome of `fallow coverage setup --cloud --wait`."
+    },
+    "MutationKillMatrix": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "Whether the matrix supports candidate analysis.",
+          "$ref": "#/definitions/MutationKillMatrixStatus"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Why evidence is unavailable or incomplete, sorted."
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MutationTestKillRow"
+          },
+          "description": "Each eligible test with observed coverage, sorted by test id."
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tests with nonempty kills and no unique kills, sorted by test id."
+        },
+        "coverage_without_kills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tests with coverage and no observed kills, sorted by test id."
+        }
+      },
+      "required": [
+        "status",
+        "reasons",
+        "tests",
+        "candidates",
+        "coverage_without_kills"
+      ],
+      "description": "Redundancy signals over the observed mutants. Candidates need review.\nRemoving candidates together can remove all tests for a mutant."
+    },
+    "MutationKillMatrixStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "complete",
+          "description": "Each eligible test has a terminal result for each covered mutant."
+        },
+        {
+          "type": "string",
+          "const": "incomplete",
+          "description": "At least one result is missing or inconclusive."
+        },
+        {
+          "type": "string",
+          "const": "unavailable",
+          "description": "The run did not request a kill matrix."
+        }
+      ],
+      "description": "The quality of observed test-to-mutant evidence."
+    },
+    "MutationTestKillRow": {
+      "type": "object",
+      "properties": {
+        "test_id": {
+          "type": "string",
+          "description": "The runner test id."
+        },
+        "file": {
+          "type": "string",
+          "description": "The root-relative test file."
+        },
+        "kills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The observed killed mutant ids, sorted."
+        },
+        "unique_kills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The mutant ids that no other eligible test kills, sorted."
+        },
+        "subsuming_tests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The tests whose kill sets contain this full kill set, sorted."
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Conservative evidence notes, sorted."
+        }
+      },
+      "required": [
+        "test_id",
+        "file",
+        "kills",
+        "unique_kills",
+        "subsuming_tests",
+        "notes"
+      ],
+      "description": "The observed mutant kills of one eligible test."
+    },
+    "LeanOutput": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Kind of the full envelope that this document trims.",
+          "$ref": "#/definitions/LeanOutputKind"
+        },
+        "profile": {
+          "description": "Always `lean`. A full document has no `profile` field.",
+          "$ref": "#/definitions/LeanProfile"
+        },
+        "schema_version": {
+          "type": "integer",
+          "description": "Schema version of the full envelope of the same `kind`."
+        },
+        "workspace_diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LeanDiagnosticGroup"
+          },
+          "description": "Workspace diagnostics, one entry per `kind`."
+        },
+        "_meta": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LeanMeta"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The `_meta` object of the full envelope plus `actions`."
+        }
+      },
+      "required": [
+        "kind",
+        "profile",
+        "schema_version"
+      ],
+      "title": "fallow --format json --lean",
+      "description": "Root of a `--format json --lean` document.\n\nThe body is the envelope of the same `kind`, with these changes:\n\n- Arrays that are empty are left out: at the root, in each `groups[]`\n  entry, and in each combined section (`check`, `dupes`, `health`).\n- Dead-code `summary` counts that are zero are left out (the dead-code\n  root and the combined `check` section).\n- `workspace_diagnostics` holds one entry per `kind`: the first\n  diagnostic of the kind plus `count` when the kind has more than one.\n- The health tables `hotspots`, `file_scores` and `large_functions` keep\n  their first rows (10 by default, the `--top` value when given, all rows\n  with `--full-tables`). `<table>_omitted` counts the rows left out. With\n  `fallow health --top`, the analysis cuts the tables first, so a table\n  that `--top` cut has no `<table>_omitted` count.\n- Repeated action text is in `_meta.actions`. An action without a text\n  field reads it from `_meta.actions[<type>].<field>`.\n\n`schema_version` is the version of the full envelope of the same `kind`."
+    },
+    "LeanOutputKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "dead-code",
+          "description": "`fallow dead-code --format json --lean`."
+        },
+        {
+          "type": "string",
+          "const": "dead-code-grouped",
+          "description": "`fallow dead-code --group-by ... --format json --lean`."
+        },
+        {
+          "type": "string",
+          "const": "health",
+          "description": "`fallow health --format json --lean`."
+        },
+        {
+          "type": "string",
+          "const": "combined",
+          "description": "Bare `fallow --format json --lean`."
+        }
+      ],
+      "description": "Envelope kinds that have a lean profile."
+    },
+    "LeanProfile": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "lean",
+          "description": "The `--lean` profile."
+        }
+      ],
+      "description": "Marker of a lean document."
+    },
+    "LeanDiagnosticGroup": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Diagnostic kind."
+        },
+        "path": {
+          "type": "string",
+          "description": "Path of the first diagnostic of the kind."
+        },
+        "message": {
+          "type": "string",
+          "description": "Message of the first diagnostic of the kind."
+        },
+        "degrades_analysis": {
+          "type": "boolean",
+          "description": "`true` when any diagnostic of the kind degrades the analysis."
+        },
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Number of diagnostics of the kind, when more than 1. An absent count\nmeans 1. Run without `--lean` for each diagnostic."
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "message"
+      ],
+      "description": "One workspace diagnostic kind in a lean document. The entry also carries\nthe kind-specific fields of the first diagnostic of the kind."
+    },
+    "LeanMeta": {
+      "type": "object",
+      "properties": {
+        "actions": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/LeanSharedActionText"
+          },
+          "description": "Shared action text, keyed by action `type`. An action without\n`description`, `note` or `comment` reads the value here."
+        }
+      },
+      "description": "The `_meta` keys that the lean profile adds. The keys of the full envelope\n`_meta` stay."
+    },
+    "LeanSharedActionText": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Shared `description`."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Shared `note`."
+        },
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Shared `comment`."
+        }
+      },
+      "description": "The most common text of one action type. Actions with other text keep\ntheir own field."
+    },
+    "InspectCloudEvidence": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "Outcome of the cloud read.",
+          "$ref": "#/definitions/InspectCloudStatus"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Explanation for a status other than `ok`, or a note on an `ok`\nsection (for example that the cloud left out functions)."
+        },
+        "repo": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Fallow Cloud repository that was read, when it was resolved."
+        },
+        "latest_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Newest deployment commit with data for the file."
+        },
+        "period_days": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Days of production data the cloud read covers."
+        },
+        "summary": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InspectCloudSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "File summary from the cloud. `None` when the cloud was not read."
+        },
+        "functions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InspectCloudFunction"
+          },
+          "description": "Local functions paired with a deployed function."
+        },
+        "unpaired_local": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InspectCloudUnpairedFunction"
+          },
+          "description": "Local functions without a deployed function."
+        }
+      },
+      "required": [
+        "status",
+        "functions",
+        "unpaired_local"
+      ],
+      "description": "`evidence.cloud` block: production data of the target file from Fallow\nCloud, paired with the functions of the local file.\n\n`null` in a count means \"not measured\", never zero."
+    },
+    "InspectCloudStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "ok",
+          "description": "The cloud answered with production data for the file."
+        },
+        {
+          "type": "string",
+          "const": "no_key",
+          "description": "No usable API key. Run `fallow cloud login` or set `FALLOW_API_KEY`."
+        },
+        {
+          "type": "string",
+          "const": "plan_required",
+          "description": "The organization has no plan with production data."
+        },
+        {
+          "type": "string",
+          "const": "unavailable",
+          "description": "The cloud could not answer (network, server error, timeout)."
+        },
+        {
+          "type": "string",
+          "const": "untracked",
+          "description": "The cloud has no production data for the file."
+        }
+      ],
+      "description": "Status of the [`InspectCloudEvidence`] section."
+    },
+    "InspectCloudSummary": {
+      "type": "object",
+      "properties": {
+        "functions": {
+          "type": "integer",
+          "description": "Deployed functions of the file."
+        },
+        "called": {
+          "type": "integer",
+          "description": "Functions that ran in the period."
+        },
+        "never_called": {
+          "type": "integer",
+          "description": "Functions that were tracked and did not run."
+        },
+        "untracked": {
+          "type": "integer",
+          "description": "Functions without production data."
+        },
+        "calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Calls of all functions of the file. `None` when not measured."
+        },
+        "error_groups": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Error groups of the file. `None` when not measured."
+        },
+        "error_events": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Error events of the file. `None` when not measured."
+        },
+        "text": {
+          "type": "string",
+          "description": "One-line summary from the cloud."
+        }
+      },
+      "required": [
+        "functions",
+        "called",
+        "never_called",
+        "untracked",
+        "text"
+      ],
+      "description": "File summary of the [`InspectCloudEvidence`] section."
+    },
+    "InspectCloudFunction": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Function name in the local file."
+        },
+        "line": {
+          "type": "integer",
+          "description": "1-based start line in the local file."
+        },
+        "stable_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Stable id of the deployed function."
+        },
+        "match": {
+          "description": "How the local function was paired.",
+          "$ref": "#/definitions/InspectCloudMatch"
+        },
+        "state": {
+          "type": "string",
+          "description": "Tracking state in the current deployment: `called`, `never_called` or\n`untracked`."
+        },
+        "period_state": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Tracking state over the whole period, earlier deployments included.\n`called` with `state` `never_called` means that the function did not\nrun in this deployment, but ran in an earlier one. `None` when the\ncloud does not say."
+        },
+        "calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Calls in the period. `None` when not measured."
+        },
+        "errors": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InspectCloudErrors"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Error counts. `None` when error capture did not cover the function."
+        },
+        "cpu_ms_per_hour": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Self CPU milliseconds per profiled hour. `None` when not measured."
+        },
+        "never_run_ranges": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Branch ranges that never ran. `None` when not measured."
+        },
+        "summary": {
+          "type": "string",
+          "description": "One-line summary from the cloud."
+        }
+      },
+      "required": [
+        "name",
+        "line",
+        "match",
+        "state",
+        "summary"
+      ],
+      "description": "One local function with its production data."
+    },
+    "InspectCloudMatch": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "stable_id",
+          "description": "The stable id of the local function equals the deployed one."
+        },
+        {
+          "type": "string",
+          "const": "name_ordinal",
+          "description": "Same name and same ordinal among the same-name functions of the file."
+        }
+      ],
+      "description": "How a local function was paired with a deployed function."
+    },
+    "InspectCloudErrors": {
+      "type": "object",
+      "properties": {
+        "groups": {
+          "type": "integer",
+          "description": "Error groups attributed to the function."
+        },
+        "events": {
+          "type": "integer",
+          "description": "Error events attributed to the function."
+        }
+      },
+      "required": [
+        "groups",
+        "events"
+      ],
+      "description": "Error counts of one function."
+    },
+    "InspectCloudUnpairedFunction": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Function name in the local file."
+        },
+        "line": {
+          "type": "integer",
+          "description": "1-based start line in the local file."
+        },
+        "note": {
+          "type": "string",
+          "description": "Why the function has no production data."
+        }
+      },
+      "required": [
+        "name",
+        "line",
+        "note"
+      ],
+      "description": "One local function without a deployed function."
+    },
+    "RuntimeCoverageCapturePolicy": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "positive_only",
+          "description": "The capture records only functions that ran. A function without a call\nis unknown, never \"never called\", so the tracked and unhit totals and\nthe coverage percent are null."
+        }
+      ],
+      "description": "Capture policy of the runtime evidence behind a report."
     }
   }
 }
