@@ -7,10 +7,12 @@ use std::fmt;
 
 use fallow_types::cloud::{CloudCommand, cloud_api_key_missing_message};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use super::cloud_transport::{self, CloudAuth, CloudBody, CloudHttpFailure, CloudOutcome};
 use super::upload_common::url_encode_path_segment;
-use crate::api::{NETWORK_EXIT_CODE, api_url};
+use crate::api::api_url;
+use crate::exit_codes::{ErrorExitCode, INVALID_INPUT, NETWORK_FAILURE, RESOURCE_UNAVAILABLE};
 
 const RUNTIME_CONTEXT_FORMAT: &str = "fallow-cloud-runtime-v1";
 const RUNTIME_CONTEXT_OPERATION: &str = "runtime-context";
@@ -54,11 +56,11 @@ pub enum CloudError {
 }
 
 impl CloudError {
-    pub const fn exit_code(&self) -> u8 {
+    pub const fn exit_code(&self) -> ErrorExitCode {
         match self {
-            Self::Validation(_) => 2,
-            Self::Auth(_) | Self::TierRequired(_) | Self::NotFound(_) => 3,
-            Self::Network(_) | Self::Server(_) => NETWORK_EXIT_CODE,
+            Self::Validation(_) => INVALID_INPUT,
+            Self::Auth(_) | Self::TierRequired(_) | Self::NotFound(_) => RESOURCE_UNAVAILABLE,
+            Self::Network(_) | Self::Server(_) => NETWORK_FAILURE,
         }
     }
 
@@ -119,6 +121,11 @@ pub struct CloudRuntimeContext {
     pub importance: Vec<CloudRuntimeImportanceEntry>,
     #[serde(default)]
     pub warnings: Vec<CloudRuntimeWarning>,
+    /// Every top-level field that this struct does not name, for example
+    /// `capabilities` and `page`. `coverage analyze --cloud` emits them as the
+    /// report `cloud_context`, so a newer cloud field reaches the output.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// A managed runtime capture that supports positive execution evidence only.
@@ -243,6 +250,11 @@ pub struct CloudRuntimeFunction {
     /// current deployment.
     #[serde(default)]
     pub period_tracking_state: Option<CloudTrackingState>,
+    /// Every row field that this struct does not name, for example `errors`,
+    /// `performance`, `branches`, `covered_by_test` and `test_hit_count`. The
+    /// output copies them to the `cloud_context` of the finding or hot path.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -265,6 +277,11 @@ pub struct CloudRuntimeBlastRadiusEntry {
     #[serde(default)]
     pub deploys_touched: Option<u32>,
     pub risk_band: CloudRuntimeRiskBand,
+    /// Every row field that this struct does not name, for example
+    /// `production_callers` and `caller_sites`. The output copies them to the
+    /// `cloud_context` of the blast-radius entry.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -511,7 +528,10 @@ mod tests {
 
     #[test]
     fn cloud_error_exit_code_for_validation_is_two() {
-        assert_eq!(CloudError::Validation("any".to_owned()).exit_code(), 2);
+        assert_eq!(
+            CloudError::Validation("any".to_owned()).exit_code().get(),
+            2
+        );
     }
 
     #[test]
@@ -675,5 +695,38 @@ mod tests {
         );
         assert_eq!(context.importance[0].cyclomatic, None);
         assert_eq!(context.importance[0].owner_count, None);
+    }
+
+    #[test]
+    fn fields_without_a_struct_field_stay_in_extra() {
+        let body = r#"{
+          "data": {
+            "repo": "owner/repo",
+            "capabilities": ["function_errors"],
+            "page": { "next_cursor": "abc", "total": 3 },
+            "summary": { "functions_tracked": 1 },
+            "functions": [{
+              "file_path": "src/a.ts", "function_name": "a", "hit_count": 4,
+              "tracking_state": "called", "covered_by_test": null,
+              "errors": { "state": "tracked", "groups": 1, "events": 2, "top": [] }
+            }],
+            "blast_radius": [{
+              "id": "fallow:blast:1", "file": "src/a.ts", "function": "a", "line": 1,
+              "risk_band": "low", "production_callers": null
+            }]
+          }
+        }"#;
+        let context = serde_json::from_str::<CloudRuntimeContextResponse>(body)
+            .expect("parse")
+            .into_context();
+        assert_eq!(context.extra["page"]["total"], 3);
+        assert_eq!(context.extra["capabilities"][0], "function_errors");
+        assert!(!context.extra.contains_key("repo"), "named fields stay out");
+        let function = &context.functions[0];
+        assert_eq!(function.hit_count, Some(4));
+        assert_eq!(function.extra["errors"]["groups"], 1);
+        assert_eq!(function.extra["covered_by_test"], Value::Null);
+        assert!(!function.extra.contains_key("hit_count"));
+        assert!(context.blast_radius[0].extra["production_callers"].is_null());
     }
 }

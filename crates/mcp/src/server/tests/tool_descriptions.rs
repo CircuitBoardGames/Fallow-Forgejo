@@ -88,7 +88,7 @@ const MAX_TOOL_DESCRIPTION_BYTES: usize = 2_000;
 ///
 /// The target is 35_000, reached by moving one tool's per-flag prose into its
 /// `fallow://tools/{name}` guide at a time.
-const RECORDED_TOTAL_DESCRIPTION_BYTES: usize = 55_571;
+const RECORDED_TOTAL_DESCRIPTION_BYTES: usize = 56_582;
 
 /// Deliberate headroom over [`RECORDED_TOTAL_DESCRIPTION_BYTES`].
 ///
@@ -191,7 +191,7 @@ const SCHEMA_REPIN_BYTES: usize = 1_024;
 const DESCRIPTION_BUDGET_EXCEPTIONS: &[(&str, usize)] = &[
     ("code_execute", 4_650),
     ("fix_apply", 4_200),
-    ("check_health", 5_500),
+    ("check_health", 5_400),
     ("fix_preview", 2_750),
     ("analyze", 2_150),
     ("check_runtime_coverage", 2_350),
@@ -307,7 +307,7 @@ fn total_schema_bytes() -> usize {
 /// deltas by hand; one edited parameter doc comment renders into every tool
 /// that takes that parameter, so the arithmetic is wrong long before it looks
 /// wrong.
-const RECORDED_TOTAL_SCHEMA_BYTES: usize = 98_672;
+const RECORDED_TOTAL_SCHEMA_BYTES: usize = 101_515;
 
 /// Deliberate headroom over [`RECORDED_TOTAL_SCHEMA_BYTES`], for the same
 /// reason [`TOTAL_DESCRIPTION_SLACK_BYTES`] exists: pinned to the exact live

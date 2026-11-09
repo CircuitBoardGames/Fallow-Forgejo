@@ -5,29 +5,23 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-#[allow(clippy::wildcard_imports, reason = "many LSP types used")]
 use ls_types::*;
 
 use fallow_api::EditorAnalysisResults as AnalysisResults;
+use fallow_types::catalog_source::is_pnpm_catalog_source;
 use fallow_types::output_dead_code::MutationEvidence;
 
 use crate::diagnostics::FIRST_LINE_RANGE;
 use crate::position::PositionMapper;
 
-const PNPM_WORKSPACE_FILE: &str = "pnpm-workspace.yaml";
-
-/// Return true if `c` is a JS / TS identifier character.
+/// Return true if `c` can continue a JS / TS identifier.
 ///
-/// Covers the ASCII identifier set (`[A-Za-z0-9_$]`) plus the non-ASCII
-/// alphabetic / numeric code points that JS allows in identifier names
-/// (CJK ideographs, Cyrillic, Arabic, etc.). `char::is_alphanumeric` is a
-/// strong approximation of the spec's `XID_Start` / `XID_Continue` for
-/// the purposes of bounded identifier matching: comparing a candidate
-/// identifier to the cached export name remains byte-equality, so the
-/// match still distinguishes `日本` from `日本語`.
+/// This follows the ECMAScript `IdentifierPart` rule (`ID_Continue`, `$`,
+/// ZWNJ and ZWJ), the same rule that the parser uses. Thus a name that
+/// contains a combining mark, for example `cafe\u{301}`, stays one name
+/// and is not cut at the mark.
 fn is_ident_char(c: char) -> bool {
-    matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$')
-        || (!c.is_ascii() && c.is_alphanumeric())
+    oxc_syntax::identifier::is_identifier_part(c)
 }
 
 /// Extract the leading identifier from `s`. Returns the prefix of `s`
@@ -772,10 +766,6 @@ fn remove_empty_catalog_group_action(
     })
 }
 
-fn is_pnpm_catalog_source(path: &Path) -> bool {
-    path == Path::new(PNPM_WORKSPACE_FILE)
-}
-
 /// Anchored match for a catalog key on its declared line. Handles
 /// unquoted (`react:`), double-quoted (`"@scope/foo":`), and single-quoted
 /// (`'react':`) key forms; rejects substring matches in values or in
@@ -1034,6 +1024,10 @@ fn build_delete_file_actions_for_test(
 }
 
 #[cfg(test)]
+#[path = "quick_fix_identifier_tests.rs"]
+mod identifier_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -1042,7 +1036,7 @@ mod tests {
         UnusedExport, UnusedFile, UnusedFileFinding, UnusedTypeFinding,
     };
 
-    fn test_root() -> PathBuf {
+    pub(super) fn test_root() -> PathBuf {
         if cfg!(windows) {
             PathBuf::from("C:\\project")
         } else {
@@ -1050,7 +1044,7 @@ mod tests {
         }
     }
 
-    fn make_range(start_line: u32, end_line: u32) -> Range {
+    pub(super) fn make_range(start_line: u32, end_line: u32) -> Range {
         Range {
             start: Position {
                 line: start_line,
@@ -1063,7 +1057,7 @@ mod tests {
         }
     }
 
-    fn make_unused_export(
+    pub(super) fn make_unused_export(
         path: &Path,
         name: &str,
         line: u32,
@@ -1082,7 +1076,7 @@ mod tests {
         })
     }
 
-    fn unwrap_code_action(action: &CodeActionOrCommand) -> &CodeAction {
+    pub(super) fn unwrap_code_action(action: &CodeActionOrCommand) -> &CodeAction {
         match action {
             CodeActionOrCommand::CodeAction(ca) => ca,
             CodeActionOrCommand::Command(_) => panic!("expected CodeAction, got Command"),
@@ -1474,7 +1468,7 @@ mod tests {
 
     /// Apply a single-line `TextEdit` to `line` by splicing UTF-16 code
     /// units, mirroring how an LSP client interprets `character` offsets.
-    fn apply_single_line_edit(line: &str, edit: &TextEdit) -> String {
+    pub(super) fn apply_single_line_edit(line: &str, edit: &TextEdit) -> String {
         let units: Vec<u16> = line.encode_utf16().collect();
         let start = edit.range.start.character as usize;
         let end = edit.range.end.character as usize;

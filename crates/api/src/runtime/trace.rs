@@ -111,6 +111,7 @@ pub fn run_trace_file(
                 })?;
         output.sources = artifacts.trace_provenance.file_sources(&output.file);
         output.apply_plugin_credits(&artifacts.trace_provenance);
+        output.apply_entry_script(&artifacts.trace_provenance);
         Ok(TraceFileProgrammaticOutput { output })
     })
 }
@@ -351,7 +352,7 @@ pub fn run_trace_clone(
 /// Returns a structured error when a fixture target is missing or compact JSON
 /// serialization fails.
 #[doc(hidden)]
-#[allow(
+#[expect(
     clippy::implicit_hasher,
     reason = "the engine trace boundary intentionally accepts the workspace-standard FxHashSet"
 )]

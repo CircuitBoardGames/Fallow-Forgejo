@@ -188,6 +188,7 @@ fn standard_dry() -> DryRunResult {
         unhandled_errors: Vec::new(),
         unloaded_paths: vec!["src/c.ts".to_owned()],
         file_setup_ms: BTreeMap::new(),
+        duplicate_test_ids: Vec::new(),
     }
 }
 
@@ -222,6 +223,7 @@ fn run_result(run: &RunRequest, status: RunStatus, killed_by: Option<&str>) -> R
         tests_executed: tests.len(),
         tests,
         unhandled_errors: Vec::new(),
+        loop_timeout: false,
     })
 }
 
@@ -251,6 +253,7 @@ fn plan(ids: &[&str]) -> SchedulePlan {
             .collect(),
         unreached: Vec::new(),
         pending: Vec::new(),
+        sampled_out: Vec::new(),
         known_ids: ids
             .iter()
             .copied()
@@ -286,6 +289,7 @@ fn config(concurrency: usize) -> ScheduleConfig {
         },
         concurrency,
         kill_matrix: false,
+        targets: Vec::new(),
         runner_timeout: Duration::from_secs(5),
         deadline: None,
         cache: None,
@@ -373,7 +377,42 @@ fn covering_tests_run_fastest_first_with_the_stryker_timeout() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].1.test_ids, vec![tid("t1"), tid("t2")]);
     assert_eq!(runs[0].1.timeout_ms, 5153, "ceil(1.5 * 102) + 5000");
+    assert_eq!(runs[0].1.loop_budget_ms, Some(653), "ceil(1.5 * 102) + 500");
     assert!(runs[0].1.bail);
+}
+
+fn mutant_run_order(spawner: &FakeSpawner) -> Vec<String> {
+    spawner
+        .runs()
+        .iter()
+        .filter_map(|(_, run)| run.mutant_id.clone())
+        .collect()
+}
+
+#[test]
+fn a_time_budget_starts_the_job_with_the_cheapest_tests_first() {
+    let spawner = FakeSpawner::new(script(
+        |_| standard_dry(),
+        |_, run| Ok(run_result(run, RunStatus::Killed, Some(&run.test_ids[0]))),
+    ));
+    let mut config = config(1);
+    config.deadline = Some(Instant::now() + Duration::from_secs(3600));
+    run_schedule(&spawner, &plan(&["m2", "m1"]), &config).expect("run");
+    assert_eq!(
+        mutant_run_order(&spawner),
+        ["m1", "m2"],
+        "m1 runs t1 (2 ms), m2 runs t1 and t2 (102 ms)"
+    );
+}
+
+#[test]
+fn without_a_time_budget_the_jobs_keep_the_plan_order() {
+    let spawner = FakeSpawner::new(script(
+        |_| standard_dry(),
+        |_, run| Ok(run_result(run, RunStatus::Killed, Some(&run.test_ids[0]))),
+    ));
+    run_schedule(&spawner, &plan(&["m2", "m1"]), &config(1)).expect("run");
+    assert_eq!(mutant_run_order(&spawner), ["m2", "m1"]);
 }
 
 #[test]
@@ -474,6 +513,7 @@ fn fail_closed_a_survived_claim_without_full_evidence_is_a_runtime_error() {
                 tests_executed: 0,
                 tests: Vec::new(),
                 unhandled_errors: Vec::new(),
+                loop_timeout: false,
             })
         }),
         ("one of two tests", |run| {
@@ -490,6 +530,7 @@ fn fail_closed_a_survived_claim_without_full_evidence_is_a_runtime_error() {
                     message: None,
                 }],
                 unhandled_errors: Vec::new(),
+                loop_timeout: false,
             })
         }),
         ("a failed test", |run| {
@@ -514,6 +555,7 @@ fn fail_closed_a_survived_claim_without_full_evidence_is_a_runtime_error() {
                     },
                 ],
                 unhandled_errors: Vec::new(),
+                loop_timeout: false,
             })
         }),
         ("another mutant", |run| {
@@ -530,6 +572,7 @@ fn fail_closed_a_survived_claim_without_full_evidence_is_a_runtime_error() {
                 tests_executed: 0,
                 tests: Vec::new(),
                 unhandled_errors: Vec::new(),
+                loop_timeout: false,
             })
         }),
     ];
@@ -573,6 +616,7 @@ fn a_kill_by_an_unhandled_error_has_no_killer() {
                     message: "late rejection".to_owned(),
                     file: Some("test/a.test.ts".to_owned()),
                 }],
+                loop_timeout: false,
             }))
         },
     ));
@@ -700,6 +744,72 @@ fn a_watchdog_timeout_is_timeout_and_the_next_mutant_gets_a_new_companion() {
     );
 }
 
+/// A `timeout` result that the loop budget of the request decided.
+fn loop_timeout(run: &RunRequest) -> Response {
+    let Response::Run(result) = run_result(run, RunStatus::Timeout, None) else {
+        unreachable!("run_result gives a run response")
+    };
+    Response::Run(RunResult {
+        loop_timeout: true,
+        ..result
+    })
+}
+
+#[test]
+fn a_loop_timeout_of_short_covering_tests_gets_no_retry() {
+    let spawner = FakeSpawner::new(script(|_| standard_dry(), |_, run| Ok(loop_timeout(run))));
+    let outcome = run_schedule(&spawner, &plan(&["m2"]), &config(1)).expect("run");
+    assert_eq!(status(&outcome, "m2"), MutantStatus::Timeout);
+    assert!(!outcome.results["m2"].retried);
+    assert_eq!(
+        spawner.runs().len(),
+        1,
+        "the loop budget of 102 ms of tests counts thread CPU time, so host load cannot reach it"
+    );
+}
+
+#[test]
+fn a_survivor_with_a_loop_timeout_flag_still_gets_its_confirmation() {
+    let spawner = FakeSpawner::new(script(
+        |_| standard_dry(),
+        |_, run| {
+            let Response::Run(result) = run_result(run, RunStatus::Survived, None) else {
+                unreachable!("run_result gives a run response")
+            };
+            Ok(Response::Run(RunResult {
+                loop_timeout: true,
+                ..result
+            }))
+        },
+    ));
+    let outcome = run_schedule(&spawner, &plan(&["m2"]), &config(1)).expect("run");
+    assert_eq!(status(&outcome, "m2"), MutantStatus::Survived);
+    assert!(
+        outcome.results["m2"].retried,
+        "only a timeout status settles"
+    );
+}
+
+#[test]
+fn a_loop_timeout_of_slow_covering_tests_gets_the_doubled_retry() {
+    let spawner = FakeSpawner::new(script(
+        |_| DryRunResult {
+            tests: vec![
+                test("t1", 2.0, TestStatus::Pass),
+                test("t2", 400.0, TestStatus::Pass),
+            ],
+            ..standard_dry()
+        },
+        |_, run| Ok(loop_timeout(run)),
+    ));
+    let outcome = run_schedule(&spawner, &plan(&["m2"]), &config(1)).expect("run");
+    assert_eq!(status(&outcome, "m2"), MutantStatus::Timeout);
+    assert!(outcome.results["m2"].retried);
+    let runs = spawner.runs();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].1.loop_budget_ms, Some(2 * (603 + 500)));
+}
+
 #[test]
 fn a_timeout_reruns_in_a_new_companion_and_a_survived_retry_is_flaky() {
     let spawner = FakeSpawner::new(script(
@@ -722,6 +832,11 @@ fn a_timeout_reruns_in_a_new_companion_and_a_survived_retry_is_flaky() {
         runs[1].1.timeout_ms,
         2 * runs[0].1.timeout_ms,
         "host load that slowed the first run can last, so the retry waits twice as long"
+    );
+    assert_eq!(
+        runs[1].1.loop_budget_ms.map(|ms| ms / 2),
+        runs[0].1.loop_budget_ms,
+        "the loop budget of the retry is twice as long too"
     );
 }
 
@@ -862,6 +977,7 @@ fn a_kill_names_the_failure_kind_of_its_killing_test_or_an_error() {
         mutant_id: Some("m1".to_owned()),
         test_ids: vec![tid("t1")],
         timeout_ms: 1000,
+        loop_budget_ms: None,
         bail: true,
     };
     let Response::Run(mut result) = run_result(&request, RunStatus::Killed, Some(&tid("t1")))
@@ -1016,6 +1132,7 @@ fn baseline_failures_never_decide_a_mutant() {
             }],
             unloaded_paths: Vec::new(),
             file_setup_ms: BTreeMap::new(),
+            duplicate_test_ids: Vec::new(),
         },
         |_, run| Ok(run_result(run, RunStatus::Killed, Some(&run.test_ids[0]))),
     ));
@@ -1597,6 +1714,7 @@ fn a_covering_test_that_fails_in_a_respawned_dry_run_is_a_baseline_failure() {
         unhandled_errors: Vec::new(),
         unloaded_paths: Vec::new(),
         file_setup_ms: BTreeMap::new(),
+        duplicate_test_ids: Vec::new(),
     };
     let spawner = FakeSpawner::new(script(dry, |_, run| {
         match run.mutant_id.as_deref().unwrap_or_default() {
@@ -1683,6 +1801,7 @@ fn a_respawned_dry_run_failure_keeps_the_error_of_the_test() {
         unhandled_errors: Vec::new(),
         unloaded_paths: Vec::new(),
         file_setup_ms: BTreeMap::new(),
+        duplicate_test_ids: Vec::new(),
     };
     let spawner = FakeSpawner::new(script(dry, |_, run| {
         match run.mutant_id.as_deref().unwrap_or_default() {
@@ -1739,6 +1858,7 @@ fn a_first_dry_run_failure_keeps_the_error_of_the_test() {
             unhandled_errors: Vec::new(),
             unloaded_paths: Vec::new(),
             file_setup_ms: BTreeMap::new(),
+            duplicate_test_ids: Vec::new(),
         },
         |_, run| Ok(run_result(run, RunStatus::Killed, Some(&run.test_ids[0]))),
     ));
@@ -1786,6 +1906,7 @@ fn a_survivor_without_a_dropped_covering_test_is_not_a_runtime_error() {
         unhandled_errors: Vec::new(),
         unloaded_paths: Vec::new(),
         file_setup_ms: BTreeMap::new(),
+        duplicate_test_ids: Vec::new(),
     };
     let spawner = FakeSpawner::new(script(dry, |_, run| {
         match run.mutant_id.as_deref().unwrap_or_default() {
@@ -1853,6 +1974,7 @@ fn a_dropped_test_cannot_be_the_killer() {
         unhandled_errors: Vec::new(),
         unloaded_paths: Vec::new(),
         file_setup_ms: BTreeMap::new(),
+        duplicate_test_ids: Vec::new(),
     };
     let spawner = FakeSpawner::new(script(dry, |_, run| {
         match run.mutant_id.as_deref().unwrap_or_default() {
@@ -2053,6 +2175,7 @@ fn load_failure(run: &RunRequest) -> Response {
             message: "createSpecification failed\n    at stack".to_owned(),
             file: None,
         }],
+        loop_timeout: false,
     })
 }
 
@@ -2148,6 +2271,7 @@ fn t2_fails_in_control(run: &RunRequest) -> Response {
         tests_executed: tests.len(),
         tests,
         unhandled_errors: Vec::new(),
+        loop_timeout: false,
     })
 }
 
@@ -2479,6 +2603,7 @@ fn a_timeout_of_the_self_check_is_reported_as_a_timeout_not_as_a_broken_run_path
                 tests_executed: 0,
                 tests: Vec::new(),
                 unhandled_errors: Vec::new(),
+                loop_timeout: false,
             }))
         }),
         ("a watchdog timeout", |_| Err(LinkFault::Timeout)),
@@ -2516,6 +2641,10 @@ fn a_control_run_waits_at_least_the_setup_timeout() {
     assert_eq!(
         controls[0].1.timeout_ms, 60_000,
         "the setup timeout, not the 5003 ms of the mutant job"
+    );
+    assert_eq!(
+        controls[0].1.loop_budget_ms, None,
+        "a control run has no active mutant, so it has no loop budget"
     );
 }
 
@@ -2560,6 +2689,7 @@ fn only_t1_passes_in_control(run: &RunRequest) -> Response {
         tests_executed: tests.len(),
         tests,
         unhandled_errors: Vec::new(),
+        loop_timeout: false,
     })
 }
 
@@ -2615,7 +2745,9 @@ fn load_kill_job() -> Job {
     Job {
         id: "m2".to_owned(),
         tests: vec![tid("t1"), tid("t2")],
+        targets: Vec::new(),
         timeout_ms: 6000,
+        loop_budget_ms: 1000,
         setup_ms: 0,
         static_mutant: false,
         test_files: vec!["test/a.test.ts".to_owned()],
@@ -2912,6 +3044,11 @@ fn a_survivor_retry_runs_each_test_of_its_files_and_a_kill_by_a_new_test_is_kill
         "the first run stays narrow"
     );
     assert_eq!(runs[1].1.test_ids, vec![tid("t1"), tid("t2")]);
+    assert_eq!(
+        runs[1].1.loop_budget_ms,
+        Some(runs[1].1.timeout_ms - 5000 + 500),
+        "the loop budget of the retry follows the timeout of the retry tests"
+    );
     let controls = spawner.controls();
     assert_eq!(
         controls.last().map(|(_, run)| run.test_ids.clone()),
@@ -3208,3 +3345,6 @@ fn a_resumed_result_skips_the_run_and_a_changed_key_runs_again() {
 
 #[path = "matrix_tests.rs"]
 mod matrix_tests;
+
+#[path = "target_tests.rs"]
+mod target_tests;

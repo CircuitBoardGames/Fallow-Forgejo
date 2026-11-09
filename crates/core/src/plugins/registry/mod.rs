@@ -269,7 +269,7 @@ impl PluginRegexValidationError {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PluginRegexValidationErrorInput<'a> {
+struct PluginRegexValidationErrorInput<'a> {
     plugin_name: &'a str,
     config_path: Option<&'a Path>,
     rule_kind: &'static str,
@@ -402,6 +402,8 @@ pub struct AggregatedPluginResult {
     pub referenced_dependencies: Vec<String>,
     /// Dependencies referenced by package.json metadata, scoped to that package.json path.
     pub package_referenced_dependencies: Vec<(PathBuf, String)>,
+    /// Packages that a config needs installed, with the config location.
+    pub required_dependencies: Vec<super::RequiredDependency>,
     /// Additional always-used files discovered from config parsing: (pattern, plugin_name).
     pub discovered_always_used: Vec<(String, String)>,
     /// Setup files discovered from config parsing: (path, plugin_name).
@@ -440,6 +442,11 @@ pub struct AggregatedPluginResult {
     /// Path alias mappings from active plugins (prefix → replacement directory).
     /// Used by the resolver to substitute import prefixes before re-resolving.
     pub path_aliases: Vec<(String, String)>,
+    /// Path alias mappings from the plugins of a workspace package. Each alias
+    /// applies only to the files inside that workspace, so two packages can
+    /// map the same prefix (SvelteKit `$lib`, Nuxt `~/`) to their own
+    /// directories.
+    pub scoped_path_aliases: Vec<fallow_graph::resolve::ScopedPathAlias>,
     /// Convention-based auto-import rules from active plugins (Nuxt components).
     /// The resolver matches each file's captured `auto_import_candidates` against
     /// these and synthesizes a graph edge to the rule's source. See issue #704.
@@ -569,8 +576,15 @@ impl AggregatedPluginResult {
         for source in &mut self.federation_sources {
             *source = source.prefixed(ws_prefix);
         }
-        for (_, replacement) in &mut self.path_aliases {
-            *replacement = format!("{ws_prefix}/{replacement}");
+        if !ws_prefix.is_empty() {
+            self.scoped_path_aliases
+                .extend(self.path_aliases.drain(..).map(|(prefix, replacement)| {
+                    fallow_graph::resolve::ScopedPathAlias {
+                        scope: ws_prefix.to_string(),
+                        prefix,
+                        replacement: format!("{ws_prefix}/{replacement}"),
+                    }
+                }));
         }
     }
 
@@ -602,6 +616,7 @@ impl AggregatedPluginResult {
             framework_class_member_contracts,
             referenced_dependencies,
             package_referenced_dependencies,
+            required_dependencies,
             discovered_always_used,
             setup_files,
             tooling_dependencies,
@@ -614,6 +629,7 @@ impl AggregatedPluginResult {
             generated_import_patterns,
             generated_type_import_prefixes,
             path_aliases,
+            scoped_path_aliases,
             auto_imports,
             active_plugins,
             fixture_patterns,
@@ -645,6 +661,7 @@ impl AggregatedPluginResult {
         self.referenced_dependencies.extend(referenced_dependencies);
         self.package_referenced_dependencies
             .extend(package_referenced_dependencies);
+        push_missing(&mut self.required_dependencies, required_dependencies);
         self.discovered_always_used.extend(discovered_always_used);
         self.setup_files.extend(setup_files);
         self.tooling_dependencies.extend(tooling_dependencies);
@@ -662,6 +679,7 @@ impl AggregatedPluginResult {
             generated_type_import_prefixes,
         );
         self.path_aliases.extend(path_aliases);
+        self.scoped_path_aliases.extend(scoped_path_aliases);
         self.auto_imports.extend(auto_imports);
         extend_unique(&mut self.active_plugins, active_plugins);
         self.fixture_patterns.extend(fixture_patterns);
@@ -686,6 +704,14 @@ impl PluginRegistry {
             plugins: builtin::create_builtin_plugins(),
             external_plugins: external,
         }
+    }
+
+    /// The preload files of the `bunfig.toml` at `root`, as absolute paths.
+    /// Bun runs them before the tests of each `bun test` run, also when no
+    /// package enables the Bun plugin.
+    #[must_use]
+    pub fn bun_preload_files(root: &Path) -> Vec<PathBuf> {
+        super::bun::preload_files(root)
     }
 
     /// Hidden directory names that should be traversed before full plugin execution.
@@ -1403,7 +1429,7 @@ fn should_warn(key: String) -> bool {
 /// subscriber. The runtime path calls [`emit_plugin_diagnostics`] to convert
 /// each variant into one `tracing::warn!` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PluginDiagnostic {
+enum PluginDiagnostic {
     /// Two or more plugins declared an identical `config_patterns` entry.
     PatternCollision {
         pattern: String,

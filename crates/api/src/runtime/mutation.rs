@@ -32,7 +32,8 @@ use crate::mutation::node_args::node_test_args;
 use crate::mutation::protocol::{InitOptions, InitRequest};
 use crate::mutation::report::{
     CompletionFacts, baseline_failures, completion, function_results, issues, mutant_results,
-    plan_counts, plan_files, plan_mutants, skipped_files, summary, tool_version,
+    plan_counts, plan_files, plan_mutants, skipped_files, skipped_tests_issue, summary,
+    tool_version,
 };
 use crate::mutation::result_cache::{KeyFiles, NOT_KEYED, ResultCache};
 use crate::mutation::run_dir::{RunFile, write_run_dir};
@@ -80,6 +81,29 @@ fn validate(options: &MutationRunOptions) -> ProgrammaticResult<()> {
         )
         .with_context("mutation.maxMutants"));
     }
+    if options.mutants_per_line == Some(0) {
+        return Err(mutation_error(
+            "FALLOW_INVALID_MUTATION_OPTIONS",
+            "the mutants per line limit must be at least 1",
+        )
+        .with_context("mutation.mutantsPerLine"));
+    }
+    if options.kill_matrix && !options.kill_matrix_targets.is_empty() {
+        return Err(mutation_error(
+            "FALLOW_INVALID_MUTATION_OPTIONS",
+            "the full kill matrix and the kill matrix for targets are exclusive; pass only one of them",
+        ));
+    }
+    if options
+        .kill_matrix_targets
+        .iter()
+        .any(|target| target.trim().is_empty())
+    {
+        return Err(mutation_error(
+            "FALLOW_INVALID_MUTATION_OPTIONS",
+            "a kill matrix target must name a test file or a test id",
+        ));
+    }
     if options.time_budget.is_some_and(|budget| budget.is_zero())
         || options
             .runner_timeout
@@ -91,6 +115,99 @@ fn validate(options: &MutationRunOptions) -> ProgrammaticResult<()> {
         ));
     }
     Ok(())
+}
+
+/// The separator between the file and the name in a runner test id.
+const TEST_ID_SEPARATOR: &str = "::";
+
+/// A `--kill-matrix-for` target in the form of the runner test ids: the file
+/// part is root-relative, with forward slashes and no leading `./`. The name
+/// after the first `::` stays as given.
+fn normalize_target(root: &Path, target: &str) -> String {
+    let (file, name) = target
+        .split_once(TEST_ID_SEPARATOR)
+        .map_or((target, None), |(file, name)| (file, Some(name)));
+    let file = file.trim();
+    let path = Path::new(file);
+    let relative = if path.is_absolute() {
+        let canonical_root = root.canonicalize().ok();
+        path.strip_prefix(root)
+            .ok()
+            .or_else(|| {
+                canonical_root
+                    .as_deref()
+                    .and_then(|root| path.strip_prefix(root).ok())
+            })
+            .map_or_else(|| file.to_owned(), |rel| rel.to_string_lossy().into_owned())
+    } else {
+        file.to_owned()
+    };
+    let relative = relative.replace('\\', "/");
+    let mut trimmed = relative.as_str();
+    while let Some(rest) = trimmed.strip_prefix("./") {
+        trimmed = rest;
+    }
+    let relative = trimmed.to_owned();
+    match name {
+        Some(name) => format!("{relative}{TEST_ID_SEPARATOR}{name}"),
+        None => relative,
+    }
+}
+
+/// `options` with each `--kill-matrix-for` target normalized and without
+/// duplicates. `None` outside target mode. A target whose file part is empty
+/// after normalization, for example `./`, is an error.
+fn with_normalized_targets(
+    options: &MutationRunOptions,
+    root: &Path,
+) -> ProgrammaticResult<Option<MutationRunOptions>> {
+    if options.kill_matrix_targets.is_empty() {
+        return Ok(None);
+    }
+    let mut targets: Vec<String> = Vec::new();
+    for raw in &options.kill_matrix_targets {
+        let target = normalize_target(root, raw);
+        if target.is_empty() || target.starts_with(TEST_ID_SEPARATOR) {
+            return Err(mutation_error(
+                "FALLOW_INVALID_MUTATION_OPTIONS",
+                format!("the kill matrix target `{raw}` names no test file"),
+            ));
+        }
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    Ok(Some(MutationRunOptions {
+        kill_matrix_targets: targets,
+        ..options.clone()
+    }))
+}
+
+/// The targets in sorted order, so that the order of the flags does not make
+/// a resume mismatch.
+fn sorted_targets(targets: &[String]) -> Vec<String> {
+    let mut sorted = targets.to_vec();
+    sorted.sort();
+    sorted
+}
+
+/// The kill matrix mode of the report.
+fn kill_matrix_mode<'a>(
+    options: &'a MutationRunOptions,
+    outcome: Option<&'a ScheduleOutcome>,
+) -> crate::mutation::kill_matrix::Mode<'a> {
+    use crate::mutation::kill_matrix::Mode;
+    if !options.kill_matrix_targets.is_empty() {
+        return Mode::Targets {
+            requested: &options.kill_matrix_targets,
+            resolved: outcome.map_or(&[], |outcome| outcome.targets.as_slice()),
+        };
+    }
+    if options.kill_matrix {
+        Mode::Full
+    } else {
+        Mode::Disabled
+    }
 }
 
 fn load_session(resolved: &ProgrammaticAnalysisContext) -> ProgrammaticResult<AnalysisSession> {
@@ -295,12 +412,28 @@ fn plan_for(
         None => config_operators(&session)?,
     };
     let operator_names = operators.as_deref().map(operator_names);
+    let mutation_config = &session.config().mutation;
+    // A run of selected mutant ids (a recheck) must run each of them, so it
+    // never samples.
+    let mutants_per_line = options
+        .mutant_ids
+        .is_empty()
+        .then(|| {
+            options
+                .mutants_per_line
+                .or(mutation_config.mutants_per_line)
+        })
+        .flatten();
     let request = MutationPlanRequest {
         scope,
         operators,
         allow_side_effects: options.allow_side_effects,
         max_mutants: options.max_mutants,
+        mutants_per_line,
+        function_scope: options.function_scope || mutation_config.function_scope == Some(true),
         skip_component_files: false,
+        mutant_ids: (!options.mutant_ids.is_empty())
+            .then(|| options.mutant_ids.iter().cloned().collect()),
     };
     // The runner decision reads the test files of the first plan. A second
     // plan without the component files keeps that decision.
@@ -504,6 +637,97 @@ fn guard_worktree(allow_dirty: bool, start: Option<&WorktreeSnapshot>) -> Progra
     .with_help("commit or stash the changes, or pass --allow-dirty"))
 }
 
+/// The guards that need the plan: the test-only worktree of a recheck, the
+/// requested mutant ids, the cache directory and the type-check companion.
+fn guard_planned(
+    options: &MutationRunOptions,
+    planned: &Planned,
+    start: Option<&WorktreeSnapshot>,
+) -> ProgrammaticResult<()> {
+    if options.test_changes_only && !options.allow_dirty {
+        guard_test_changes_only(planned, start)?;
+    }
+    guard_mutant_ids(options, &planned.plan)?;
+    guard_cache_holds_no_planned_file(planned.resolved.root(), &planned.cache_dir, &planned.plan)?;
+    guard_typecheck_companion(options.typecheck, planned.resolved.root())
+}
+
+/// Refuses a dirty path that is not a test file, so a run with
+/// [`MutationRunOptions::test_changes_only`] proves a change of the tests
+/// only. A test file is a path that the test path rules match, or a test
+/// file of the plan.
+fn guard_test_changes_only(
+    planned: &Planned,
+    start: Option<&WorktreeSnapshot>,
+) -> ProgrammaticResult<()> {
+    let Some(start) = start else {
+        return Ok(());
+    };
+    let root = planned.resolved.root();
+    let test_files: FxHashSet<&str> = planned.plan.test_files.iter().map(String::as_str).collect();
+    let changed: Vec<String> = start
+        .dirty_paths()
+        .into_iter()
+        .filter(|path| {
+            !test_files.contains(path.as_str())
+                && !fallow_engine::test_paths::is_test_path_str(root, path)
+        })
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = changed.iter().take(10).map(String::as_str).collect();
+    Err(mutation_error(
+        "FALLOW_MUTATION_NON_TEST_CHANGE",
+        format!(
+            "the git worktree changes {} {} that {} not a test file: {}",
+            changed.len(),
+            path_noun(changed.len()),
+            if changed.len() == 1 { "is" } else { "are" },
+            shown.join(", ")
+        ),
+    )
+    .with_help(
+        "a recheck proves a change of the tests only; commit or stash the other changes, then run `fallow mutation` again for new results",
+    ))
+}
+
+/// Refuses a requested mutant id that the plan does not have. The id of a
+/// mutant changes when its source changes.
+fn guard_mutant_ids(options: &MutationRunOptions, plan: &MutationPlan) -> ProgrammaticResult<()> {
+    if options.mutant_ids.is_empty() {
+        return Ok(());
+    }
+    let planned: FxHashSet<&str> = plan
+        .mutants
+        .iter()
+        .map(|mutant| mutant.mutant.id.as_str())
+        .collect();
+    let mut missing: Vec<&str> = options
+        .mutant_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !planned.contains(id))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    Err(mutation_error(
+        "FALLOW_MUTATION_UNKNOWN_MUTANT",
+        format!(
+            "the plan has no mutant with the {} {}",
+            if missing.len() == 1 { "id" } else { "ids" },
+            missing.join(", ")
+        ),
+    )
+    .with_context("mutation.mutantId")
+    .with_help(
+        "a mutant id changes when its source changes; run `fallow mutation` again for new ids",
+    ))
+}
+
 /// The help of a runner version outside `range`. It names the supported
 /// range as an install step. When the minimum is not a `.0.0` release, it
 /// also says that a minor update inside the major version is enough.
@@ -541,6 +765,12 @@ fn schedule_error(
         ScheduleError::RunPath { .. } => ("FALLOW_MUTATION_RUNNER_FAILED", None),
         ScheduleError::UnknownHit(_) => ("FALLOW_MUTATION_PLAN_MISMATCH", None),
         ScheduleError::Baseline(_) => ("FALLOW_MUTATION_BASELINE_FAILED", None),
+        ScheduleError::UnmatchedTargets(_) | ScheduleError::TargetsNeedTestFilter => {
+            ("FALLOW_MUTATION_TARGET_UNMATCHED", None)
+        }
+        ScheduleError::DuplicateTargetTestIds(_) => {
+            ("FALLOW_MUTATION_TARGET_DUPLICATE_TEST_ID", None)
+        }
     };
     let mut help = Vec::new();
     if matches!(error, ScheduleError::RunnerVersion(_)) {
@@ -601,6 +831,7 @@ fn schedule_plan(plan: &MutationPlan) -> SchedulePlan {
         mutants: scheduled(plan, MutantDisposition::Planned),
         unreached: scheduled(plan, MutantDisposition::NoCoverage),
         pending: scheduled(plan, MutantDisposition::Pending),
+        sampled_out: scheduled(plan, MutantDisposition::SampledOut),
         known_ids: plan
             .mutants
             .iter()
@@ -749,6 +980,7 @@ fn open_stores(
         operators: planned.operators.clone(),
         allow_side_effects: options.allow_side_effects,
         kill_matrix: options.kill_matrix,
+        kill_matrix_targets: sorted_targets(&options.kill_matrix_targets),
     };
     let run_journal = start_journal(options, planned, mutation_cache, &header, keys)?;
     Ok((result_cache, run_journal))
@@ -973,6 +1205,7 @@ fn execute(
         },
         runner: range.clone(),
         kill_matrix: options.kill_matrix,
+        targets: options.kill_matrix_targets.clone(),
         concurrency: options.concurrency.unwrap_or_else(default_concurrency),
         runner_timeout: options.runner_timeout.unwrap_or(DEFAULT_RUNNER_TIMEOUT),
         deadline,
@@ -1008,11 +1241,13 @@ fn execute(
 
 /// The errors of a finished run: the scheduler issues and the worktree facts.
 fn run_issues(
+    plan: &MutationPlan,
     outcome: Option<&ScheduleOutcome>,
     changed_paths: &[String],
     check_error: Option<String>,
 ) -> Vec<fallow_output::MutationRunIssue> {
     let mut errors = issues(outcome);
+    errors.extend(skipped_tests_issue(plan));
     if !changed_paths.is_empty() {
         errors.push(fallow_output::MutationRunIssue {
             code: "worktree-changed".to_owned(),
@@ -1093,6 +1328,21 @@ pub fn run_mutation(options: &MutationRunOptions) -> ProgrammaticResult<Mutation
     run_mutation_with_progress(options, &|_| {})
 }
 
+/// The worktree check of the report: the dirty paths at the start and the
+/// paths that the run changed.
+fn worktree_check(
+    start: Option<&WorktreeSnapshot>,
+    allow_dirty: bool,
+    changed_paths: Vec<String>,
+) -> MutationWorktreeCheck {
+    MutationWorktreeCheck {
+        checked: start.is_some(),
+        allow_dirty,
+        dirty_at_start: start.map(WorktreeSnapshot::dirty_paths).unwrap_or_default(),
+        changed_paths,
+    }
+}
+
 /// [`run_mutation`] that sends a [`MutationProgress`] event at the start of
 /// each run phase and after each finished mutant.
 ///
@@ -1112,10 +1362,14 @@ pub fn run_mutation_with_progress(
     let planned = plan_for(options, |root, cache_dir| {
         guard_cache_dir(root, cache_dir)?;
         start_snapshot = take_worktree_snapshot(root, cache_dir, &options.output_paths, None)?;
+        if options.test_changes_only && !options.allow_dirty && start_snapshot.is_some() {
+            return Ok(());
+        }
         guard_worktree(options.allow_dirty, start_snapshot.as_ref())
     })?;
-    guard_cache_holds_no_planned_file(planned.resolved.root(), &planned.cache_dir, &planned.plan)?;
-    guard_typecheck_companion(options.typecheck, planned.resolved.root())?;
+    guard_planned(options, &planned, start_snapshot.as_ref())?;
+    let normalized = with_normalized_targets(options, planned.resolved.root())?;
+    let options = normalized.as_ref().unwrap_or(options);
     let plan_ms = millis(started.elapsed());
     let execution = execute(options, &planned, deadline, progress);
     progress(MutationProgress::Finalize);
@@ -1156,7 +1410,7 @@ pub fn run_mutation_with_progress(
         typecheck_failed: typecheck.issue.is_some(),
         promoted: outcome.map_or(&[], |outcome| outcome.promoted.as_slice()),
     });
-    let mut errors = run_issues(outcome, &changed_paths, check_error);
+    let mut errors = run_issues(plan, outcome, &changed_paths, check_error);
     errors.extend(typecheck.issue);
     let timings = run_timings(outcome, execution.setup_ms, plan_ms, typecheck_ms);
     Ok(MutationReport {
@@ -1164,7 +1418,7 @@ pub fn run_mutation_with_progress(
         version: tool_version(),
         elapsed_ms: ElapsedMs(millis(started.elapsed())),
         kill_matrix: crate::mutation::kill_matrix::build(
-            options.kill_matrix,
+            &kill_matrix_mode(options, outcome),
             &results,
             &baseline,
             &completion,
@@ -1186,20 +1440,14 @@ pub fn run_mutation_with_progress(
         unloaded_paths: outcome
             .map(|outcome| outcome.unloaded_paths.clone())
             .unwrap_or_default(),
-        worktree: MutationWorktreeCheck {
-            checked: start_snapshot.is_some(),
-            allow_dirty: options.allow_dirty,
-            dirty_at_start: start_snapshot
-                .as_ref()
-                .map(WorktreeSnapshot::dirty_paths)
-                .unwrap_or_default(),
-            changed_paths,
-        },
+        worktree: worktree_check(start_snapshot.as_ref(), options.allow_dirty, changed_paths),
         errors,
         timings,
         files: plan_files(plan),
         verdicts: None,
         typecheck: typecheck.output,
+        recheck: None,
+        compare: None,
     })
 }
 
@@ -1290,6 +1538,26 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_target_test_id_exits_2_and_names_the_id() {
+        let error = schedule_error(
+            &ScheduleError::DuplicateTargetTestIds(vec!["test/a.test.ts::adds".to_owned()]),
+            vitest_range(),
+            Duration::from_secs(120),
+        );
+        assert_eq!(
+            error.code.as_deref(),
+            Some("FALLOW_MUTATION_TARGET_DUPLICATE_TEST_ID")
+        );
+        assert_eq!(error.exit_code, 2);
+        assert!(
+            error.message.contains("test/a.test.ts::adds"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("not reliable"), "{}", error.message);
+    }
+
+    #[test]
     fn a_failed_self_check_is_a_runner_failure_with_its_own_help() {
         let error = schedule_error(
             &ScheduleError::RunPath {
@@ -1371,6 +1639,7 @@ mod tests {
             framework_config_checked: false,
             skipped_files: Vec::new(),
             unmatched_paths: Vec::new(),
+            skipped_tests: Vec::new(),
         };
         assert!(
             open_result_cache(
@@ -1407,6 +1676,7 @@ mod tests {
             framework_config_checked: false,
             skipped_files: Vec::new(),
             unmatched_paths: Vec::new(),
+            skipped_tests: Vec::new(),
         }
     }
 
@@ -1456,6 +1726,66 @@ mod tests {
             error.message
         );
         assert!(guard_cache_holds_no_planned_file(root, &root.join(".fallow"), &plan).is_ok());
+    }
+
+    #[test]
+    fn kill_matrix_targets_take_the_form_of_runner_test_ids() {
+        let root = Path::new("/project");
+        assert_eq!(normalize_target(root, "./test/a.test.ts"), "test/a.test.ts");
+        assert_eq!(
+            normalize_target(root, "test\\a.test.ts::adds > two"),
+            "test/a.test.ts::adds > two"
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                normalize_target(root, "/project/test/a.test.ts::a::b"),
+                "test/a.test.ts::a::b"
+            );
+            assert_eq!(
+                normalize_target(root, "/other/a.test.ts"),
+                "/other/a.test.ts"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_that_normalizes_to_no_file_is_refused_and_order_does_not_matter() {
+        let root = Path::new("/project");
+        for raw in ["./", "././", "::name"] {
+            let options = MutationRunOptions {
+                kill_matrix_targets: vec![raw.to_owned()],
+                ..MutationRunOptions::default()
+            };
+            let error = with_normalized_targets(&options, root).expect_err(raw);
+            assert!(error.message.contains("names no test file"), "{raw}");
+        }
+        let options = MutationRunOptions {
+            kill_matrix_targets: vec!["./b.test.ts".to_owned(), "b.test.ts".to_owned()],
+            ..MutationRunOptions::default()
+        };
+        let normalized = with_normalized_targets(&options, root)
+            .expect("valid")
+            .expect("target mode");
+        assert_eq!(normalized.kill_matrix_targets, ["b.test.ts"]);
+        assert_eq!(
+            sorted_targets(&["b".to_owned(), "a".to_owned()]),
+            sorted_targets(&["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn the_full_and_the_target_kill_matrix_are_exclusive() {
+        let both = MutationRunOptions {
+            kill_matrix: true,
+            kill_matrix_targets: vec!["test/a.test.ts".to_owned()],
+            ..MutationRunOptions::default()
+        };
+        assert!(validate(&both).is_err());
+        let blank = MutationRunOptions {
+            kill_matrix_targets: vec![" ".to_owned()],
+            ..MutationRunOptions::default()
+        };
+        assert!(validate(&blank).is_err());
     }
 
     #[test]

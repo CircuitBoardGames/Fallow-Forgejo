@@ -24,7 +24,7 @@
 
 
 /**
- * Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field. A `--lean` document is not a root branch: it validates against `LeanOutput`.
+ * Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`, `mutation-tasks`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field. A `--lean` document is not a root branch: it validates against `LeanOutput`.
  */
 export type FallowJsonOutput = (FallowOutput | CodeClimateOutput | ErrorOutput)
 /**
@@ -122,6 +122,8 @@ kind: "mutation"
 kind: "mutation-plan"
 }) | (MutationInspectOutput & {
 kind: "mutation-inspect"
+}) | (MutationTasksOutput & {
+kind: "mutation-tasks"
 }))
 /**
  * Schema projection for the audit envelope's exact version.
@@ -157,15 +159,14 @@ export type AuditWorsened = ("warn" | "error" | "off")
 /**
  * What a gate concluded on this run.
  *
- * Four-valued rather than a boolean because audit's verdict has a warn tier
- * (`crates/cli/src/cli_report.rs` maps it onto three conclusions) and because
- * a gate can stand down without passing. Widening a published boolean later
- * would retype a required field and bump every carrying envelope, so the width
- * is decided here.
+ * The status has four values, not two. A verdict can have a warn tier that
+ * does not fail the run, and a gate can stand down without a pass. A change
+ * from a boolean to a wider type later would change the type of a required
+ * member and the version of each envelope that carries it.
  */
 export type GateStatus = ("pass" | "warn" | "fail" | "skipped")
 /**
- * Why a file counts for the `parse-error` gate, other than a parser error.
+ * Why a file counts for a parse gate, other than a parser error.
  */
 export type GateFileReason = "nesting-too-deep"
 /**
@@ -862,6 +863,17 @@ files: string[]
  * Why the rule has no effect, as a kebab-case token.
  */
 reason: string
+} | {
+kind: "requested-rule-off"
+/**
+ * The canonical rule name in `rules`.
+ */
+rule: string
+/**
+ * The canonical CLI selector of the request, such as `--unused-deps`.
+ * A typed API or MCP request reports the same selector.
+ */
+flag: string
 } | {
 kind: "baseline-install-state-mismatch"
 baseline_node_modules: NodeModulesState
@@ -1799,11 +1811,15 @@ export type MutationSchemaVersion = "2"
 /**
  * Why a run is partial.
  */
-export type MutationIncompleteReason = ("runtime-error" | "mutant-limit" | "time-budget" | "skipped-files" | "unloaded-files" | "test-files-not-discovered" | "baseline-failure" | "worktree-changed" | "typecheck-failed" | "worktree-unchecked")
+export type MutationIncompleteReason = ("runtime-error" | "mutant-limit" | "sampled-out" | "time-budget" | "skipped-files" | "unloaded-files" | "test-files-not-discovered" | "baseline-failure" | "worktree-changed" | "typecheck-failed" | "worktree-unchecked")
 /**
  * The quality of observed test-to-mutant evidence.
  */
 export type MutationKillMatrixStatus = ("complete" | "incomplete" | "unavailable")
+/**
+ * The quality of the evidence of one `--kill-matrix-for` target.
+ */
+export type MutationKillMatrixTargetStatus = ("complete" | "incomplete")
 /**
  * Which code a run mutates.
  */
@@ -1817,9 +1833,21 @@ export type MutantStatus = ("killed" | "timeout" | "survived" | "no_coverage" | 
  */
 export type MutantFailureKind = ("assertion" | "error" | "timeout")
 /**
+ * Why a survivor may be equivalent, as far as the type check can tell.
+ */
+export type MutantEquivalenceHint = "type-non-nullish"
+/**
  * Why the type check did not check a survivor.
  */
 export type MutationTypecheckSkipReason = ("no-project" | "not-type-checked" | "source-changed" | "file-missing" | "unsupported-file")
+/**
+ * What a recheck shows for one mutant of the earlier report.
+ */
+export type MutationRecheckOutcome = ("killed" | "survived" | "no_coverage" | "tests_fail_on_original" | "unsettled")
+/**
+ * How one mutant of a compare differs from the saved report.
+ */
+export type MutationCompareChange = ("regressed" | "inconclusive" | "added" | "removed")
 /**
  * Version singleton for a mutation plan.
  */
@@ -1840,6 +1868,10 @@ export type MutationInspectStatus = ("fresh" | "stale")
  * Why an inspect packet is stale.
  */
 export type MutationStaleReason = ("file-missing" | "no-digest" | "source-changed" | "mutant-not-reproduced")
+/**
+ * Version singleton for the open tasks of a mutation report.
+ */
+export type MutationTasksSchemaVersion = "1"
 /**
  * Discriminator value for [`CodeClimateIssue::kind`].
  */
@@ -2017,27 +2049,16 @@ duplication_demoted: number
 diff_risk_introduced: number
 }
 /**
- * The verdict of every gate a run evaluated, keyed by name.
+ * The verdict of every gate that a run evaluated, keyed by gate name.
  *
- * A gate is armed by a flag or by config. The default exit rule of a command
- * is always in the object, also when no flag armed a gate:
- * `error-severity-findings` on `dead-code`, `check` and the combined run
- * (with `health-findings` when the combined run analyzed health),
- * `health-findings` on `health`, `security-advisory` on `security` and
- * `audit-verdict` on `audit`. A reader of the JSON sees a failing run without
- * the exit code. `dupes` has no default exit rule, so a `dupes` run that armed
- * no gate carries no object and always exits 0.
+ * Each tool defines its own gate names. The name of a gate is the JSON member
+ * name, and the members are in the order of the names. A tool never writes an
+ * empty object. When no gate ran, the member is absent.
  *
- * An empty object is never emitted. The typed programmatic API runs no CLI
- * gate and leaves the object absent.
+ * The key set is OPEN. A name that a consumer does not recognize means "some
+ * gate", not an error.
  *
- * The names this build can emit are `error-severity-findings`, `regression`,
- * `stale-baseline`, `baseline-growth`, `duplication-threshold`,
- * `duplication-findings`, `health-min-score`,
- * `health-min-severity`, `health-findings`, `health-coverage-gaps`,
- * `health-runtime-coverage`, `security`, `security-advisory`, `audit-verdict`,
- * `type-aware-require` and `parse-error`. The set is OPEN: a name a consumer does not
- * recognise means "some gate", not an error.
+ * The names that this build can emit are `error-severity-findings`, `regression`, `stale-baseline`, `baseline-growth`, `duplication-threshold`, `duplication-findings`, `health-min-score`, `health-min-severity`, `health-findings`, `health-coverage-gaps`, `health-runtime-coverage`, `security`, `security-advisory`, `audit-verdict`, `type-aware-require` and `parse-error`. `GateName` describes each name and the default entries of each command.
  */
 export interface GateOutcomes {
 [k: string]: GateOutcome
@@ -2045,70 +2066,59 @@ export interface GateOutcomes {
 /**
  * One gate's verdict on one run.
  *
- * `status` and `enforced` answer different questions and legitimately
- * disagree. `status` is what the rule concluded; `enforced` is whether a
- * `fail` from this gate would make the run exit non-zero. A
- * `health --report-only` run is an explicit request never to fail, so a
- * failing gate there reports `status: fail` with `enforced: false`, and a
- * stale-baseline verdict published without `--fail-on-stale-baseline` reports
- * the same pair.
+ * `status` and `enforced` answer different questions, and they can disagree.
+ * `status` is what the rule concluded. `enforced` tells if a `fail` from this
+ * gate makes the run exit non-zero. A run that was told never to fail reports
+ * a failed gate as `status: fail` with `enforced: false`.
  *
  * **A gate fails the build when `status` is `fail` AND `enforced` is true.**
- * Neither member decides it alone: `enforced` is true on every armed gate,
- * including the ones that passed, so gating on it by itself fails every run
- * that armed anything. Read `status` on its own to decide what to say, and
- * remember that `warn` and `skipped` are neither a pass nor a failure.
+ * One member alone does not decide it. `enforced` is true on every armed
+ * gate, also on a gate that passed. Thus a gate rule on `enforced` alone
+ * fails every run that armed a gate. Read `status` alone to decide what to
+ * say. `warn` and `skipped` are not a pass and not a failure.
  */
 export interface GateOutcome {
 status: GateStatus
 /**
  * True when a `fail` from this gate makes the run exit non-zero. False
- * when the verdict is published for information only: the gate was never
- * armed, the run was told never to fail, or the combined machine formats
- * exit 0 for the gate (bare `fallow` without `--fail-on-issues`).
+ * when the tool publishes the verdict for information only: no flag or
+ * config armed the gate, the run was told never to fail, or the output
+ * format exits 0 for the gate.
  */
 enforced: boolean
 /**
- * The measured value the gate compared, when there is one: the duplication
- * percentage, the health score, the number of findings at or above the
- * severity floor, the number of `error` findings of `health-findings` and
- * of `error-severity-findings`, or
- * the number of files in `files`. Whole numbers are
- * carried as JSON numbers, so a count of three reads as `3.0`. Absent for
- * gates that compare no number.
+ * The measured value that the gate compared, when there is one: for
+ * example a percentage, a score, a number of findings, or the number of
+ * files in `files`. A whole number is a JSON number, so a count of three
+ * reads as `3.0`. Absent for a gate that compares no number.
  */
 observed?: (number | null)
 /**
- * The configured limit `observed` was compared against, when there is one.
- * Absent for gates that compare no number.
+ * The configured limit that the gate compared `observed` against, when
+ * there is one. Absent for a gate that compares no number.
  */
 threshold?: (number | null)
 /**
  * How the limit was spelled, for a gate whose `threshold` number does not
- * carry its own unit. `health-min-severity` sets it to the severity floor
- * (`moderate`, `high` or `critical`); `health-findings` and
- * `error-severity-findings` set it to `error`, the rule severity they
- * count; `regression` sets it to the
- * tolerance as the user wrote it (`"50%"` or `"5"`), because `threshold`
- * there is the allowance in issues and the percentage would otherwise be
- * unrecoverable on the grouped envelope, which carries no `regression`
- * object. Absent for gates whose numbers speak for themselves.
+ * carry its unit. Examples are a severity floor such as `high`, the rule
+ * severity that the gate counts such as `error`, or a tolerance as the
+ * user wrote it, such as `"50%"`. Each gate name documents its label.
+ * Absent for a gate whose numbers have a clear meaning without a label.
  */
 threshold_label?: (string | null)
 /**
- * The files the gate judged, for a gate that judges files rather than a
- * number. Only `parse-error` sets it: one item per file that did not
- * parse cleanly, sorted by path. Absent when the list is empty.
+ * The files that the gate judged, for a gate that judges files and not a
+ * number. One item for each file, sorted by path. Absent when the list is
+ * empty.
  */
 files?: GateFile[]
 }
 /**
- * One file a file-judging gate names, with the reason the gate counted it.
+ * One file that a file-judging gate names, with the reason that the gate
+ * counted it.
  *
- * Today only `parse-error` emits it. The item carries the same facts as the
- * `source-parse-degraded` entry in `workspace_diagnostics[]` for that file,
- * so a consumer can act on the gate without a join. With `reason` set, the
- * count and the parser outcome are placeholders.
+ * A gate that counts files that did not parse cleanly writes this item. When
+ * `reason` is set, `error_count` and `panicked` hold fixed values.
  */
 export interface GateFile {
 /**
@@ -2120,7 +2130,7 @@ path: string
  */
 error_count: number
 /**
- * True when the parser stopped in the file instead of recovering, so the
+ * True when the parser stopped in the file and did not recover, so the
  * analysis saw only the part before the error. `true` when `reason` is set.
  */
 panicked: boolean
@@ -3135,6 +3145,13 @@ unused_enum_members: UnusedEnumMemberFinding[]
  */
 unused_class_members: UnusedClassMemberFinding[]
 /**
+ * Exported members of an exported TypeScript namespace that no code
+ * reads. Wrapped in [`UnusedNamespaceMemberFinding`]: same inner
+ * [`UnusedMember`] struct as `unused_enum_members`. `member_name` is the
+ * dotted path from the exported namespace (`Inner.x`).
+ */
+unused_namespace_members?: UnusedNamespaceMemberFinding[]
+/**
  * Store members (Pinia `state` / `getters` / `actions` key, or a
  * setup-store returned key) declared but never accessed by any consumer
  * project-wide. Wrapped in [`UnusedStoreMemberFinding`]: same inner
@@ -3155,12 +3172,23 @@ unresolved_imports: UnresolvedImportFinding[]
  */
 unlisted_dependencies: UnlistedDependencyFinding[]
 /**
+ * Binaries that package.json scripts or process calls run, but that no
+ * installed or listed package provides. Wrapped in
+ * [`UnlistedBinaryFinding`].
+ */
+unlisted_binaries?: UnlistedBinaryFinding[]
+/**
  * Exports with the same name across multiple modules. Wrapped in
  * [`DuplicateExportFinding`] so each entry carries a typed `actions`
  * array natively, with the position-0 `add-to-config` `ignoreExports`
  * snippet wired in at wrapper construction.
  */
 duplicate_exports: DuplicateExportFinding[]
+/**
+ * One module that exports one binding under two or more names. Wrapped
+ * in [`DuplicateExportAliasFinding`]. Default severity is `warn`.
+ */
+duplicate_export_aliases?: DuplicateExportAliasFinding[]
 /**
  * Production dependencies only used via type-only imports (could be
  * devDependencies). Only populated in production mode. Wrapped in
@@ -3639,6 +3667,10 @@ unused_enum_members: number
  */
 unused_class_members: number
 /**
+ * Unused namespace members.
+ */
+unused_namespace_members?: number
+/**
  * Unused store members.
  */
 unused_store_members?: number
@@ -3705,9 +3737,18 @@ unresolved_imports: number
  */
 unlisted_dependencies: number
 /**
+ * Binaries that scripts or process calls run, but that no installed or
+ * listed package provides.
+ */
+unlisted_binaries?: number
+/**
  * Same-named exports declared in more than one module.
  */
 duplicate_exports: number
+/**
+ * Bindings that one module exports under two or more names.
+ */
+duplicate_export_aliases?: number
 /**
  * Production dependencies only used via type-only imports (could be
  * devDependencies). Only populated in production mode.
@@ -4545,11 +4586,12 @@ export interface UnusedEnumMemberFinding {
  */
 path: string
 /**
- * Name of the parent enum or class.
+ * Name of the parent enum, class, store, or exported namespace.
  */
 parent_name: string
 /**
- * Name of the unused member.
+ * Name of the unused member. A member of a nested namespace has the dotted
+ * path from the exported namespace (`Inner.x`).
  */
 member_name: string
 kind: MemberKind
@@ -4608,11 +4650,12 @@ export interface UnusedClassMemberFinding {
  */
 path: string
 /**
- * Name of the parent enum or class.
+ * Name of the parent enum, class, store, or exported namespace.
  */
 parent_name: string
 /**
- * Name of the unused member.
+ * Name of the unused member. A member of a nested namespace has the dotted
+ * path from the exported namespace (`Inner.x`).
  */
 member_name: string
 kind: MemberKind
@@ -4666,6 +4709,71 @@ reachability_caveats?: ReachabilityCaveat[]
 }
 /**
  * Wire-shape envelope for an [`UnusedMember`] finding consumed under the
+ * `unused_namespace_members` key (an exported member of an exported
+ * TypeScript namespace that no code reads). `member_name` is the dotted path
+ * from the exported namespace, for example `Inner.x`. Emits only a
+ * line-level suppress action: a member can be a multi-line function, class
+ * or nested namespace, so there is no safe one-line auto-fix.
+ */
+export interface UnusedNamespaceMemberFinding {
+/**
+ * File containing the unused member.
+ */
+path: string
+/**
+ * Name of the parent enum, class, store, or exported namespace.
+ */
+parent_name: string
+/**
+ * Name of the unused member. A member of a nested namespace has the dotted
+ * path from the exported namespace (`Inner.x`).
+ */
+member_name: string
+kind: MemberKind
+/**
+ * 1-based line number.
+ */
+line: number
+/**
+ * 0-based byte column offset.
+ */
+col: number
+/**
+ * Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+ * `~<k>` suffix when several findings of one type share an identity.
+ * Line and column are not inputs, so the id survives line shifts,
+ * reformats and reorders. A rename of the file or the symbol gives a
+ * new id. Absent in output from older versions.
+ */
+finding_id?: (string | null)
+/**
+ * Suggested next steps. Always emitted (possibly empty for
+ * forward-compat).
+ */
+actions: IssueAction[]
+/**
+ * Set by the audit pass when this finding is introduced relative to
+ * the merge-base.
+ */
+introduced?: (AuditIntroduced | null)
+/**
+ * Gate severity of this finding after `rules` and `overrides[].rules`
+ * resolve for its path. CI formats read it for the annotation, SARIF
+ * and CodeClimate level. Absent in output from older versions. Not
+ * part of the finding identity, baseline keys or fingerprints.
+ */
+effective_severity?: (EffectiveSeverity | null)
+/**
+ * Advisory caveats on the verdict behind this finding. A namespace
+ * member takes the member rule unchanged: any module this run analyzed
+ * incompletely can hold the access that credits it. Sorted,
+ * deduplicated, and omitted from the wire when empty. This is disclosure
+ * only, because a namespace member offers no mutation.
+ */
+reachability_caveats?: ReachabilityCaveat[]
+}
+/**
+ * Wire-shape envelope for an [`UnusedMember`] finding consumed under the
  * `unused_store_members` key (a Pinia `state` / `getters` / `actions` key, or
  * a setup-store returned key, declared but never accessed by any consumer
  * project-wide). Same Rust struct as [`UnusedClassMemberFinding`]. Emits only
@@ -4680,11 +4788,12 @@ export interface UnusedStoreMemberFinding {
  */
 path: string
 /**
- * Name of the parent enum or class.
+ * Name of the parent enum, class, store, or exported namespace.
  */
 parent_name: string
 /**
- * Name of the unused member.
+ * Name of the unused member. A member of a nested namespace has the dotted
+ * path from the exported namespace (`Inner.x`).
  */
 member_name: string
 kind: MemberKind
@@ -4846,6 +4955,68 @@ line: number
 col: number
 }
 /**
+ * Wire-shape envelope for an [`UnlistedBinary`] finding. Carries an
+ * `install-dependency` primary (non-auto-fixable) plus an `ignoreBinaries`
+ * config suppress.
+ */
+export interface UnlistedBinaryFinding {
+/**
+ * The binary name as the command runs it (for example `ffmpeg`).
+ */
+binary_name: string
+/**
+ * The sites that run this binary.
+ */
+used_in: BinaryUseSite[]
+/**
+ * Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+ * `~<k>` suffix when several findings of one type share an identity.
+ * Line and column are not inputs, so the id survives line shifts,
+ * reformats and reorders. Absent in output from older versions.
+ */
+finding_id?: (string | null)
+/**
+ * Suggested next steps. Always emitted (possibly empty for
+ * forward-compat).
+ */
+actions: IssueAction[]
+/**
+ * Set by the audit pass when this finding is introduced relative to
+ * the merge-base.
+ */
+introduced?: (AuditIntroduced | null)
+/**
+ * Gate severity of this finding after `rules` and `overrides[].rules`
+ * resolve for its path. CI formats read it for the annotation, SARIF
+ * and CodeClimate level. Absent in output from older versions. Not
+ * part of the finding identity, baseline keys or fingerprints.
+ */
+effective_severity?: (EffectiveSeverity | null)
+}
+/**
+ * A location that runs a binary.
+ */
+export interface BinaryUseSite {
+/**
+ * The `package.json` that declares the script, or the source file that
+ * makes the process call.
+ */
+path: string
+/**
+ * 1-based line number.
+ */
+line: number
+/**
+ * 0-based byte column offset.
+ */
+col: number
+/**
+ * The name of the package.json script that runs the binary. Absent for
+ * a process call in source.
+ */
+script_name?: (string | null)
+}
+/**
  * Wire-shape envelope for a [`DuplicateExport`] finding. Carries up to
  * three actions in position-locked order: an `add-to-config` `ignoreExports`
  * snippet (only when `locations[]` carries at least one path) followed by
@@ -4901,6 +5072,81 @@ export interface DuplicateLocation {
  * File containing the duplicate export.
  */
 path: string
+/**
+ * 1-based line number.
+ */
+line: number
+/**
+ * 0-based byte column offset.
+ */
+col: number
+}
+/**
+ * Wire-shape envelope for a [`DuplicateExportAlias`] finding. There is no
+ * safe auto-fix: a consumer outside the project can import any of the
+ * names. Actions are manual remediation guidance plus a line-level
+ * suppress.
+ */
+export interface DuplicateExportAliasFinding {
+/**
+ * The module that exports the binding.
+ */
+path: string
+/**
+ * The local name of the binding. For a re-export, the name that the
+ * source module exports.
+ */
+local_name: string
+/**
+ * The export names of the binding, in source order.
+ */
+export_names: string[]
+/**
+ * 1-based line number of the first export of the binding.
+ */
+line: number
+/**
+ * 0-based byte column offset of the first export of the binding.
+ */
+col: number
+/**
+ * One location for each export name, in source order.
+ */
+locations: DuplicateExportAliasLocation[]
+/**
+ * Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+ * `~<k>` suffix when several findings of one type share an identity.
+ * Line and column are not inputs, so the id survives line shifts,
+ * reformats and reorders. A rename of the file or the binding gives a
+ * new id. Absent in output from older versions.
+ */
+finding_id?: (string | null)
+/**
+ * Suggested next steps. Always emitted (possibly empty for
+ * forward-compat).
+ */
+actions: IssueAction[]
+/**
+ * Set by the audit pass when this finding is introduced relative to
+ * the merge-base.
+ */
+introduced?: (AuditIntroduced | null)
+/**
+ * Gate severity of this finding after `rules` and `overrides[].rules`
+ * resolve for its path. CI formats read it for the annotation, SARIF
+ * and CodeClimate level. Absent in output from older versions. Not
+ * part of the finding identity, baseline keys or fingerprints.
+ */
+effective_severity?: (EffectiveSeverity | null)
+}
+/**
+ * One export name of a [`DuplicateExportAlias`].
+ */
+export interface DuplicateExportAliasLocation {
+/**
+ * The export name at this location (`default` for a default export).
+ */
+export_name: string
 /**
  * 1-based line number.
  */
@@ -9764,6 +10010,15 @@ actionability_reason?: (string | null)
  */
 actionability_verdict?: (string | null)
 provenance: RuntimeCoverageProvenance
+/**
+ * Fields of the Fallow Cloud runtime-context answer that the CLI does not
+ * read, as the cloud sent them: for example `capabilities`, `page`,
+ * `context_unavailable` and `commit_shas`. Cloud mode only; omitted in
+ * local mode. Context only.
+ */
+cloud_context?: ({
+[k: string]: unknown
+} | null)
 }
 /**
  * Summary block mirroring `fallow_cov_protocol::Summary` (0.3 shape).
@@ -9918,6 +10173,18 @@ actions?: RuntimeCoverageAction[]
  * from JSON when absent.
  */
 discriminators?: (RuntimeCoverageDiscriminators | null)
+/**
+ * Production signals of the function from the Fallow Cloud runtime-context
+ * row, as the cloud sent them: for example `errors`, `performance` (with
+ * `cpu` and `browser`), `branches`, `covered_by_test` and
+ * `test_hit_count`. The block holds only the row fields that the CLI does
+ * not read for the verdict, and a newer cloud can add keys. Cloud mode
+ * only; omitted in local mode. Context only: these signals never change
+ * the verdict, the confidence or the actions.
+ */
+cloud_context?: ({
+[k: string]: unknown
+} | null)
 }
 /**
  * Supporting evidence for a finding (mirrors `fallow_cov_protocol::Evidence`).
@@ -10079,6 +10346,14 @@ actions?: RuntimeCoverageAction[]
  * in this checkout.
  */
 optimization_target?: (RuntimeCoverageOptimizationTarget | null)
+/**
+ * Production signals of the hot function from the Fallow Cloud
+ * runtime-context row, in the shape of `RuntimeCoverageFinding::cloud_context`.
+ * Cloud mode only; omitted in local mode. Context only.
+ */
+cloud_context?: ({
+[k: string]: unknown
+} | null)
 }
 /**
  * Speed-work inputs for one hot function: how often it runs and how much
@@ -10157,6 +10432,16 @@ caller_count_weighted_by_traffic: number
  */
 deploys_touched?: (number | null)
 risk_band: RuntimeCoverageRiskBand
+/**
+ * Fields of the Fallow Cloud blast-radius row that the CLI does not read,
+ * as the cloud sent them: for example `production_callers`,
+ * `caller_sites`, `test_caller_count`, `non_runtime_caller_count` and
+ * `context_unavailable_reason`. Cloud mode only, and only when the cloud
+ * sent the blast-radius rows. Context only: the risk band does not read it.
+ */
+cloud_context?: ({
+[k: string]: unknown
+} | null)
 }
 /**
  * One production-importance entry in `runtime_coverage.importance`, scoring
@@ -11302,6 +11587,15 @@ keyframes_unreferenced: number
  */
 keyframes_undefined: number
 /**
+ * `@keyframes` with no literal reference that a Sass or Less source
+ * defines and that the unreferenced check skips. A Sass or Less
+ * animation value with a variable or an interpolation that fallow cannot
+ * resolve can name any such block. These are not in
+ * `keyframes_unreferenced`. A `@keyframes` block in plain CSS is always
+ * checked.
+ */
+keyframes_unchecked: number
+/**
  * Total Vue `<style scoped>` classes used nowhere else in their component
  * (cleanup candidates), across all SFCs.
  */
@@ -12155,6 +12449,12 @@ related?: DiffRiskLocation[]
  * Suppression actions.
  */
 actions: DiffRiskAction[]
+/**
+ * The parsed `fallow-ignore` comment. Present only on an
+ * `added-suppression` finding whose evidence is `fallow-ignore` and
+ * whose comment Fallow can parse.
+ */
+suppression?: (DiffRiskSuppression | null)
 }
 /**
  * A location that relates to a diff-risk finding, such as an unchanged clone
@@ -12187,6 +12487,26 @@ description: string
  * The suppression comment to insert. Absent on `suppress-in-config`.
  */
 comment?: (string | null)
+}
+/**
+ * The parsed content of an added `fallow-ignore` comment.
+ */
+export interface DiffRiskSuppression {
+/**
+ * The suppressed kinds in kebab-case, in source order. Empty for a
+ * blanket comment that suppresses every kind.
+ */
+kinds: string[]
+/**
+ * The human-authored reason after `--`, or `null` when absent.
+ */
+reason?: (string | null)
+/**
+ * `true` when the comment names `security-sink` or
+ * `security-client-server-leak` and has no reason. An advisory signal
+ * only: it does not change the severity of the finding.
+ */
+security_without_reason: boolean
 }
 /**
  * Envelope emitted by `fallow explain <issue-type> --format json`.
@@ -12490,9 +12810,26 @@ errors?: (InspectCloudErrors | null)
  */
 cpu_ms_per_hour?: (number | null)
 /**
+ * Long animation frame milliseconds per hour of visible page time in
+ * the browser. `None` when not measured (a server function, or a
+ * browser without the API).
+ */
+browser_long_frame_ms_per_hour?: (number | null)
+/**
  * Branch ranges that never ran. `None` when not measured.
  */
 never_run_ranges?: (number | null)
+/**
+ * Files that import the function, from the static caller graph. `None`
+ * when not known.
+ */
+static_callers?: (number | null)
+/**
+ * Functions that called this one in the CPU profiles of the deployment,
+ * most samples first. `None` when the deployment has no CPU profile; an
+ * empty list means a profile without a caller.
+ */
+production_callers?: (InspectCloudCaller[] | null)
 /**
  * One-line summary from the cloud.
  */
@@ -12510,6 +12847,31 @@ groups: number
  * Error events attributed to the function.
  */
 events: number
+}
+/**
+ * One production caller of an [`InspectCloudFunction`].
+ */
+export interface InspectCloudCaller {
+/**
+ * Stable id of the calling function.
+ */
+stable_id?: (string | null)
+/**
+ * File of the calling function, relative to the repository root.
+ */
+file: string
+/**
+ * Name of the calling function.
+ */
+function: string
+/**
+ * 1-based start line of the calling function.
+ */
+line?: (number | null)
+/**
+ * CPU profile samples with this caller to callee step on the stack.
+ */
+samples: number
 }
 /**
  * One local function without a deployed function.
@@ -12777,6 +13139,12 @@ imported_by: string[]
  * Re-exports declared by this file.
  */
 re_exports: TracedReExport[]
+/**
+ * The package.json script key that makes this file an entry point, e.g.
+ * `build`. Absent when no script makes the file an entry point
+ * (issue #4175).
+ */
+entry_script?: (string | null)
 /**
  * The configs that make this file an entry point through Module
  * Federation `exposes`, one per config. Absent when no Federation config
@@ -14300,8 +14668,8 @@ name: string
  */
 path: string
 /**
- * Whether the package is a generated or platform-specific dependency
- * package rather than a hand-authored workspace.
+ * Whether another workspace of the project lists this package as a
+ * dependency.
  */
 is_internal_dependency: boolean
 }
@@ -15080,6 +15448,13 @@ unused_enum_members: UnusedEnumMemberFinding[]
  */
 unused_class_members: UnusedClassMemberFinding[]
 /**
+ * Exported members of an exported TypeScript namespace that no code
+ * reads. Wrapped in [`UnusedNamespaceMemberFinding`]: same inner
+ * [`UnusedMember`] struct as `unused_enum_members`. `member_name` is the
+ * dotted path from the exported namespace (`Inner.x`).
+ */
+unused_namespace_members?: UnusedNamespaceMemberFinding[]
+/**
  * Store members (Pinia `state` / `getters` / `actions` key, or a
  * setup-store returned key) declared but never accessed by any consumer
  * project-wide. Wrapped in [`UnusedStoreMemberFinding`]: same inner
@@ -15100,12 +15475,23 @@ unresolved_imports: UnresolvedImportFinding[]
  */
 unlisted_dependencies: UnlistedDependencyFinding[]
 /**
+ * Binaries that package.json scripts or process calls run, but that no
+ * installed or listed package provides. Wrapped in
+ * [`UnlistedBinaryFinding`].
+ */
+unlisted_binaries?: UnlistedBinaryFinding[]
+/**
  * Exports with the same name across multiple modules. Wrapped in
  * [`DuplicateExportFinding`] so each entry carries a typed `actions`
  * array natively, with the position-0 `add-to-config` `ignoreExports`
  * snippet wired in at wrapper construction.
  */
 duplicate_exports: DuplicateExportFinding[]
+/**
+ * One module that exports one binding under two or more names. Wrapped
+ * in [`DuplicateExportAliasFinding`]. Default severity is `warn`.
+ */
+duplicate_export_aliases?: DuplicateExportAliasFinding[]
 /**
  * Production dependencies only used via type-only imports (could be
  * devDependencies). Only populated in production mode. Wrapped in
@@ -15905,9 +16291,9 @@ finding_id: string
 kind: SecurityFindingKind
 /**
  * The catalogue category id (e.g. `"dangerous-html"`). `Some` for
- * `TaintedSink`. For `ClientServerLeak` this is `None` for the secret-leak
- * finding, and `Some("server-only-import")` when a `"use client"` cone
- * reaches server-only code.
+ * `TaintedSink`. For `ClientServerLeak` it is `"client-server-leak"` for the
+ * secret leak (older releases omit it) or `"server-only-import"` when a
+ * `"use client"` cone reaches server-only code.
  */
 category?: (string | null)
 /**
@@ -16141,9 +16527,9 @@ line: number
 col: number
 /**
  * Catalogue category id of the sink (e.g. `"dangerous-html"`). For
- * `client-server-leak` this is `None` for the secret-leak finding, and
- * `Some("server-only-import")` when a `"use client"` cone reaches
- * server-only code.
+ * `client-server-leak` this is `"client-server-leak"` for the secret-leak
+ * finding, and `"server-only-import"` when a `"use client"` cone reaches
+ * server-only code. Older releases left it absent for the secret leak.
  */
 category?: (string | null)
 /**
@@ -16808,6 +17194,13 @@ unused_enum_members: UnusedEnumMemberFinding[]
  */
 unused_class_members: UnusedClassMemberFinding[]
 /**
+ * Exported members of an exported TypeScript namespace that no code
+ * reads. Wrapped in [`UnusedNamespaceMemberFinding`]: same inner
+ * [`UnusedMember`] struct as `unused_enum_members`. `member_name` is the
+ * dotted path from the exported namespace (`Inner.x`).
+ */
+unused_namespace_members?: UnusedNamespaceMemberFinding[]
+/**
  * Store members (Pinia `state` / `getters` / `actions` key, or a
  * setup-store returned key) declared but never accessed by any consumer
  * project-wide. Wrapped in [`UnusedStoreMemberFinding`]: same inner
@@ -16828,12 +17221,23 @@ unresolved_imports: UnresolvedImportFinding[]
  */
 unlisted_dependencies: UnlistedDependencyFinding[]
 /**
+ * Binaries that package.json scripts or process calls run, but that no
+ * installed or listed package provides. Wrapped in
+ * [`UnlistedBinaryFinding`].
+ */
+unlisted_binaries?: UnlistedBinaryFinding[]
+/**
  * Exports with the same name across multiple modules. Wrapped in
  * [`DuplicateExportFinding`] so each entry carries a typed `actions`
  * array natively, with the position-0 `add-to-config` `ignoreExports`
  * snippet wired in at wrapper construction.
  */
 duplicate_exports: DuplicateExportFinding[]
+/**
+ * One module that exports one binding under two or more names. Wrapped
+ * in [`DuplicateExportAliasFinding`]. Default severity is `warn`.
+ */
+duplicate_export_aliases?: DuplicateExportAliasFinding[]
 /**
  * Production dependencies only used via type-only imports (could be
  * devDependencies). Only populated in production mode. Wrapped in
@@ -20321,6 +20725,16 @@ verdicts?: (MutationVerdictJoin | null)
  * them (`--typecheck` not set).
  */
 typecheck?: (MutationTypecheckOutput | null)
+/**
+ * The result of each rechecked mutant against its status in the earlier
+ * report. Absent outside `--recheck`.
+ */
+recheck?: (MutationRecheck | null)
+/**
+ * The mutants whose result differs from a saved report. Absent outside
+ * `--compare`, and absent when this run is not complete.
+ */
+compare?: (MutationCompare | null)
 }
 /**
  * The completion status of a run.
@@ -20348,12 +20762,19 @@ reasons: string[]
 tests: MutationTestKillRow[]
 /**
  * Tests with nonempty kills and no unique kills, sorted by test id.
+ * In target mode, only the tests of complete targets.
  */
 candidates: string[]
 /**
  * Tests with coverage and no observed kills, sorted by test id.
  */
 coverage_without_kills: string[]
+/**
+ * The `--kill-matrix-for` targets, in the given order. Absent outside
+ * target mode. In target mode, `tests` has only target tests, and
+ * `subsuming_tests` is empty, because bail hides the other killers.
+ */
+targets?: (MutationKillMatrixTarget[] | null)
 }
 /**
  * The observed mutant kills of one eligible test.
@@ -20383,6 +20804,50 @@ subsuming_tests: string[]
  * Conservative evidence notes, sorted.
  */
 notes: string[]
+/**
+ * The kills that other target tests also detect and no non-target test
+ * detects, sorted by mutant id. Only `--kill-matrix-for` sets this
+ * field. The test stays redundant only while one of `targets` for each
+ * entry stays in the suite.
+ */
+target_only_kills?: (MutationTargetOnlyKill[] | null)
+}
+/**
+ * A kill of a target test that only other target tests share.
+ */
+export interface MutationTargetOnlyKill {
+/**
+ * The killed mutant.
+ */
+mutant_id: string
+/**
+ * The other target tests that also kill the mutant, sorted.
+ */
+targets: string[]
+}
+/**
+ * One `--kill-matrix-for` target and the dry-run tests that it selects.
+ */
+export interface MutationKillMatrixTarget {
+/**
+ * The target as the caller gave it, after path normalization: a test
+ * file or a runner test id.
+ */
+target: string
+/**
+ * The dry-run test ids that the target selects, sorted.
+ */
+test_ids: string[]
+status: MutationKillMatrixTargetStatus
+/**
+ * Why the evidence of this target is incomplete, sorted. The run-wide
+ * reasons `partial-mutation-run`, `baseline-failure`, and
+ * `missing-test-file-metadata` apply to each target.
+ * `incomplete-mutant-results` means that a test of this target covers a
+ * mutant with incomplete evidence. `unmatched-target` means that the
+ * target selects no test.
+ */
+reasons: string[]
 }
 /**
  * The scope of a plan or a run.
@@ -20508,6 +20973,11 @@ score?: (number | null)
  * mutants never count. `null` when no mutant is covered or unreached.
  */
 coverage?: (number | null)
+/**
+ * The `pending` mutants that the `--mutants-per-line` limit left out of
+ * the plan. They are part of `counts.pending`.
+ */
+sampled_out: number
 }
 /**
  * One mutant of a run.
@@ -20562,6 +21032,13 @@ status: MutantStatus
  * The static rule of a `pruned` mutant, kebab-case.
  */
 prune_reason?: (string | null)
+/**
+ * Why a `pending` mutant did not run, kebab-case. Only `sampled-out` has
+ * a reason: the `--mutants-per-line` limit left the mutant out of the
+ * plan. A mutant that the mutant limit or the time budget left out has
+ * no reason.
+ */
+pending_reason?: (string | null)
 /**
  * The test that killed the mutant in this run. Absent for a kill by an
  * error outside a test.
@@ -20631,14 +21108,22 @@ resumed?: boolean
  * `compile_error` mutant, sorted, at most 8.
  */
 type_error_codes?: number[]
+/**
+ * An advisory hint that the mutant may be equivalent to the original
+ * code. The hint never changes the status: the mutant stays `survived`
+ * and counts in the score. A person decides, and records the decision in
+ * a verdict file. The hint can be wrong.
+ */
+equivalence_hint?: (MutantEquivalenceHint | null)
 }
 /**
  * The edit of a mutant, without project text.
  *
  * Each side is an operator token (for example `??` or `<=`), a fixed literal
  * (`true`, `undefined`, `""`, `"fallow"`, `void 0`), a regular expression
- * token (`^`, `$`, `[`, `[^`, `\d`), or a placeholder for a side that is
- * project code: `<condition>`, `<call>`, `<expression>` or `<string>`. An
+ * token (`^`, `$`, `[`, `[^`, `+`, `{n,m}`, `\d`), or a placeholder for a
+ * side that is project code: `<condition>`, `<call>`, `<expression>`,
+ * `<string>` or `<template>`. An
  * empty side means that the edit removes the token.
  */
 export interface MutantChange {
@@ -20823,9 +21308,9 @@ changed_paths: string[]
 export interface MutationRunIssue {
 /**
  * A stable kebab-case code: `cache-write-failed`,
- * `journal-write-failed`, `runtime-error`, `static-map-miss`,
- * `test-files-not-discovered`, `typecheck-failed`, `worktree-changed`
- * or `worktree-check-failed`.
+ * `duplicate-test-ids`, `journal-write-failed`, `runtime-error`,
+ * `static-map-miss`, `test-files-not-discovered`, `typecheck-failed`,
+ * `worktree-changed` or `worktree-check-failed`.
  */
 code: string
 /**
@@ -20941,6 +21426,12 @@ checked: number
  */
 compile_errors: number
 /**
+ * The mutants of the final report that have an `equivalence_hint`. They
+ * keep the status `survived`. A verdict that makes a mutant `equivalent`
+ * removes its hint and lowers this count.
+ */
+hinted?: number
+/**
  * The survivors that the checker did not check, by reason.
  */
 skipped?: MutationTypecheckSkip[]
@@ -20954,6 +21445,125 @@ reason: MutationTypecheckSkipReason
  * The number of survivors.
  */
 count: number
+}
+/**
+ * The recheck facts of a `--recheck` run.
+ */
+export interface MutationRecheck {
+/**
+ * The SHA-256 digest of the earlier report.
+ */
+report_sha256: string
+/**
+ * The number of mutants for each outcome.
+ */
+killed: number
+/**
+ * See `killed`.
+ */
+survived: number
+/**
+ * See `killed`.
+ */
+no_coverage: number
+/**
+ * See `killed`.
+ */
+tests_fail_on_original: number
+/**
+ * See `killed`.
+ */
+unsettled: number
+/**
+ * The rechecked mutants, sorted by file, line and mutant id.
+ */
+mutants: MutationRecheckMutant[]
+}
+/**
+ * One rechecked mutant.
+ */
+export interface MutationRecheckMutant {
+/**
+ * The id of the mutant.
+ */
+mutant_id: string
+/**
+ * The project-root-relative path of the mutated file.
+ */
+file: string
+/**
+ * The 1-based line of the mutant.
+ */
+line: number
+previous_status: MutantStatus
+status: MutantStatus
+outcome: MutationRecheckOutcome
+}
+/**
+ * The compare facts of a `--compare` run.
+ */
+export interface MutationCompare {
+/**
+ * The SHA-256 digest of the saved report.
+ */
+report_sha256: string
+/**
+ * The number of mutant ids in both runs.
+ */
+compared: number
+/**
+ * The number of mutants for each change.
+ */
+regressed: number
+/**
+ * See `regressed`.
+ */
+inconclusive: number
+/**
+ * See `regressed`.
+ */
+added: number
+/**
+ * See `regressed`.
+ */
+removed: number
+/**
+ * Each mutant with a change, sorted by file, line and mutant id. A
+ * mutant in both runs without a change is not in the list.
+ */
+mutants: MutationCompareMutant[]
+}
+/**
+ * One mutant of a compare.
+ */
+export interface MutationCompareMutant {
+/**
+ * The id of the mutant.
+ */
+mutant_id: string
+/**
+ * The project-root-relative path of the mutated file.
+ */
+file: string
+/**
+ * The 1-based line of the mutant.
+ */
+line: number
+change: MutationCompareChange
+/**
+ * The status in the saved report. Absent for an `added` mutant.
+ */
+previous_status?: (MutantStatus | null)
+/**
+ * The status in this run. Absent for a `removed` mutant.
+ */
+status?: (MutantStatus | null)
+/**
+ * The tests that killed the mutant in the saved report, sorted: its
+ * `killing_tests`, else its `killed_by`. Empty when the saved report
+ * names no killing test.
+ */
+previous_killing_tests: string[]
 }
 /**
  * The envelope of `fallow mutation --plan`. It runs no user code.
@@ -21006,9 +21616,13 @@ total: number
  */
 planned: number
 /**
- * Mutants after the mutant limit.
+ * Mutants after the mutant limit, and the sampled-out mutants.
  */
 pending: number
+/**
+ * The `pending` mutants that the `--mutants-per-line` limit left out.
+ */
+sampled_out: number
 /**
  * Mutants that no test file reaches.
  */
@@ -21083,6 +21697,13 @@ disposition: MutationPlanDisposition
  * The static rule of a `pruned` mutant, kebab-case.
  */
 prune_reason?: (string | null)
+/**
+ * Why a `pending` mutant did not run, kebab-case. Only `sampled-out` has
+ * a reason: the `--mutants-per-line` limit left the mutant out of the
+ * plan. A mutant that the mutant limit or the time budget left out has
+ * no reason.
+ */
+pending_reason?: (string | null)
 /**
  * How tests reach the code of the mutant in the module graph. Only a
  * `no_coverage` mutant has this field.
@@ -21205,6 +21826,104 @@ original_lines: string
 mutated_lines: string
 }
 /**
+ * The envelope of `fallow mutation tasks`: the open tasks of one saved
+ * report, as one batch. It runs no user code.
+ */
+export interface MutationTasksOutput {
+schema_version: MutationTasksSchemaVersion
+version: ToolVersion
+/**
+ * The completion status of the report. A `partial` report can miss
+ * tasks: a `pending` mutant is not a task.
+ */
+report_completion?: (MutationCompletionStatus | null)
+summary: MutationTasksSummary
+/**
+ * The tasks, sorted by file, line, column and mutant id.
+ */
+tasks: MutationTask[]
+}
+/**
+ * The number of tasks for each status.
+ */
+export interface MutationTasksSummary {
+/**
+ * The number of tasks.
+ */
+tasks: number
+/**
+ * The tasks with the status `survived`.
+ */
+survived: number
+/**
+ * The tasks with the status `no_coverage`.
+ */
+no_coverage: number
+/**
+ * The tasks whose file changed after the report. They have no code.
+ */
+stale: number
+}
+/**
+ * One open task: a `survived` or `no_coverage` mutant of a saved report.
+ * A task holds no source text other than the source lines of the mutant.
+ */
+export interface MutationTask {
+/**
+ * The id of the mutant. `fallow mutation inspect` takes this id.
+ */
+mutant_id: string
+/**
+ * The project-root-relative path of the mutated file.
+ */
+file: string
+/**
+ * The 1-based line of the mutant.
+ */
+line: number
+/**
+ * The 1-based column of the mutant.
+ */
+column: number
+/**
+ * The operator, kebab-case.
+ */
+operator: string
+/**
+ * The name of the enclosing function. Absent at the top level of a
+ * module and for an anonymous function.
+ */
+function?: (string | null)
+status: MutantStatus
+/**
+ * The source lines that contain the mutant, from the current file.
+ * `null` when the task is stale.
+ */
+original_lines?: (string | null)
+/**
+ * The same lines with the mutation applied. `null` when the task is
+ * stale.
+ */
+mutated_lines?: (string | null)
+/**
+ * An advisory hint that the mutant may be equivalent. The task stays
+ * open: a person decides, and records an equivalent mutant in a verdict
+ * file.
+ */
+equivalence_hint?: (MutantEquivalenceHint | null)
+/**
+ * Why the current file no longer gives the mutant. Absent for a fresh
+ * task.
+ */
+stale_reason?: (MutationStaleReason | null)
+/**
+ * The test files of the tests that reached the mutant in the dry run,
+ * sorted. Empty for `no_coverage`. `fallow mutation inspect` gives the
+ * test ids and the static test files of one mutant.
+ */
+covering_test_files: string[]
+}
+/**
  * Single CodeClimate-compatible issue inside [`CodeClimateOutput`].
  */
 export interface CodeClimateIssue {
@@ -21267,12 +21986,12 @@ begin: number
 end?: (number | null)
 }
 /**
- * Structured JSON error emitted on stdout when `--format json` is active and a
- * command fails. It carries no `kind` discriminator: it is distinguished from
- * the kind-tagged success envelopes by the required `error: true` field, and is
- * a document-root branch alongside `FallowOutput` and `CodeClimateOutput` in
- * `docs/output-schema.json`. Agents that pass `--format json` and observe a
- * non-zero exit code parse this shape from stdout.
+ * Structured JSON error that a tool writes to stdout when `--format json` is
+ * active and a command fails. It has no `kind` discriminator. The required
+ * `error: true` member separates it from a success envelope, which carries a
+ * `kind`. The error document is one of the root branches of the output
+ * schema. A consumer that passes `--format json` and sees a non-zero exit
+ * code parses this shape from stdout.
  */
 export interface ErrorOutput {
 /**
@@ -21469,6 +22188,16 @@ export type DevDependencyInProduction = DevDependencyInProductionFinding;
 export type DuplicateExport = DuplicateExportFinding;
 
 /**
+ * Backwards-compat alias for the pre-#384 bare `DuplicateExportAlias` name.
+ * The wire shape is byte-identical: `DuplicateExportAliasFinding` flattens the bare
+ * finding's fields via `#[serde(flatten)]` and adds `actions[]` plus
+ * the optional audit-mode `introduced` flag. Consumers that imported
+ * `DuplicateExportAlias` from `fallow/types` pre-migration continue to work via
+ * this alias; new code should prefer `DuplicateExportAliasFinding`.
+ */
+export type DuplicateExportAlias = DuplicateExportAliasFinding;
+
+/**
  * Backwards-compat alias for the pre-#384 bare `EmptyCatalogGroup` name.
  * The wire shape is byte-identical: `EmptyCatalogGroupFinding` flattens the bare
  * finding's fields via `#[serde(flatten)]` and adds `actions[]` plus
@@ -21537,6 +22266,16 @@ export type TestOnlyDependency = TestOnlyDependencyFinding;
  * this alias; new code should prefer `TypeOnlyDependencyFinding`.
  */
 export type TypeOnlyDependency = TypeOnlyDependencyFinding;
+
+/**
+ * Backwards-compat alias for the pre-#384 bare `UnlistedBinary` name.
+ * The wire shape is byte-identical: `UnlistedBinaryFinding` flattens the bare
+ * finding's fields via `#[serde(flatten)]` and adds `actions[]` plus
+ * the optional audit-mode `introduced` flag. Consumers that imported
+ * `UnlistedBinary` from `fallow/types` pre-migration continue to work via
+ * this alias; new code should prefer `UnlistedBinaryFinding`.
+ */
+export type UnlistedBinary = UnlistedBinaryFinding;
 
 /**
  * Backwards-compat alias for the pre-#384 bare `UnlistedDependency` name.
@@ -21621,14 +22360,14 @@ export type UnusedDependency = UnusedDependencyFinding | UnusedDevDependencyFind
 
 /**
  * Backwards-compat alias for the pre-#384 bare `UnusedMember` union name.
- * Maps to the union of typed wrappers (`UnusedClassMemberFinding`, `UnusedEnumMemberFinding`, `UnusedStoreMemberFinding`)
+ * Maps to the union of typed wrappers (`UnusedClassMemberFinding`, `UnusedEnumMemberFinding`, `UnusedNamespaceMemberFinding`, `UnusedStoreMemberFinding`)
  * that replaced the pre-migration bare union. The wire shape per variant
  * is byte-identical (each wrapper flattens its bare payload and adds
  * `actions[]` plus optional `introduced`). Consumers that imported
  * `UnusedMember` from `fallow/types` pre-migration continue to work via
  * this alias; new code should narrow on the specific wrapper variant.
  */
-export type UnusedMember = UnusedClassMemberFinding | UnusedEnumMemberFinding | UnusedStoreMemberFinding;
+export type UnusedMember = UnusedClassMemberFinding | UnusedEnumMemberFinding | UnusedNamespaceMemberFinding | UnusedStoreMemberFinding;
 
 /**
  * @deprecated Renamed to BaselineStaleness in 3.27.0, when dead-code and dupes started carrying the same shape. The members are unchanged.

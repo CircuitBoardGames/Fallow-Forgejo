@@ -606,17 +606,17 @@ fn render_css_notable_rules(lines: &mut Vec<String>, css: &fallow_output::CssAna
     }
 }
 
-/// Render the two located `@keyframes` candidate lines: defined-but-unused
-/// (`unreferenced`) and used-but-defined-nowhere (`undefined`).
+/// Render the located `@keyframes` candidate lines: `unreferenced` and `undefined`.
 fn render_css_keyframe_candidates(
     lines: &mut Vec<String>,
     css: &fallow_output::CssAnalyticsReport,
 ) {
     let summary = &css.summary;
     if summary.keyframes_defined > 0 {
+        let unchecked = fallow_output::keyframes_unchecked_suffix(summary);
         if css.unreferenced_keyframes.is_empty() {
             lines.push(format!(
-                "  @keyframes: {} defined, 0 unreferenced",
+                "  @keyframes: {} defined, 0 unreferenced{unchecked}",
                 summary.keyframes_defined,
             ));
         } else {
@@ -627,7 +627,7 @@ fn render_css_keyframe_candidates(
                 css.unreferenced_keyframes.len(),
             );
             lines.push(format!(
-                "  @keyframes: {} defined, {} unreferenced (candidates; verify): {listed}",
+                "  @keyframes: {} defined{unchecked}, {} unreferenced (candidates; verify): {listed}",
                 summary.keyframes_defined, summary.keyframes_unreferenced,
             ));
         }
@@ -2194,9 +2194,9 @@ fn finding_generated_tag(finding: &fallow_output::ComplexityViolation) -> String
 /// Render the CRAP row.
 ///
 /// The CRAP value is highlighted only when CRAP is one of the dimensions that
-/// produced the finding. It used to render red unconditionally, which made a
-/// benign CRAP look identical to a breaching one and left the colour channel
-/// carrying no information (issue #2163).
+/// produced the finding. A value that is always red makes a benign CRAP look
+/// identical to a breaching one and leaves the colour channel carrying no
+/// information (issue #2163).
 fn finding_crap_line(finding: &fallow_output::ComplexityViolation, root: &Path) -> Option<String> {
     let crap = finding.crap?;
     let breached = finding.exceeded.includes_crap();

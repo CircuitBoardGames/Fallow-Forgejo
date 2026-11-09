@@ -12,10 +12,6 @@ mod test;
 
 pub use test::benchmark_rule_pack_test_json;
 
-#[allow(
-    dead_code,
-    reason = "the command family is wired before every subcommand consumes all context fields"
-)]
 pub struct RulePackContext<'a> {
     pub root: &'a Path,
     pub config_path: &'a Option<PathBuf>,
@@ -44,19 +40,14 @@ fn emit_json(
             crate::report::sink::outln!("{json}");
             ExitCode::SUCCESS
         }
-        Err(error) => crate::error::emit_error_with_style(
+        Err(error) => crate::error::emit_input_error_with_style(
             &format!("failed to serialize {kind} output: {error}"),
-            2,
             OutputFormat::Json,
             json_style,
         ),
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "the init implementation consumes these parsed fields"
-)]
 pub struct InitArgs {
     pub name: Option<String>,
     pub template: String,
@@ -64,10 +55,6 @@ pub struct InitArgs {
     pub no_config: bool,
 }
 
-#[allow(
-    dead_code,
-    reason = "the test implementation consumes the optional pack path"
-)]
 pub struct TestArgs {
     pub pack: Option<PathBuf>,
 }

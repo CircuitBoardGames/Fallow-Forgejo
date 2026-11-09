@@ -12,11 +12,12 @@ use std::fmt::Write as _;
 use colored::Colorize as _;
 use fallow_api::mutation::split_control_run_failure;
 use fallow_output::{
-    MutantResult, MutantStatus, MutationCompletionStatus, MutationInspectOutput,
-    MutationInspectStatus, MutationKillMatrix, MutationKillMatrixStatus, MutationPlanDisposition,
-    MutationPlanOutput, MutationReport, MutationResumeOutput, MutationScopeKind,
-    MutationScopeOutput, MutationSkippedFile, MutationStaleReason, MutationTestKillRow,
-    MutationTypecheckOutput, TestReachClass,
+    DUPLICATE_TEST_IDS_CODE, MutantResult, MutantStatus, MutationCompletionStatus,
+    MutationInspectOutput, MutationInspectStatus, MutationKillMatrix, MutationKillMatrixStatus,
+    MutationKillMatrixTargetStatus, MutationPlanDisposition, MutationPlanOutput, MutationReport,
+    MutationResumeOutput, MutationScopeKind, MutationScopeOutput, MutationSkippedFile,
+    MutationStaleReason, MutationTargetOnlyKill, MutationTestKillRow, MutationTypecheckOutput,
+    SKIPPED_TESTS_CODE, TestReachClass,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -286,6 +287,9 @@ fn summary_line(report: &MutationReport) -> String {
         if count > 0 {
             let _ = write!(line, "  {label} {count}");
         }
+        if label == "pending" && report.summary.sampled_out > 0 {
+            let _ = write!(line, "  sampled out {}", report.summary.sampled_out);
+        }
     }
     let _ = write!(line, "  {}", completion_text(report));
     line
@@ -353,6 +357,9 @@ fn covered_by_line(tests: &[String]) -> Option<String> {
     })
 }
 
+/// The note under a survivor with an `equivalence_hint`.
+pub const EQUIVALENCE_HINT_TEXT: &str = "hint: the type of the receiver excludes null and undefined. If no runtime value can be nullish, the mutant is equivalent; record it in a verdict file.";
+
 fn render_survivors(out: &mut String, report: &MutationReport, code: Option<&CodeLookup>) {
     let groups = grouped(report, MutantStatus::Survived, MAX_SURVIVORS_SHOWN);
     if groups.is_empty() {
@@ -384,6 +391,9 @@ fn render_survivors(out: &mut String, report: &MutationReport, code: Option<&Cod
             );
             if let Some(line) = covered_by_line(&mutant.covering_tests) {
                 let _ = writeln!(out, "      {}", line.dimmed());
+            }
+            if mutant.equivalence_hint.is_some() {
+                let _ = writeln!(out, "      {}", EQUIVALENCE_HINT_TEXT.dimmed());
             }
         }
     }
@@ -569,16 +579,22 @@ fn render_footer_lines(out: &mut String, report: &MutationReport) {
         }
     }
     for error in &report.errors {
+        // A run with duplicate or skipped test ids still has valid verdicts for the other tests.
+        let label = if error.code == DUPLICATE_TEST_IDS_CODE || error.code == SKIPPED_TESTS_CODE {
+            "Warning"
+        } else {
+            "Error"
+        };
         match &error.mutant_id {
             Some(id) => {
                 let _ = writeln!(
                     footer,
-                    "Error ({}), mutant {id}: {}",
+                    "{label} ({}), mutant {id}: {}",
                     error.code, error.message
                 );
             }
             None => {
-                let _ = writeln!(footer, "Error ({}): {}", error.code, error.message);
+                let _ = writeln!(footer, "{label} ({}): {}", error.code, error.message);
             }
         }
     }
@@ -714,6 +730,14 @@ fn typecheck_line(typecheck: &MutationTypecheckOutput) -> String {
         typecheck.compile_errors,
         plural(typecheck.compile_errors, "does", "do")
     );
+    if typecheck.hinted > 0 {
+        let _ = write!(
+            line,
+            ", {} {} an equivalence hint",
+            typecheck.hinted,
+            plural(typecheck.hinted, "has", "have")
+        );
+    }
     if !typecheck.skipped.is_empty() {
         let reasons: Vec<String> = typecheck
             .skipped
@@ -739,6 +763,7 @@ fn kill_matrix_reason(reason: &str) -> &str {
         "baseline-failure" => "baseline failures excluded tests and left incomplete evidence.",
         "partial-mutation-run" => "the mutation run did not finish.",
         "missing-test-file-metadata" => "the runner did not report the test file of some tests.",
+        "unmatched-target" => "a --kill-matrix-for target selects no test of the run.",
         _ => "complete matrix evidence is unavailable.",
     }
 }
@@ -753,6 +778,9 @@ fn kill_matrix_note(note: &str) -> &str {
         }
         "incomplete-observed-evidence" => "Kill sets use incomplete observed evidence.",
         "static-export-reach-unavailable" => "Static export reach is unavailable.",
+        "subsumers-not-computed" => {
+            "Subsumers are not computed: the other tests stop at the first failure."
+        }
         _ => note,
     }
 }
@@ -802,6 +830,36 @@ fn render_subsuming_tests(out: &mut String, tests: &[String]) {
     }
 }
 
+/// The kills that only other target tests share, each with those targets.
+fn render_target_only_kills(out: &mut String, shared: &[MutationTargetOnlyKill]) {
+    if shared.is_empty() {
+        out.push_str("    Kills shared only with other targets: none\n");
+        return;
+    }
+    out.push_str("    Kills shared only with other targets:\n");
+    for kill in shared.iter().take(MAX_MATRIX_IDS_SHOWN) {
+        let targets: Vec<_> = kill
+            .targets
+            .iter()
+            .map(|target| shorten(target, MAX_TEST_NAME_CHARS))
+            .collect();
+        let _ = writeln!(
+            out,
+            "      {} (also: {})",
+            shorten(&kill.mutant_id, MAX_MATRIX_ID_CHARS),
+            targets.join(", ")
+        );
+    }
+    let hidden = shared.len().saturating_sub(MAX_MATRIX_IDS_SHOWN);
+    if hidden > 0 {
+        let _ = writeln!(
+            out,
+            "    {}",
+            more_line_in(hidden, "mutant", "mutants", "the saved JSON report")
+        );
+    }
+}
+
 fn render_test_kill_rows(out: &mut String, title: &str, rows: &[&MutationTestKillRow]) {
     if rows.is_empty() {
         return;
@@ -820,7 +878,10 @@ fn render_test_kill_rows(out: &mut String, title: &str, rows: &[&MutationTestKil
         );
         render_kill_id_list(out, "Kills", &row.kills, "mutant", "mutants");
         render_kill_id_list(out, "Unique kills", &row.unique_kills, "mutant", "mutants");
-        render_subsuming_tests(out, &row.subsuming_tests);
+        match &row.target_only_kills {
+            Some(shared) => render_target_only_kills(out, shared),
+            None => render_subsuming_tests(out, &row.subsuming_tests),
+        }
         for note in &row.notes {
             let _ = writeln!(out, "    Note: {}", kill_matrix_note(note));
         }
@@ -835,20 +896,61 @@ fn render_test_kill_rows(out: &mut String, title: &str, rows: &[&MutationTestKil
     }
 }
 
-fn render_kill_matrix(out: &mut String, matrix: &MutationKillMatrix) {
-    let status = match matrix.status {
+const fn kill_matrix_status(status: MutationKillMatrixStatus) -> &'static str {
+    match status {
         MutationKillMatrixStatus::Complete => "complete",
         MutationKillMatrixStatus::Incomplete => "incomplete",
         MutationKillMatrixStatus::Unavailable => "unavailable",
-    };
-    let _ = writeln!(out, "\nTest kill evidence: {status}");
+    }
+}
+
+const fn kill_matrix_target_status(status: MutationKillMatrixTargetStatus) -> &'static str {
+    match status {
+        MutationKillMatrixTargetStatus::Complete => "complete",
+        MutationKillMatrixTargetStatus::Incomplete => "incomplete",
+    }
+}
+
+fn render_kill_matrix(out: &mut String, matrix: &MutationKillMatrix) {
+    let _ = writeln!(
+        out,
+        "\nTest kill evidence: {}",
+        kill_matrix_status(matrix.status)
+    );
+    for target in matrix.targets.iter().flatten() {
+        let _ = write!(
+            out,
+            "  Target {}: {} {}, {}",
+            shorten(&target.target, MAX_TEST_NAME_CHARS),
+            target.test_ids.len(),
+            if target.test_ids.len() == 1 {
+                "test"
+            } else {
+                "tests"
+            },
+            kill_matrix_target_status(target.status)
+        );
+        if !target.reasons.is_empty() {
+            let _ = write!(out, " ({})", target.reasons.join(", "));
+        }
+        out.push('\n');
+    }
     for reason in &matrix.reasons {
         let _ = writeln!(out, "  {reason}: {}", kill_matrix_reason(reason));
     }
     if matrix.status == MutationKillMatrixStatus::Unavailable {
         return;
     }
-    if matrix.status == MutationKillMatrixStatus::Incomplete {
+    let complete_target = matrix
+        .targets
+        .iter()
+        .flatten()
+        .any(|target| target.status == MutationKillMatrixTargetStatus::Complete);
+    let incomplete = matrix.status == MutationKillMatrixStatus::Incomplete;
+    if incomplete && complete_target {
+        out.push_str("  Only the tests of complete targets can be candidates.\n");
+    }
+    if incomplete && !complete_target {
         out.push_str("  Candidates are unavailable because the kill matrix is incomplete.\n");
     } else if matrix.candidates.is_empty() {
         out.push_str("  No redundant-test candidates were observed.\n");
@@ -880,9 +982,7 @@ fn render_kill_matrix(out: &mut String, matrix: &MutationKillMatrix) {
                 && !without_kills.contains(row.test_id.as_str())
         })
         .collect();
-    if matrix.status == MutationKillMatrixStatus::Complete {
-        render_test_kill_rows(out, "Redundant-test candidates for review", &candidate_rows);
-    }
+    render_test_kill_rows(out, "Redundant-test candidates for review", &candidate_rows);
     render_test_kill_rows(
         out,
         "Observed coverage without observed kills",
@@ -933,9 +1033,14 @@ pub fn render_plan(plan: &MutationPlanOutput) -> String {
         + counts.pruned_generated
         + counts.pruned_side_effect_sink
         + counts.pruned_framework_config;
+    let sampled = if counts.sampled_out > 0 {
+        format!(" ({} sampled out)", counts.sampled_out)
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
-        "Mutants: {} planned, {} pending, {} no coverage, {pruned} pruned",
+        "Mutants: {} planned, {} pending{sampled}, {} no coverage, {pruned} pruned",
         counts.planned, counts.pending, counts.no_coverage
     );
     let _ = writeln!(

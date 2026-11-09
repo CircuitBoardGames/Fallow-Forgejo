@@ -21,7 +21,7 @@ mod provenance;
 mod rules;
 mod severity;
 
-pub use identity::{security_finding_id, security_rule_id, stamp_security_finding_ids};
+pub use identity::{security_rule_id, stamp_security_finding_ids};
 pub use provenance::{ProvenanceBindings, import_source_matches};
 pub use rules::{
     enable_security_rules, resolve_security_finding_severity, retain_enabled_security_findings,
@@ -30,7 +30,7 @@ pub use rules::{
 pub use severity::{derive_security_severity, security_catalogue_title};
 
 pub const HARDCODED_SECRET_CATEGORY_ID: &str = "hardcoded-secret";
-pub const HARDCODED_SECRET_CATEGORY_TITLE: &str = "Hardcoded secret candidate";
+const HARDCODED_SECRET_CATEGORY_TITLE: &str = "Hardcoded secret candidate";
 
 /// Embedded catalogue source. Because it is `include_str!`-embedded at compile
 /// time, a green `security_catalogue_parses` test guarantees the released
@@ -64,6 +64,11 @@ struct RawSource {
     /// patterns, whose receiver is fixed in the pattern itself.
     #[serde(default)]
     receiver_allowlist: Vec<String>,
+    /// Marks a deployment-secret source (`process.env`). A secret is not
+    /// attacker-controlled input: it backs only the rows that name it in
+    /// `requires_source_kinds`, and it never starts an untrusted-source trace.
+    #[serde(default)]
+    secret: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -137,6 +142,20 @@ struct RawMatcher {
     /// (which the `ssrf` rows already cover).
     #[serde(default)]
     requires_source_kinds: Vec<String>,
+    /// Optional precision gate, looser than `requires_source`: the sink must
+    /// either trace to a source in its argument, or sit in a module that reads
+    /// untrusted input or whose direct importers all read untrusted input.
+    #[serde(default)]
+    requires_module_source: bool,
+    /// Optional source kinds that neither back this row nor satisfy
+    /// `requires_module_source` (for example `process-argv` for a path join:
+    /// the user who runs a CLI owns the file system it reads).
+    #[serde(default)]
+    ignored_source_kinds: Vec<String>,
+    /// Optional: let a deployment-secret source (`secret = true`) back this
+    /// row. Off by default, because a secret is not attacker input.
+    #[serde(default)]
+    secret_sources: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -331,6 +350,16 @@ pub struct Matcher {
     /// (issue #890): the matched source's id must be one of these. Empty admits
     /// any matched source.
     pub requires_source_kinds: Vec<String>,
+    /// Whether this matcher fires only when the sink argument traces to an
+    /// untrusted source, or the sink module or every direct importer reads
+    /// untrusted input.
+    pub requires_module_source: bool,
+    /// Source kinds that neither back this row nor satisfy
+    /// `requires_module_source`.
+    pub ignored_source_kinds: Vec<String>,
+    /// Whether a deployment-secret source can back this row without naming
+    /// its kind in `requires_source_kinds`.
+    pub secret_sources: bool,
     /// String-literal values admitted by this row.
     pub literal_values: Vec<String>,
     /// String fragments admitted by this row.
@@ -360,6 +389,8 @@ pub struct SourceMatcher {
     /// Lowercased receiver allowlist for leading-wildcard patterns (issue
     /// #1092). Empty leaves the row ungated.
     receiver_allowlist: Vec<String>,
+    /// Whether this row names a deployment secret, not attacker input.
+    secret: bool,
 }
 
 impl SourceMatcher {
@@ -614,6 +645,13 @@ impl Catalogue {
             .map(|s| (s.id.as_str(), s.title.as_str()))
     }
 
+    /// Whether the catalogue source id names a deployment secret
+    /// (`process-env`, `import-meta-env`) instead of attacker-controlled input.
+    #[must_use]
+    pub fn is_secret_source(&self, id: &str) -> bool {
+        self.sources.iter().any(|s| s.id == id && s.secret)
+    }
+
     /// The human-readable title for a category id, if any matcher declares it.
     #[must_use]
     fn title_for(&self, id: &str) -> Option<&str> {
@@ -626,7 +664,7 @@ impl Catalogue {
 
 /// The human-readable title for a category id, used by the CLI renderer.
 #[must_use]
-pub fn catalogue_title(id: &str) -> Option<&'static str> {
+fn catalogue_title(id: &str) -> Option<&'static str> {
     catalogue().title_for(id)
 }
 
@@ -808,6 +846,9 @@ fn parse_matcher_entry(entry: RawMatcher) -> Result<Matcher, String> {
         arg_kinds,
         requires_source: entry.requires_source,
         requires_source_kinds: entry.requires_source_kinds,
+        requires_module_source: entry.requires_module_source,
+        ignored_source_kinds: entry.ignored_source_kinds,
+        secret_sources: entry.secret_sources,
         literal_values: entry.literal_values.unwrap_or_default(),
         literal_contains: entry.literal_contains.unwrap_or_default(),
         literal_integers: entry.literal_integers.unwrap_or_default(),
@@ -926,6 +967,7 @@ fn parse_source_catalogue(raw_sources: Vec<RawSource>) -> Result<Vec<SourceMatch
             enabler,
             path_patterns,
             receiver_allowlist,
+            secret: entry.secret,
         });
     }
     Ok(sources)
@@ -981,7 +1023,7 @@ pub fn catalogue() -> &'static Catalogue {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::expect_used,
     clippy::unwrap_used,
     reason = "catalogue parser tests assert fixture invariants directly"
@@ -1351,6 +1393,21 @@ evidence_template = "   "
     }
 
     #[test]
+    fn every_jsx_attr_row_is_followed_through_jsx_spread() {
+        let missing: Vec<&str> = catalogue()
+            .matchers()
+            .iter()
+            .filter(|matcher| matcher.sink_shape == SinkShape::JsxAttr)
+            .flat_map(|matcher| matcher.callee_patterns.iter().map(CalleePattern::raw))
+            .filter(|raw| !fallow_types::security_sinks::JSX_SPREAD_SINK_PROPS.contains(raw))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "add these jsx-attr patterns to JSX_SPREAD_SINK_PROPS: {missing:?}"
+        );
+    }
+
+    #[test]
     fn wildcard_only_pattern_matches_nothing() {
         // Guard against a degenerate `*` pattern matching every callee.
         let star = parse_callee_pattern("*").unwrap();
@@ -1659,6 +1716,29 @@ evidence_template = "x"
         assert!(!is_source(cat, "user.name"));
         assert!(!is_source(cat, "profile.name"));
         assert!(!is_source(cat, "jar.cookie"));
+    }
+
+    #[test]
+    fn message_event_data_needs_a_message_event_receiver() {
+        let cat = catalogue();
+        for path in [
+            "event.data",
+            "e.data",
+            "evt.data",
+            "msg.data",
+            "message.data",
+        ] {
+            assert_eq!(
+                source_for(cat, path, &FxHashSet::default()).map(|(id, _)| id),
+                Some("message-event-data"),
+                "{path}"
+            );
+        }
+        // A `data` field on a parse result, a response or a store is not a
+        // message payload.
+        for path in ["input.data", "result.data", "response.data", "ctx.data"] {
+            assert!(!is_source(cat, path), "{path}");
+        }
     }
 
     #[test]

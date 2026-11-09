@@ -114,13 +114,14 @@ pub use audit_decision_surface::{
 };
 pub use audit_diff_risk::{
     DiffRiskAction, DiffRiskActionType, DiffRiskFinding, DiffRiskLocation, DiffRiskReport,
-    DiffRiskRule, DiffRiskSeverity, WeakenedTestsKind,
+    DiffRiskRule, DiffRiskSeverity, DiffRiskSuppression, WeakenedTestsKind,
 };
 pub use audit_focus::{ConfidenceFlag, FocusLabel, FocusMap, FocusScore, FocusUnit};
 pub use audit_ownership::{OWNER_GROUP_CAP, OwnerGroupFact, OwnershipFacts, OwnershipSliceFact};
 pub use audit_render::{
     AuditDisplayGate, AuditDisplaySeverity, AuditStylingContextLabelInput,
-    styling_audit_context_label, styling_candidate_count,
+    keyframes_unchecked_clause, keyframes_unchecked_suffix, styling_audit_context_label,
+    styling_candidate_count,
 };
 pub use audit_routing::{RoutingFacts, RoutingUnit};
 pub use audit_test_reach::{
@@ -135,8 +136,9 @@ pub use audit_walkthrough::{
 };
 pub use audit_weakening::{WeakeningKind, WeakeningSignal};
 pub use audit_worsened::{
-    AuditFindingAttribution, AuditGateExemption, WorsenedMetric, WorsenedMetricKind,
-    describe_worsened_metrics, format_metric_value,
+    AuditBaseMetrics, AuditFindingAttribution, AuditGateExemption, AuditReviewContext,
+    AuditReviewGate, WorsenedMetric, WorsenedMetricKind, describe_worsened_metrics,
+    format_metric_value,
 };
 pub use baseline_staleness::{
     BaselineMode, BaselineScopeReasons, BaselineStaleness, BaselineStalenessAdvisory, ScopeReason,
@@ -212,6 +214,7 @@ pub use finding_id_query::{FindingIdQuery, FindingIdQueryReason};
 pub use fix::{FixJsonOutput, FixJsonOutputInput, count_applied_fixes, serialize_fix_json_output};
 pub use gate_outcomes::{
     GateFile, GateFileReason, GateName, GateOutcome, GateOutcomes, GateStatus,
+    with_gate_outcome_names,
 };
 pub use health::{
     HEALTH_SCHEMA_VERSION, HealthJsonOutputInput, HealthOutput, HealthOutputInput,
@@ -263,13 +266,13 @@ pub use health_report::{HealthReport, HealthSection};
 pub use health_runtime_coverage::{
     OPTIMIZATION_TARGET_UNMATCHED_WARNING, RUNTIME_STALE_AFTER_DAYS, RuntimeCoverageAction,
     RuntimeCoverageBlastRadiusEntry, RuntimeCoverageCapturePolicy, RuntimeCoverageCaptureQuality,
-    RuntimeCoverageConfidence, RuntimeCoverageCostBasis, RuntimeCoverageDataSource,
-    RuntimeCoverageDiscriminators, RuntimeCoverageEvidence, RuntimeCoverageFinding,
-    RuntimeCoverageHotPath, RuntimeCoverageImportanceEntry, RuntimeCoverageMessage,
-    RuntimeCoverageOptimizationTarget, RuntimeCoverageProvenance, RuntimeCoverageReport,
-    RuntimeCoverageReportVerdict, RuntimeCoverageRiskBand, RuntimeCoverageSchemaVersion,
-    RuntimeCoverageSignal, RuntimeCoverageSummary, RuntimeCoverageVerdict,
-    RuntimeCoverageWatermark,
+    RuntimeCoverageCloudContext, RuntimeCoverageConfidence, RuntimeCoverageCostBasis,
+    RuntimeCoverageDataSource, RuntimeCoverageDiscriminators, RuntimeCoverageEvidence,
+    RuntimeCoverageFinding, RuntimeCoverageHotPath, RuntimeCoverageImportanceEntry,
+    RuntimeCoverageMessage, RuntimeCoverageOptimizationTarget, RuntimeCoverageProvenance,
+    RuntimeCoverageReport, RuntimeCoverageReportVerdict, RuntimeCoverageRiskBand,
+    RuntimeCoverageSchemaVersion, RuntimeCoverageSignal, RuntimeCoverageSummary,
+    RuntimeCoverageVerdict, RuntimeCoverageWatermark,
 };
 pub use health_scores::{
     COGNITIVE_EXTRACTION_THRESHOLD, ClockProvenance, ClockSource, ComplexityViolation,
@@ -305,11 +308,12 @@ pub use impact::{
     serialize_cross_repo_impact_json_output, serialize_impact_json_output,
 };
 pub use inspect_envelopes::{
-    ExplainOutput, InspectCloudErrors, InspectCloudEvidence, InspectCloudFunction,
-    InspectCloudMatch, InspectCloudStatus, InspectCloudSummary, InspectCloudUnpairedFunction,
-    InspectEvidence, InspectEvidenceScope, InspectEvidenceSection, InspectFileIdentity,
-    InspectIdentity, InspectOutput, InspectSectionStatus, InspectSymbolIdentity,
-    InspectTargetDescriptor, serialize_explain_json_output, serialize_inspect_json_output,
+    ExplainOutput, InspectCloudCaller, InspectCloudErrors, InspectCloudEvidence,
+    InspectCloudFunction, InspectCloudMatch, InspectCloudStatus, InspectCloudSummary,
+    InspectCloudUnpairedFunction, InspectEvidence, InspectEvidenceScope, InspectEvidenceSection,
+    InspectFileIdentity, InspectIdentity, InspectOutput, InspectSectionStatus,
+    InspectSymbolIdentity, InspectTargetDescriptor, serialize_explain_json_output,
+    serialize_inspect_json_output,
 };
 pub use issue_contract::{
     ACTIONS_AUTO_FIXABLE_FIELD_DEFINITION, ACTIONS_FIELD_DEFINITION, ARCHITECTURE_DOCS,
@@ -329,21 +333,26 @@ pub use list_envelopes::{
     WorkspacesOutput, serialize_list_boundaries_json_output, serialize_list_workspaces_json_output,
 };
 pub use mutation::{
-    MUTATION_INSPECT_SCHEMA_VERSION, MUTATION_PLAN_SCHEMA_VERSION, MUTATION_SCHEMA_VERSION,
-    MutantAttempt, MutantChange, MutantFailureKind, MutantLocation, MutantResult, MutantStatus,
-    MutantTestReach, MutationBaselineFailure, MutationCacheOutput, MutationCompletion,
-    MutationCompletionStatus, MutationFunctionResult, MutationIncompleteReason,
-    MutationInspectCode, MutationInspectOutput, MutationInspectSchemaVersion,
-    MutationInspectStatus, MutationKillMatrix, MutationKillMatrixStatus, MutationPlanCountsOutput,
-    MutationPlanDisposition, MutationPlanFile, MutationPlanMutant, MutationPlanOutput,
-    MutationPlanSchemaVersion, MutationReport, MutationResumeOutput, MutationRunIssue,
+    DUPLICATE_TEST_IDS_CODE, MUTATION_INSPECT_SCHEMA_VERSION, MUTATION_PLAN_SCHEMA_VERSION,
+    MUTATION_SCHEMA_VERSION, MUTATION_TASKS_SCHEMA_VERSION, MutantAttempt, MutantChange,
+    MutantEquivalenceHint, MutantFailureKind, MutantLocation, MutantResult, MutantStatus,
+    MutantTestReach, MutationBaselineFailure, MutationCacheOutput, MutationCompare,
+    MutationCompareChange, MutationCompareMutant, MutationCompletion, MutationCompletionStatus,
+    MutationFunctionResult, MutationIncompleteReason, MutationInspectCode, MutationInspectOutput,
+    MutationInspectSchemaVersion, MutationInspectStatus, MutationKillMatrix,
+    MutationKillMatrixStatus, MutationKillMatrixTarget, MutationKillMatrixTargetStatus,
+    MutationPlanCountsOutput, MutationPlanDisposition, MutationPlanFile, MutationPlanMutant,
+    MutationPlanOutput, MutationPlanSchemaVersion, MutationRecheck, MutationRecheckMutant,
+    MutationRecheckOutcome, MutationReport, MutationResumeOutput, MutationRunIssue,
     MutationRunnerOutput, MutationRuntimeOutput, MutationSchemaVersion, MutationScopeKind,
     MutationScopeOutput, MutationSkippedFile, MutationStaleReason, MutationStatusCounts,
-    MutationSummary, MutationTestKillRow, MutationTimings, MutationTypecheckOutput,
-    MutationTypecheckSkip, MutationTypecheckSkipReason, MutationVerdict, MutationVerdictInput,
-    MutationVerdictJoin, MutationVerdictKind, MutationVerdictSchemaVersion, MutationWorktreeCheck,
+    MutationSummary, MutationTargetOnlyKill, MutationTask, MutationTasksOutput,
+    MutationTasksSchemaVersion, MutationTasksSummary, MutationTestKillRow, MutationTimings,
+    MutationTypecheckOutput, MutationTypecheckSkip, MutationTypecheckSkipReason, MutationVerdict,
+    MutationVerdictInput, MutationVerdictJoin, MutationVerdictKind, MutationVerdictSchemaVersion,
+    MutationWorktreeCheck, SAMPLED_OUT_REASON, SKIPPED_TESTS_CODE,
     serialize_mutation_inspect_json_output, serialize_mutation_json_output,
-    serialize_mutation_plan_json_output,
+    serialize_mutation_plan_json_output, serialize_mutation_tasks_json_output,
 };
 pub use next_steps::{
     AuditNextStepsInput, BaselineRecheckInput, CombinedNextStepsInput, DeadCodeNextStepsInput,

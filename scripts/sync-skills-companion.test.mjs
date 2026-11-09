@@ -246,6 +246,53 @@ test(
 );
 
 test(
+  "a pin older than the published source lock changes nothing",
+  withFixture((fixture) => {
+    const older = changeSkill(fixture, "two\n", "fix: update the reference (#42)");
+    changeSkill(fixture, "three\n", "docs: reword the reference (#43)");
+    assert.equal(sync(fixture).code, 0);
+    git(fixture.skills, "push", "-q", "origin", "HEAD:main");
+    const before = companionState(fixture.skills);
+
+    const { code, output } = sync(fixture, ["--pin", older]);
+    assert.equal(code, 0, output);
+    assert.match(output, /already publishes a newer commit/u);
+    assert.deepEqual(companionState(fixture.skills), before);
+    assert.equal(readFileSync(join(fixture.skills, PUBLISHED_CLI_REFERENCE), "utf8"), "three\n");
+  }),
+);
+
+test(
+  "refuses a published source lock that the fallow checkout does not have",
+  withFixture((fixture) => {
+    changeSkill(fixture, "two\n", "fix: update the reference (#42)");
+    write(fixture.skills, { "source-lock.json": sourceLock("1".repeat(40)) });
+    commitAll(fixture.skills, "chore: pin an unknown commit");
+    git(fixture.skills, "push", "-q", "origin", "main");
+    const before = companionState(fixture.skills);
+
+    const { code, output } = sync(fixture);
+    assert.equal(code, 1);
+    assert.match(output, /is not in .*fetch/u);
+    assert.deepEqual(companionState(fixture.skills), before);
+  }),
+);
+
+test(
+  "refuses a source lock that is not valid JSON",
+  withFixture((fixture) => {
+    changeSkill(fixture, "two\n", "fix: update the reference (#42)");
+    write(fixture.skills, { "source-lock.json": "{" });
+    commitAll(fixture.skills, "chore: break the lock");
+    git(fixture.skills, "push", "-q", "origin", "main");
+
+    const { code, output } = sync(fixture);
+    assert.equal(code, 1);
+    assert.match(output, /source-lock\.json is not valid JSON/u);
+  }),
+);
+
+test(
   "refuses uncommitted changes under npm/fallow/skills",
   withFixture((fixture) => {
     write(fixture.fallow, { [CLI_REFERENCE]: "edited\n" });
@@ -297,7 +344,13 @@ test(
     assert.equal(git(skills, "rev-parse", "origin/main"), before);
     assert.doesNotMatch(output, /push origin main/u, "the companion main branch is protected");
     assert.match(output, /push origin HEAD:refs\/heads\/docs\/sync-fallow-/u);
-    assert.match(output, /gh pr create/u);
+    // `gh pr create --fill` reads the local branch, and the push above creates
+    // only the remote branch, so the hint gives the title and body itself.
+    assert.doesNotMatch(output, /--fill/u);
+    assert.match(
+      output,
+      /gh pr create .*--title 'docs: sync the Fallow skill from fallow \(#42, #43\)' --body '.+'/u,
+    );
     assert.match(output, /Public skills contract/u);
   }),
 );
@@ -313,6 +366,31 @@ test(
     const lock = JSON.parse(readFileSync(join(fixture.skills, "source-lock.json"), "utf8"));
     assert.equal(lock.commit, pin);
     assert.equal(git(fixture.skills, "log", "-1", "--format=%s"), "docs: custom sync");
+  }),
+);
+
+test(
+  "the printed gh pr create hint survives a shell for any --message",
+  withFixture((fixture) => {
+    changeSkill(fixture, "two\n", "fix: update the reference (#42)");
+    const message = "\n\ndocs: it's $HOME `id`\nsecond line\n\nbody";
+    const { code, output } = sync(fixture, ["--message", message]);
+    assert.equal(code, 0, output);
+    const hint = output.split("\n").find((line) => line.includes("gh pr create"));
+    assert.ok(hint, output);
+    // Parse the hint with a real shell: print each argument after `gh pr create`.
+    const args = execFileSync(
+      "sh",
+      ["-c", `set -- ${hint.replace("gh pr create", "")}; printf '%s\\0' "$@"`],
+      {
+        encoding: "utf8",
+      },
+    ).split("\0");
+    assert.equal(
+      args[args.indexOf("--title") + 1],
+      git(fixture.skills, "log", "-1", "--format=%s"),
+    );
+    assert.equal(args[args.indexOf("--title") + 1], "docs: it's $HOME `id` second line");
   }),
 );
 

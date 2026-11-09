@@ -17,7 +17,7 @@ use fallow_output::{
 };
 use fallow_types::results::ActiveSuppression;
 
-use crate::error::emit_error;
+use crate::error::emit_input_error;
 
 /// Options for the `fallow suppressions` subcommand.
 pub struct SuppressionsOptions<'a> {
@@ -50,14 +50,14 @@ pub fn run_suppressions(opts: &SuppressionsOptions<'_>) -> ExitCode {
     };
     let session = match fallow_engine::session::AnalysisSession::from_resolved_config(config) {
         Ok(session) => session,
-        Err(err) => return emit_error(&format!("Analysis error: {err}"), 2, opts.output),
+        Err(err) => return emit_input_error(&format!("Analysis error: {err}"), opts.output),
     };
     // The dead-code execute path is what populates `active_suppressions` and
     // `stale_suppressions`; presence capture is uniform across all suppression
     // kinds (complexity and code-duplication markers included).
     let results = match session.analyze_dead_code_with_artifacts(false, false) {
         Ok(artifacts) => artifacts.results,
-        Err(err) => return emit_error(&format!("Analysis error: {err}"), 2, opts.output),
+        Err(err) => return emit_input_error(&format!("Analysis error: {err}"), opts.output),
     };
 
     let mut active = results.active_suppressions;
@@ -95,9 +95,8 @@ fn validate_suppressions_output(output: OutputFormat) -> Result<(), ExitCode> {
     if matches!(output, OutputFormat::Human | OutputFormat::Json) {
         Ok(())
     } else {
-        Err(emit_error(
+        Err(emit_input_error(
             "fallow suppressions supports --format human or json only.",
-            2,
             output,
         ))
     }
@@ -315,6 +314,7 @@ fn print_suppressions_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exit_codes::exit_invalid_input;
 
     /// No explicit `--config`; static so the `&Option<PathBuf>` field borrows it.
     const NO_CONFIG: Option<PathBuf> = None;
@@ -367,7 +367,7 @@ mod tests {
         ] {
             assert_eq!(
                 run_suppressions(&suppressions_opts(&root, output)),
-                ExitCode::from(2),
+                exit_invalid_input(),
                 "format {output:?} should be rejected"
             );
         }

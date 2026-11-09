@@ -1,4 +1,3 @@
-#[allow(clippy::wildcard_imports, reason = "many AST helper types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
 use oxc_semantic::ScopeFlags;
@@ -12,7 +11,10 @@ use crate::js_text::JsText;
 
 use super::super::helpers::{extract_type_annotation_name, is_meta_url_arg};
 use super::visit_chain_names::MAX_RECORDED_CHAIN_LINKS;
-use super::{assignment_target_identifier_name, static_member_object_name, unwrap_static_expr};
+use super::{
+    assignment_target_identifier_name, call_receiver_name, static_member_object_name,
+    unwrap_parens, unwrap_static_expr,
+};
 
 pub(super) const PINO_PACKAGE: &str = "pino";
 pub(super) const PINO_FACTORY_EXPORT: &str = "pino";
@@ -138,8 +140,19 @@ impl StructuralParamMemberCollector {
         }
     }
 
-    fn resolve_receiver_path(&self, object: &Expression<'_>) -> Option<(String, String)> {
-        let object_path = static_member_object_name(object)?;
+    /// The tracked parameter and the property path that `object` reads. With
+    /// `allow_call_arguments`, a method call with arguments is a `()` link, as
+    /// in `call_receiver_name`. Use that form only to record a member access.
+    fn resolve_receiver_path(
+        &self,
+        object: &Expression<'_>,
+        allow_call_arguments: bool,
+    ) -> Option<(String, String)> {
+        let object_path = if allow_call_arguments {
+            call_receiver_name(object)?
+        } else {
+            static_member_object_name(object)?
+        };
         let (root, suffix) = object_path
             .split_once('.')
             .map_or((object_path.as_str(), ""), |(root, suffix)| (root, suffix));
@@ -171,7 +184,7 @@ impl StructuralParamMemberCollector {
         let Some(init) = declarator.init.as_ref() else {
             return Vec::new();
         };
-        let Some((param, base_path)) = self.resolve_receiver_path(init) else {
+        let Some((param, base_path)) = self.resolve_receiver_path(init, false) else {
             return Vec::new();
         };
         extract_object_pattern_bindings(pattern)
@@ -190,7 +203,10 @@ impl StructuralParamMemberCollector {
 
 impl<'a> Visit<'a> for StructuralParamMemberCollector {
     fn visit_static_member_expression(&mut self, expr: &StaticMemberExpression<'a>) {
-        if let Some((param, property_path)) = self.resolve_receiver_path(&expr.object) {
+        // `local.rotate(1).translate(1, 1)` reads `translate` on the
+        // `rotate()` path of `local`, as the call without arguments does
+        // (issue #4311).
+        if let Some((param, property_path)) = self.resolve_receiver_path(&expr.object, true) {
             if property_path.is_empty() {
                 self.members
                     .entry(param)
@@ -208,7 +224,7 @@ impl<'a> Visit<'a> for StructuralParamMemberCollector {
 
     fn visit_computed_member_expression(&mut self, expr: &ComputedMemberExpression<'a>) {
         if let Expression::StringLiteral(property) = &expr.expression
-            && let Some((param, property_path)) = self.resolve_receiver_path(&expr.object)
+            && let Some((param, property_path)) = self.resolve_receiver_path(&expr.object, true)
         {
             if property_path.is_empty() {
                 self.members
@@ -731,6 +747,10 @@ pub(super) fn loader_hook_exports_for_source(source: &str) -> Vec<String> {
     }
 }
 
+/// The export that a path loader calls on a module that code names with
+/// `new URL(path, import.meta.url)`.
+pub(super) const NEW_URL_LOADER_EXPORT: &str = "default";
+
 pub(super) fn new_url_import_source(expr: &NewExpression<'_>) -> Option<String> {
     if let Expression::Identifier(callee) = &expr.callee
         && callee.name == "URL"
@@ -845,7 +865,7 @@ pub(super) fn normalize_module_file_relative_path(relative: &str) -> Option<Stri
 }
 
 #[derive(Default)]
-pub(super) struct PlaywrightFixtureMemberCollector {
+struct PlaywrightFixtureMemberCollector {
     fixture_by_local: FxHashMap<String, String>,
     alias_by_local: FxHashMap<String, Vec<String>>,
     shadowed_stack: Vec<FxHashSet<String>>,
@@ -1867,4 +1887,21 @@ mod tests {
         append_unique_paths(&mut target, vec!["y".to_string(), "z".to_string()]);
         assert_eq!(target, vec!["x", "y", "z"]);
     }
+}
+
+pub(super) fn terminal_static_member_name<'a>(expr: &'a Expression<'_>) -> Option<&'a str> {
+    match unwrap_parens(expr) {
+        Expression::StaticMemberExpression(member) => Some(member.property.name.as_str()),
+        _ => None,
+    }
+}
+
+pub(super) fn callee_method_name<'a>(
+    callee: &'a Expression<'_>,
+    callee_path: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(callee_path) = callee_path {
+        return callee_path.rsplit_once('.').map(|(_, method)| method);
+    }
+    terminal_static_member_name(callee)
 }

@@ -134,7 +134,7 @@ fn push_suppressions(parsed: &mut ParsedSuppressions, line: u32, comment_line: u
     clippy::cast_possible_truncation,
     reason = "source length is bounded by file size"
 )]
-pub fn parse_suppressions(comments: &[Comment], source: &str) -> ParsedSuppressions {
+pub(crate) fn parse_suppressions(comments: &[Comment], source: &str) -> ParsedSuppressions {
     let mut parsed = ParsedSuppressions::default();
 
     for comment in comments {
@@ -533,6 +533,8 @@ mod tests {
             ("unresolved-import", IssueKind::UnresolvedImport),
             ("unlisted-dependency", IssueKind::UnlistedDependency),
             ("duplicate-export", IssueKind::DuplicateExport),
+            ("duplicate-export-alias", IssueKind::DuplicateExportAlias),
+            ("duplicate-export-aliases", IssueKind::DuplicateExportAlias),
             ("code-duplication", IssueKind::CodeDuplication),
             ("circular-dependency", IssueKind::CircularDependency),
             ("circular-dependencies", IssueKind::CircularDependency),
@@ -659,5 +661,17 @@ mod tests {
         assert!(parsed.suppressions.is_empty());
         assert_eq!(parsed.unknown_kinds.len(), 1);
         assert_eq!(parsed.unknown_kinds[0].token, "nonexistent-kind");
+    }
+
+    #[test]
+    fn duplicate_export_token_does_not_suppress_alias_kind() {
+        let source = "// fallow-ignore-next-line duplicate-export\nexport default a;\n";
+        let suppressions = parse_suppressions_from_source(source).suppressions;
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].issue_kind_target(),
+            Some(IssueKind::DuplicateExport)
+        );
+        assert!(!suppressions[0].matches_issue_kind(2, IssueKind::DuplicateExportAlias));
     }
 }

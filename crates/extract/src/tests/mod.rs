@@ -42,7 +42,7 @@ pub fn parse_at_path(path: &str, source: &str) -> ModuleInfo {
 }
 
 /// The sources of the dynamic imports that extraction marks as eager.
-pub fn eager_dynamic_import_sources(info: &ModuleInfo) -> Vec<&str> {
+fn eager_dynamic_import_sources(info: &ModuleInfo) -> Vec<&str> {
     let eager_starts: Vec<u32> = info
         .semantic_facts
         .iter()
@@ -315,6 +315,47 @@ fn bom_stripped_before_line_offsets_so_line_numbers_align() {
         plain_pos.0, 1,
         "the first export sits on line 1 in both views",
     );
+}
+
+/// The span of `a0` in `\u{feff}\u{feff}export const a0 = 1;`, as an
+/// offset into the source without the byte order mark. Only the first
+/// U+FEFF is the mark. The second U+FEFF is text, so `a0` starts at byte 16.
+fn a0_span(info: &ModuleInfo) -> (u32, u32) {
+    let export = info
+        .exports
+        .iter()
+        .find(|e| e.name.matches_str("a0"))
+        .expect("the source exports `a0`");
+    (export.span.start, export.span.end)
+}
+
+const TWO_LEADING_FEFF: &str = "\u{feff}\u{feff}export const a0 = 1;";
+
+#[test]
+fn second_leading_feff_is_source_text_for_in_memory_parse() {
+    let after_mark = &TWO_LEADING_FEFF['\u{feff}'.len_utf8()..];
+    assert_eq!(&after_mark[16..18], "a0");
+    let content = crate::parse_from_content(FileId(0), Path::new("module.ts"), TWO_LEADING_FEFF);
+    assert_eq!(a0_span(&content), (16, 18));
+    assert_eq!(a0_span(&parse_ts(TWO_LEADING_FEFF)), (16, 18));
+}
+
+#[test]
+fn second_leading_feff_is_source_text_for_file_parse() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let path = dir.path().join("module.ts");
+    std::fs::write(&path, TWO_LEADING_FEFF).expect("write source");
+    let file = fallow_types::discover::DiscoveredFile {
+        id: FileId(0),
+        path,
+        size_bytes: TWO_LEADING_FEFF.len() as u64,
+    };
+
+    let single = crate::parse_single_file(&file).expect("parse the file");
+    let all = crate::parse_all_files(std::slice::from_ref(&file), None, false);
+
+    assert_eq!(a0_span(&single), (16, 18));
+    assert_eq!(a0_span(&all.modules[0]), (16, 18));
 }
 
 #[test]

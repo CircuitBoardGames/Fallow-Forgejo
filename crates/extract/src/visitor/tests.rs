@@ -1125,8 +1125,30 @@ fn security_unresolved_callee_records_dynamic_dispatch() {
 }
 
 #[test]
+fn security_member_assignment_object_keeps_call_and_this_roots() {
+    let info = parse(
+        "getElement().innerHTML = a;\nthis.shadowRoot!.innerHTML = b;\n(el as HTMLElement).outerHTML = c;",
+    );
+
+    assert_eq!(info.security_sinks_skipped, 0);
+    let paths: Vec<&str> = info
+        .security_sinks
+        .iter()
+        .map(|sink| sink.callee_path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "getElement().innerHTML",
+            "this.shadowRoot.innerHTML",
+            "el.outerHTML"
+        ]
+    );
+}
+
+#[test]
 fn security_unresolved_callee_records_member_assignment_object() {
-    let info = parse("getElement().innerHTML = req.body.name;");
+    let info = parse("(primary || fallback).innerHTML = req.body.name;");
 
     assert_eq!(info.security_sinks_skipped, 1);
     let diagnostic = info
@@ -1599,6 +1621,29 @@ fn security_sink_arg_idents_recurse_into_array_nested_object() {
         "array-nested object property identifier must surface, got: {:?}",
         sink.arg_idents
     );
+}
+
+#[test]
+fn security_sink_arg_idents_include_computed_keys_and_spreads() {
+    let info = parse(
+        "const name = req.query.name; const extra = req.body; \
+         res.writeHead(302, { [name]: \"x\", ...extra, plain: \"y\" });",
+    );
+    let sink = info
+        .security_sinks
+        .iter()
+        .find(|sink| sink.callee_path == "res.writeHead")
+        .expect("writeHead sink captured");
+
+    for ident in ["name", "extra"] {
+        assert!(
+            sink.arg_idents.iter().any(|n| n == ident),
+            "{ident} must surface, got: {:?}",
+            sink.arg_idents
+        );
+    }
+    // A static key is a property name, not a data reference.
+    assert!(!sink.arg_idents.iter().any(|n| n == "plain"));
 }
 
 #[test]
@@ -7841,7 +7886,8 @@ fn namespace_nested_inside_declare_global_is_local() {
 #[test]
 fn exported_namespace_member_extraction_is_unchanged() {
     // Pin: an exported namespace still records one file export carrying its
-    // inner exported declarations as members (flattened through nesting).
+    // inner exported declarations as members. A member of a nested namespace
+    // has the dotted path from the root.
     let info = parse(
         "export namespace Foo {\n\
            export const x = 1;\n\
@@ -7856,7 +7902,7 @@ fn exported_namespace_member_extraction_is_unchanged() {
         .iter()
         .map(|m| m.name.as_str())
         .collect();
-    assert_eq!(members, ["x", "Bar", "y"]);
+    assert_eq!(members, ["x", "Bar", "Bar.y"]);
     assert!(
         info.exports[0]
             .members
@@ -9953,8 +9999,9 @@ fn this_member_return_type_credits_member_access() {
 fn local_holding_this_method_result_credits_return_type_member() {
     // Issue #4033: `const old = this.current(); old?.deactivate?.();` credits
     // `Tool.deactivate`, as the direct `this.current()?.deactivate?.()` does.
-    // The method can come after the call site. A cast, a call with arguments,
-    // a call in a plain `function` and a method-generic return give no credit.
+    // The method can come after the call site. A call with arguments credits
+    // the return type too (issue #4199). A cast, a call in a plain `function`
+    // and a method-generic return give no credit.
     let info = parse(
         r"
         import type { Tool } from './tool';
@@ -9993,13 +10040,407 @@ fn local_holding_this_method_result_credits_return_type_member() {
     };
     assert!(has("Tool", "deactivate"), "{:?}", info.member_accesses);
     assert!(has("Brush", "stroke"), "{:?}", info.member_accesses);
-    for member in ["castOnly", "argsOnly", "genericOnly", "innerOnly"] {
+    assert!(has("Tool", "argsOnly"), "{:?}", info.member_accesses);
+    for member in ["castOnly", "genericOnly", "innerOnly"] {
         assert!(
             !has("Tool", member) && !has("Other", member),
             "{member}: {:?}",
             info.member_accesses
         );
     }
+}
+
+#[test]
+fn local_holding_inherited_this_method_result_records_call_receiver() {
+    // Issue #4183: `const table = this.find(); table?.setVip();` in a class
+    // that inherits `find()` records `setVip` on `this.find()`, so the
+    // analysis resolves it through the return type of the base class. A local
+    // that a later declarator rebinds, and a local of a plain `function`,
+    // record nothing on the call.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+
+        export class Viewer extends Floor {
+            mark(): void {
+                const table = this.find();
+                table?.setVip();
+                table.seat.reserve();
+                const run = function (this: unknown) {
+                    const inner = this.find();
+                    inner.innerOnly();
+                };
+            }
+            other(): void {
+                table.otherMethodOnly();
+            }
+        }
+        ",
+    );
+
+    let has_fact = |object: &str, member: &str| {
+        info.semantic_facts.iter().any(|fact| {
+            matches!(
+                fact,
+                SemanticFact::ClassThisMemberAccess(access)
+                    if access.class_local_name == "Viewer"
+                        && access.object == object
+                        && access.member == member
+            )
+        })
+    };
+    assert!(
+        has_fact("this.find()", "setVip"),
+        "{:?}",
+        info.semantic_facts
+    );
+    assert!(
+        has_fact("this.find().seat", "reserve"),
+        "{:?}",
+        info.semantic_facts
+    );
+    for member in ["innerOnly", "otherMethodOnly"] {
+        assert!(
+            !info.member_accesses.iter().any(|access| {
+                access.object.starts_with("this.find()") && access.member == member
+            }),
+            "{member}: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn nested_binding_hides_local_holding_inherited_this_method_result() {
+    // Issue #4198: a parameter, a loop head, a `catch` parameter or a block
+    // declaration with the name of a local that holds an inherited
+    // `this.find()` result is a different value. A read through it records
+    // nothing on the call. After the nested scope ends, a read through the
+    // outer local records the call receiver again.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+
+        export class Viewer extends Floor {
+            mark(other: Array<{ reset(): void }>): void {
+                const table = this.find();
+                table?.setVip();
+                other.forEach((table) => table.paramOnly());
+                for (const table of other) {
+                    table.ofOnly();
+                }
+                for (const table in other) {
+                    table.inOnly();
+                }
+                try {
+                    other.length;
+                } catch (table) {
+                    table.catchOnly();
+                }
+                {
+                    const table = other[0];
+                    table.blockOnly();
+                }
+                table.afterBlock();
+                {
+                    const table = this.find();
+                    table.innerResult();
+                }
+                table.afterInnerResult();
+            }
+        }
+        ",
+    );
+
+    let has_fact = |member: &str| {
+        info.semantic_facts.iter().any(|fact| {
+            matches!(
+                fact,
+                SemanticFact::ClassThisMemberAccess(access)
+                    if access.class_local_name == "Viewer"
+                        && access.object == "this.find()"
+                        && access.member == member
+            )
+        })
+    };
+    assert!(has_fact("setVip"), "{:?}", info.semantic_facts);
+    for member in ["afterBlock", "innerResult", "afterInnerResult"] {
+        assert!(has_fact(member), "{member}: {:?}", info.semantic_facts);
+    }
+    for member in ["paramOnly", "ofOnly", "inOnly", "catchOnly", "blockOnly"] {
+        assert!(
+            !info.member_accesses.iter().any(|access| {
+                access.object.starts_with("this.find()") && access.member == member
+            }),
+            "{member}: {:?}",
+            info.member_accesses
+        );
+        assert!(!has_fact(member), "{member}: {:?}", info.semantic_facts);
+    }
+}
+
+#[test]
+fn nested_binding_hides_local_holding_own_this_method_result() {
+    // Issue #4198: the same scope rule applies when the class itself declares
+    // `find(): Table | undefined`. A nested binding with the name of the
+    // local gives no credit to `Table`, and the outer local gives credit again
+    // after the nested scope ends.
+    let info = parse(
+        r"
+        import type { Table } from './table';
+
+        export class Viewer {
+            mark(other: Array<{ reset(): void }>): void {
+                const table = this.find();
+                table?.setVip();
+                other.forEach((table) => table.paramOnly());
+                for (const table of other) {
+                    table.ofOnly();
+                }
+                for (const table in other) {
+                    table.inOnly();
+                }
+                try {
+                    other.length;
+                } catch (table) {
+                    table.catchOnly();
+                }
+                {
+                    const table = other[0];
+                    table.blockOnly();
+                }
+                table.afterBlock();
+            }
+            private find(): Table | undefined { return undefined; }
+        }
+        ",
+    );
+
+    let has = |member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Table" && access.member == member)
+    };
+    assert!(has("setVip"), "{:?}", info.member_accesses);
+    assert!(has("afterBlock"), "{:?}", info.member_accesses);
+    for member in ["paramOnly", "ofOnly", "inOnly", "catchOnly", "blockOnly"] {
+        assert!(!has(member), "{member}: {:?}", info.member_accesses);
+    }
+}
+
+#[test]
+fn nested_class_binding_keeps_its_own_class_over_this_method_result() {
+    // Issue #4198: a loop head that binds the name of a `this` result local
+    // to an element class credits that class inside the loop. The outer local
+    // gives no credit there.
+    let info = parse(
+        r"
+        import type { Table } from './table';
+        import type { RectTable } from './rect-table';
+
+        export class Viewer {
+            mark(rects: RectTable[]): void {
+                const table = this.find();
+                for (const table of rects) {
+                    table.rectOnly();
+                }
+                table.afterLoop();
+            }
+            private find(): Table | undefined { return undefined; }
+        }
+        ",
+    );
+
+    let has = |object: &str, member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == object && access.member == member)
+    };
+    assert!(has("RectTable", "rectOnly"), "{:?}", info.member_accesses);
+    assert!(!has("Table", "rectOnly"), "{:?}", info.member_accesses);
+}
+
+#[test]
+fn narrowed_shadow_of_inherited_this_method_result_credits_its_class() {
+    // Issue #4198: an `instanceof` guard on a parameter with the name of a
+    // local that holds an inherited `this.find()` result binds the parameter
+    // to the guard class. The read credits that class and not the call.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+        import { Chair } from './chair';
+
+        export class Viewer extends Floor {
+            mark(xs: unknown[]): void {
+                const table = this.find();
+                table.setVip();
+                xs.forEach((table) => {
+                    if (table instanceof Chair) {
+                        table.narrowed();
+                    }
+                });
+            }
+        }
+        ",
+    );
+
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Chair" && access.member == "narrowed"),
+        "{:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object.starts_with("this.find()") && access.member == "narrowed"),
+        "{:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn class_shadow_of_inherited_this_method_result_gives_no_call_credit() {
+    // Issue #4198: a loop head that binds the name of a local with an
+    // inherited `this.find()` result to an element class holds an element.
+    // A read through it records nothing on the call.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+        import type { Chair } from './chair';
+
+        export class Viewer extends Floor {
+            mark(chairs: Chair[]): void {
+                const table = this.find();
+                table.setVip();
+                for (const table of chairs) {
+                    table.rectOnly();
+                }
+                table.afterLoop();
+            }
+        }
+        ",
+    );
+
+    let on_call = |member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object.starts_with("this.find()") && access.member == member)
+    };
+    assert!(on_call("setVip"), "{:?}", info.member_accesses);
+    assert!(on_call("afterLoop"), "{:?}", info.member_accesses);
+    assert!(!on_call("rectOnly"), "{:?}", info.member_accesses);
+}
+
+#[test]
+fn narrowed_and_factory_shadows_of_own_this_method_result_keep_credit() {
+    // Issue #4198: an `instanceof` guard on a shadowing parameter and a block
+    // local from a same-file factory bind the name to a class of their own.
+    // A read through them credits that class.
+    let info = parse(
+        r"
+        import { Seat } from './seat';
+
+        const makeSeat = () => new Seat();
+
+        export class Usher {
+            guide(xs: unknown[]): void {
+                const seat = this.current();
+                seat.claim();
+                xs.forEach((seat) => {
+                    if (seat instanceof Seat) seat.narrowed();
+                });
+                {
+                    const seat = makeSeat();
+                    seat.factoryLocal();
+                }
+            }
+            private current(): Seat { return new Seat(); }
+        }
+        ",
+    );
+
+    let has = |member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Seat" && access.member == member)
+    };
+    for member in ["claim", "narrowed", "factoryLocal"] {
+        assert!(has(member), "{member}: {:?}", info.member_accesses);
+    }
+}
+
+#[test]
+fn narrowed_inherited_this_method_result_local_credits_guard_class() {
+    // An `instanceof` guard on the local that holds an inherited
+    // `this.find()` result credits the guard class inside the guard.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+        import { Chair } from './chair';
+
+        export class Viewer extends Floor {
+            mark(): void {
+                const table = this.find();
+                if (table instanceof Chair) {
+                    table.narrowed();
+                }
+            }
+        }
+        ",
+    );
+
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Chair" && access.member == "narrowed"),
+        "{:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn chained_method_call_with_arguments_records_call_receiver() {
+    // Issue #4184: `local.rotate(1).translate(1, 1)` records `translate` on
+    // `local.rotate()`, as `local.rotate().translate()` does. A bare call with
+    // arguments (`make(1).paint()`) gives no call receiver.
+    let info = parse(
+        r"
+        import { Point } from './point';
+        import { make } from './make';
+
+        const local = new Point(0, 0);
+        local.rotate(1).translate(1, 1);
+        local.rotate(1).translate(2, 2).scale(3);
+        make(1).paint();
+        ",
+    );
+
+    let has = |object: &str, member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == object && access.member == member)
+    };
+    assert!(
+        has("local.rotate()", "translate"),
+        "{:?}",
+        info.member_accesses
+    );
+    assert!(
+        has("local.rotate().translate()", "scale"),
+        "{:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "make()"),
+        "{:?}",
+        info.member_accesses
+    );
 }
 
 #[test]
@@ -10711,6 +11152,70 @@ fn new_url_import_meta_url_tracked() {
         info.dynamic_imports
             .iter()
             .any(|d| d.source == "./worker.js")
+    );
+}
+
+fn new_url_destructured_names(source: &str, specifier: &str) -> Vec<String> {
+    let info = parse(source);
+    info.dynamic_imports
+        .iter()
+        .find(|d| d.source == specifier)
+        .map(|d| d.destructured_names.clone())
+        .expect("new URL edge")
+}
+
+#[test]
+fn new_url_module_path_credits_default_export() {
+    assert_eq!(
+        new_url_destructured_names(
+            "export const sign = new URL('./lib/sign.ts', import.meta.url);",
+            "./lib/sign.ts",
+        ),
+        ["default"]
+    );
+}
+
+#[test]
+fn new_url_worker_argument_credits_no_export() {
+    for source in [
+        "new Worker(new URL('./worker.ts', import.meta.url));",
+        "new SharedWorker(new URL('./worker.ts', import.meta.url));",
+        "new Worker((new URL('./worker.ts', import.meta.url)));",
+        "new Worker(new URL('./worker.ts', import.meta.url) as URL);",
+    ] {
+        assert!(
+            new_url_destructured_names(source, "./worker.ts").is_empty(),
+            "a worker runs the module as a script: {source}"
+        );
+    }
+}
+
+#[test]
+fn new_url_directory_credits_no_export() {
+    assert!(
+        new_url_destructured_names("new URL('./services', import.meta.url);", "./services")
+            .is_empty()
+    );
+}
+
+#[test]
+fn new_url_registered_loader_credits_only_hooks() {
+    let info = parse(
+        "import { register } from 'node:module';\n\
+         const hooks = new URL('./hooks.ts', import.meta.url);\n\
+         register(hooks);",
+    );
+    let names: Vec<&[String]> = info
+        .dynamic_imports
+        .iter()
+        .filter(|d| d.source == "./hooks.ts")
+        .map(|d| d.destructured_names.as_slice())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .all(|names| !names.contains(&"default".to_string())),
+        "a registered loader edge credits only hook exports: {names:?}"
     );
 }
 
@@ -13008,7 +13513,7 @@ fn security_sink_arg_via_conditional_expression_collects_source_paths() {
     let sink = info
         .security_sinks
         .iter()
-        .find(|s| s.callee_path == "execSync");
+        .find(|s| s.callee_path == "node:child_process.execSync");
     assert!(
         sink.is_some(),
         "execSync with conditional arg should be captured: {:#?}",
@@ -13033,7 +13538,10 @@ fn security_sink_arg_via_await_expression_collects_source_paths() {
         }
         ",
     );
-    let sink = info.security_sinks.iter().find(|s| s.callee_path == "exec");
+    let sink = info
+        .security_sinks
+        .iter()
+        .find(|s| s.callee_path == "node:child_process.exec");
     assert!(
         sink.is_some(),
         "exec with await-wrapped arg should be captured: {:#?}",
@@ -13056,7 +13564,7 @@ fn security_sink_arg_via_unary_expression_collects_source_paths() {
     let sink = info
         .security_sinks
         .iter()
-        .find(|s| s.callee_path == "execSync");
+        .find(|s| s.callee_path == "node:child_process.execSync");
     assert!(
         sink.is_some(),
         "execSync with source-backed arg should be captured"
@@ -13082,7 +13590,7 @@ fn security_sink_ident_collected_through_template_literal_expression() {
     let sink = info
         .security_sinks
         .iter()
-        .find(|s| s.callee_path == "execSync");
+        .find(|s| s.callee_path == "node:child_process.execSync");
     assert!(
         sink.is_some(),
         "execSync with template-literal arg should be captured"
@@ -17285,4 +17793,518 @@ fn constructor_alternatives_preserve_jsx_receiver_spelling() {
                 .any(|access| access.object == "Widgets" && access.member == "dead")
         );
     }
+}
+
+#[test]
+fn unexported_local_base_class_folds_into_exported_subclass_heritage() {
+    // Issue #4199: the analysis finds a base class through its export key.
+    // A base class that the file does not export folds into the heritage of
+    // the exported subclass, at any depth: the subclass takes the bindings of
+    // the base, and the binding walk continues at the base's own `extends`
+    // target. The declared `super_class` stays for the scoped rules and the
+    // framework base checks. A generic base and an exported base stay as they
+    // are.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+        import type { Table } from './table';
+        import type { Seat } from './seat';
+
+        class Base {
+            protected find(): Table | undefined { return undefined; }
+            protected seat(): Seat | undefined { return undefined; }
+        }
+        class Mid extends Base {}
+        export class Deep extends Mid {
+            protected seat(): Table | undefined { return undefined; }
+        }
+
+        class Bridge extends Floor {}
+        export class Chained extends Bridge {}
+
+        class Generic<T> { protected item(): T | undefined { return undefined; } }
+        export class Typed extends Generic<Table> {}
+
+        export class Shared {}
+        export class Child extends Shared {}
+        ",
+    );
+
+    let heritage = |name: &str| {
+        info.class_heritage
+            .iter()
+            .find(|heritage| heritage.export_name == name)
+            .unwrap_or_else(|| panic!("{name}: {:?}", info.class_heritage))
+    };
+    let binding = |name: &str, field: &str| {
+        heritage(name)
+            .instance_bindings
+            .iter()
+            .find(|(existing, _)| existing == field)
+            .map(|(_, type_name)| type_name.clone())
+    };
+
+    assert_eq!(heritage("Deep").super_class.as_deref(), Some("Mid"));
+    assert_eq!(heritage("Deep").binding_super_class, None);
+    assert_eq!(binding("Deep", "find()").as_deref(), Some("Table"));
+    assert_eq!(binding("Deep", "seat()").as_deref(), Some("Table"));
+    assert_eq!(heritage("Chained").super_class.as_deref(), Some("Bridge"));
+    assert_eq!(
+        heritage("Chained").binding_super_class,
+        Some(("Floor".to_string(), Vec::new()))
+    );
+    assert_eq!(heritage("Typed").super_class.as_deref(), Some("Generic"));
+    assert_eq!(heritage("Typed").binding_super_class, None);
+    assert_eq!(heritage("Child").super_class.as_deref(), Some("Shared"));
+    assert_eq!(heritage("Child").binding_super_class, None);
+}
+
+#[test]
+fn typed_parameter_chain_with_arguments_records_return_type_path() {
+    // Issue #4311: `local.rotate(1).translate(1, 1)` on a parameter typed
+    // `Point` records `translate` on the `rotate()` path of `Point`, as the
+    // call without arguments does.
+    let info = parse(
+        r"
+        import type { Point } from './point';
+
+        export function toWorld(local: Point): Point {
+            return local.rotate(1).translate(1, 1);
+        }
+        ",
+    );
+
+    assert!(
+        info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::TypedPropertyMemberAccess(access)
+                if access.type_name == "Point"
+                    && access.property_path == "rotate()"
+                    && access.member == "translate"
+        )),
+        "{:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn unexported_subclass_this_method_result_records_base_access() {
+    // Issue #4312: `this.find()?.setVip()` in an unexported subclass records
+    // `setVip` on `Floor.find()`, so the analysis resolves it through the
+    // return type of the base class. A subclass that declares `find()`
+    // itself records nothing on the base.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+
+        class Viewer extends Floor {
+            mark(): void {
+                this.find()?.setVip();
+            }
+        }
+
+        class Owner extends Floor {
+            find() {
+                return undefined;
+            }
+            mark(): void {
+                this.find()?.ownOnly();
+            }
+        }
+
+        new Viewer().mark();
+        new Owner().mark();
+        ",
+    );
+
+    let has = |object: &str, member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == object && access.member == member)
+    };
+    assert!(has("Floor.find()", "setVip"), "{:?}", info.member_accesses);
+    assert!(
+        !has("Floor.find()", "ownOnly"),
+        "{:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn local_function_array_return_binds_element_class() {
+    // Issue #4313: an element of the array that `all(): Table[]` returns is
+    // a `Table`, in a `for...of` loop, an iteration callback, an index, and
+    // through a local that holds the result. A string key reads a property
+    // of the array, and a nested declaration of `all` hides the function.
+    let info = parse(
+        r"
+        import { Table } from './table';
+
+        function all(): Table[] {
+            return [new Table()];
+        }
+
+        for (const table of all()) {
+            table.loop();
+        }
+        all().forEach((table) => table.callback());
+        all()[0].index();
+        const tables = all();
+        for (const table of tables) {
+            table.local();
+        }
+        all()['length'].stringKey();
+        function shadow() {
+            const all = () => [];
+            for (const item of all()) {
+                item.shadowed();
+            }
+        }
+        ",
+    );
+
+    let has = |member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Table" && access.member == member)
+    };
+    for member in ["loop", "callback", "index", "local"] {
+        assert!(has(member), "{member}: {:?}", info.member_accesses);
+    }
+    for member in ["stringKey", "shadowed"] {
+        assert!(!has(member), "{member}: {:?}", info.member_accesses);
+    }
+}
+
+/// Whether `info` credits `member` on `Table`.
+fn credits_table_member(info: &ModuleInfo, member: &str) -> bool {
+    info.member_accesses
+        .iter()
+        .any(|access| access.object == "Table" && access.member == member)
+}
+
+#[test]
+fn catch_parameter_hides_local_function_array_return() {
+    // Issue #4313: a catch parameter with the name of the function holds
+    // another value, so a call of it does not read the element class of the
+    // top-level `all(): Table[]`.
+    let info = parse(
+        r"
+        import { Table } from './table';
+
+        export function all(): Table[] {
+            return [new Table()];
+        }
+
+        export function run() {
+            try {
+            } catch (all: any) {
+                all()[0].caught();
+                for (const item of all()) {
+                    item.caughtLoop();
+                }
+            }
+        }
+        ",
+    );
+
+    for member in ["caught", "caughtLoop"] {
+        assert!(
+            !credits_table_member(&info, member),
+            "{member}: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn namespace_body_hides_local_function_array_return() {
+    // Issue #4313: a call in a namespace body can name a function of the
+    // namespace, so it does not read the element class of the top-level
+    // `all(): Table[]`. This holds for an exported namespace, a namespace
+    // without `export`, an exported namespace inside one without `export`,
+    // a dotted namespace name, and a `module` declaration.
+    let info = parse(
+        r"
+        import { Table } from './table';
+
+        export function all(): Table[] {
+            return [new Table()];
+        }
+
+        export namespace Other {
+            function all(): { inner(): void }[] {
+                return [];
+            }
+            export const run = () => {
+                for (const item of all()) {
+                    item.namespaced();
+                }
+                all()[0].namespacedIndex();
+            };
+        }
+
+        namespace Local {
+            function all(): { inner(): void }[] {
+                return [];
+            }
+            all()[0].localIndex();
+            for (const item of all()) {
+                item.localLoop();
+            }
+        }
+
+        namespace Outer {
+            export namespace Inner {
+                function all(): { inner(): void }[] {
+                    return [];
+                }
+                all()[0].nestedIndex();
+            }
+        }
+
+        namespace Dotted.Name {
+            function all(): { inner(): void }[] {
+                return [];
+            }
+            all()[0].dottedIndex();
+        }
+
+        module Legacy {
+            function all(): { inner(): void }[] {
+                return [];
+            }
+            all()[0].legacyIndex();
+        }
+        ",
+    );
+
+    for member in [
+        "namespaced",
+        "namespacedIndex",
+        "localIndex",
+        "localLoop",
+        "nestedIndex",
+        "dottedIndex",
+        "legacyIndex",
+    ] {
+        assert!(
+            !credits_table_member(&info, member),
+            "{member}: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn for_of_element_class_applies_only_in_the_loop_body() {
+    // Issue #4352: the element class of a `for...of` loop variable applies
+    // only in the loop body, for a loop over an array and over a call. A
+    // binding of the same name in another scope has another type.
+    let info = parse(
+        r"
+        import { Table } from './table';
+
+        const tables: Table[] = [new Table()];
+        function all(): Table[] {
+            return tables;
+        }
+        for (const t of tables) {
+            t.inArrayLoop();
+        }
+        for (const u of all()) {
+            u.inCallLoop();
+        }
+        export function g(t: { other(): void }) {
+            t.paramOfArrayLoopName();
+        }
+        export function h(u: { other(): void }) {
+            u.paramOfCallLoopName();
+        }
+        const t = { local() {} };
+        t.moduleLocal();
+        ",
+    );
+
+    for member in ["inArrayLoop", "inCallLoop"] {
+        assert!(
+            credits_table_member(&info, member),
+            "{member}: {:?}",
+            info.member_accesses
+        );
+    }
+    for member in ["paramOfArrayLoopName", "paramOfCallLoopName", "moduleLocal"] {
+        assert!(
+            !credits_table_member(&info, member),
+            "{member}: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn this_in_function_with_own_this_gives_no_class_this_fact() {
+    // Issue #4351: `this` in a nested `function` or an object-literal method
+    // inside a class method is not the class instance, so a read there gives
+    // no class `this` fact. An arrow function keeps the `this` of the method.
+    // A class declared inside such a function has its own instance `this`.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+
+        export class Viewer extends Floor {
+            mark(): void {
+                function g(this: unknown) {
+                    this.find().inFunction();
+                }
+                const handlers = {
+                    run() {
+                        this.find().inObjectMethod();
+                    },
+                };
+                const visit = () => this.find().inArrow();
+                this.find().inMethod();
+            }
+        }
+
+        export function make() {
+            return function () {
+                class Local extends Floor {
+                    field = this.find().inNestedClassField();
+                }
+                return Local;
+            };
+        }
+        ",
+    );
+
+    let has_fact = |class: &str, member: &str| {
+        info.semantic_facts.iter().any(|fact| {
+            matches!(
+                fact,
+                SemanticFact::ClassThisMemberAccess(access)
+                    if access.class_local_name == class
+                        && access.object == "this.find()"
+                        && access.member == member
+            )
+        })
+    };
+    for member in ["inArrow", "inMethod"] {
+        assert!(
+            has_fact("Viewer", member),
+            "{member}: {:?}",
+            info.semantic_facts
+        );
+    }
+    assert!(
+        has_fact("Local", "inNestedClassField"),
+        "{:?}",
+        info.semantic_facts
+    );
+    for member in ["inFunction", "inObjectMethod"] {
+        assert!(
+            !has_fact("Viewer", member),
+            "{member}: {:?}",
+            info.semantic_facts
+        );
+        assert!(
+            !info
+                .member_accesses
+                .iter()
+                .any(|access| access.object.starts_with("Floor.") && access.member == member),
+            "{member}: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn this_read_in_function_with_own_this_gives_no_this_member_access() {
+    // Issue #4351: a bare `this.<member>` read in a nested `function` or an
+    // object-literal method inside a class method is not a read on the class
+    // instance. A function that the code gives the instance keeps the `this`
+    // of the method: `.bind(this)`, `.call(this)` or `.apply(this)` on the
+    // function or its name, a call that also passes `this`, an assignment to a
+    // `this.<field>` or a class field, and a `this` parameter with a named
+    // type. This holds for the bare read and for the class `this` fact of a
+    // chain.
+    let info = parse(
+        r"
+        import { Floor } from './floor';
+
+        export class Viewer extends Floor {
+            mark(): void {
+                function g(this: unknown) {
+                    this.inFunction();
+                }
+                const handlers = {
+                    run() {
+                        this.inObjectMethod();
+                    },
+                };
+                const visit = () => this.inArrow();
+                setTimeout(function () { this.inBound(); this.find().inBoundChain(); }.bind(this), 0);
+                (function () { this.inCalled(); }).call(this);
+                (function () { this.inApplied(); }).apply(this, []);
+                (function () { this.inCalledOther(); }).call({});
+                function named() { this.inNamedCalled(); }
+                named.call(this);
+                const later = function () { this.inNamedBound(); };
+                setTimeout(later.bind(this), 0);
+                [1].forEach(function () { this.inThisArg(); }, this);
+                Object.defineProperty(this, 'x', { get() { return this.inDescriptor(); } });
+                this.handler = function () { this.inThisField(); };
+                function typed(this: Viewer) { this.inTypedThis(); }
+                el.onclick = function () { this.inElementHandler(); };
+                this.on('ready', function () { this.inOwnListener(); });
+                this.items.forEach(function () { this.inOtherReceiver(); });
+                this.inMethod();
+            }
+            field = function () { this.inClassField(); };
+        }
+        ",
+    );
+
+    let reads_this = |member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "this" && access.member == member)
+    };
+    for member in [
+        "inArrow",
+        "inBound",
+        "inCalled",
+        "inApplied",
+        "inNamedCalled",
+        "inNamedBound",
+        "inThisArg",
+        "inOwnListener",
+        "inDescriptor",
+        "inThisField",
+        "inTypedThis",
+        "inClassField",
+        "inMethod",
+    ] {
+        assert!(reads_this(member), "{member}: {:?}", info.member_accesses);
+    }
+    for member in [
+        "inFunction",
+        "inObjectMethod",
+        "inCalledOther",
+        "inElementHandler",
+        "inOtherReceiver",
+    ] {
+        assert!(!reads_this(member), "{member}: {:?}", info.member_accesses);
+    }
+    assert!(
+        info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::ClassThisMemberAccess(access)
+                if access.class_local_name == "Viewer"
+                    && access.object == "this.find()"
+                    && access.member == "inBoundChain"
+        )),
+        "{:?}",
+        info.semantic_facts
+    );
 }

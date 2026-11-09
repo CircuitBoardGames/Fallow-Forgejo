@@ -112,6 +112,10 @@ export const validateRun = (request) => {
   expectRequest(isNonEmptyStringList(request.test_ids), "test_ids must be a non-empty list");
   expectRequest(isPositiveInteger(request.timeout_ms), "timeout_ms must be a positive integer");
   expectRequest(typeof request.bail === "boolean", "bail must be a boolean");
+  expectRequest(
+    request.loop_budget_ms === undefined || isPositiveInteger(request.loop_budget_ms),
+    "loop_budget_ms must be a positive integer when present",
+  );
 };
 
 /**
@@ -133,10 +137,15 @@ export const buildOverlay = (root, runDir, pathMap) => {
   return overlay;
 };
 
-/** Names each test. A repeated full name gets a ` (n)` suffix. */
+/**
+ * Names each test. A repeated full name gets a ` (n)` suffix. A lone UTF-16
+ * surrogate becomes U+FFFD before the suffix, because the protocol carries
+ * only well-formed text. A run request then sends back the same name.
+ */
 export const uniqueNames = (fullNames) => {
   const seen = new Map();
-  return fullNames.map((fullName) => {
+  return fullNames.map((rawName) => {
+    const fullName = rawName.toWellFormed();
     const count = (seen.get(fullName) ?? 0) + 1;
     seen.set(fullName, count);
     return count === 1 ? fullName : `${fullName} (${count})`;
@@ -145,6 +154,22 @@ export const uniqueNames = (fullNames) => {
 
 /** True for a test that ran to a result. A skipped or cancelled test did not run. */
 export const hasRun = (status) => status === "pass" || status === "fail";
+
+/**
+ * Flags each test that ran and whose full name another test that ran repeats.
+ * `uniqueNames` gives such tests a ` (n)` suffix, which depends on the report
+ * order, so the evidence of a repeated name is not reliable. A skipped or
+ * todo twin gives no evidence, so it does not count. `ran` has one boolean
+ * for each test. The flags use the same well-formed names as `uniqueNames`.
+ */
+export const repeatedNameFlags = (fullNames, ran) => {
+  const wellFormed = fullNames.map((name) => name.toWellFormed());
+  const counts = new Map();
+  wellFormed.forEach((name, index) => {
+    if (ran[index]) counts.set(name, (counts.get(name) ?? 0) + 1);
+  });
+  return wellFormed.map((name, index) => ran[index] && counts.get(name) > 1);
+};
 
 export const errorMessage = (error) => String(error?.message ?? error);
 
@@ -243,10 +268,22 @@ const runStatus = (tests, errors, requestedCount) => {
   return tests.length === requestedCount ? "survived" : "runtime_error";
 };
 
-/** Builds a `run_result` body from the tests and the errors of a run. */
-export const runResult = ({ mutantId, tests, errors, requestedCount, durationMs }) => {
+/**
+ * Builds a `run_result` body from the tests and the errors of a run.
+ * `loopTimeout` is true when the loop budget failed the first failing test.
+ * The body then has `loop_timeout: true` when the status is `timeout`.
+ */
+export const runResult = ({
+  mutantId,
+  tests,
+  errors,
+  requestedCount,
+  durationMs,
+  loopTimeout = false,
+}) => {
   const status = runStatus(tests, errors, requestedCount);
   return {
+    ...(loopTimeout && status === "timeout" ? { loop_timeout: true } : {}),
     mutant_id: mutantId,
     status,
     // With no failing test, a kill comes from an error outside a test, so
@@ -279,7 +316,8 @@ export const groupRequestedTests = (requested, testIndex) => {
 
 /**
  * Builds a `dry_run_result` body. `summary` has `tests`, `hits`,
- * `staticHits` and `setup`. A path of `pathMap` that is not in `loaded` is
+ * `staticHits`, `duplicates` (the ids of tests with a repeated name) and
+ * `setup`. A path of `pathMap` that is not in `loaded` is
  * an unloaded path.
  */
 export const dryRunResult = ({ started, summary, errors, pathMap, loaded }) => ({
@@ -288,6 +326,7 @@ export const dryRunResult = ({ started, summary, errors, pathMap, loaded }) => (
   hits: summary.hits,
   static_hits: [...summary.staticHits].toSorted(),
   file_setup_ms: roundedByKey(summary.setup),
+  duplicate_test_ids: [...summary.duplicates].toSorted(),
   unhandled_errors: errors,
   unloaded_paths: Object.keys(pathMap)
     .filter((path) => !loaded.has(path))

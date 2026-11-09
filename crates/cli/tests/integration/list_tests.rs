@@ -1030,9 +1030,10 @@ fn list_files_includes_plugin_scoped_hidden_dirs_for_remix() {
 }
 
 /// Issue #2366 follow-up: the `fallow workspaces` / `fallow list --workspaces`
-/// envelope has no post-serialization root-prefix strip, so its
-/// `workspace_diagnostics[].path` used to be the only absolute path in any
-/// fallow JSON envelope while the `workspaces[].path` next to it was relative.
+/// envelope has no post-serialization root-prefix strip. Unless the paths are
+/// made relative before serialization, its `workspace_diagnostics[].path` is the
+/// only absolute path in any fallow JSON envelope, next to a relative
+/// `workspaces[].path`.
 #[test]
 fn list_workspaces_json_emits_project_relative_diagnostic_paths() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -1887,6 +1888,48 @@ fn configured_workspace_entry_outside_the_root_is_anchored_at_dot() {
             "`fallow {args:?}`: {json}"
         );
     }
+}
+
+/// The members that a nested `pnpm-workspace.yaml` declares are listed as
+/// workspaces under the nested project root, with no undeclared-workspace
+/// diagnostic.
+#[test]
+fn list_workspaces_includes_nested_pnpm_project_members() {
+    let output = run_list(
+        "pnpm-nested-workspace-members",
+        &["--workspaces", "--format", "json", "--quiet"],
+    );
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+    let json = parse_json(&output);
+
+    let mut workspaces: Vec<(String, String)> = json["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .map(|workspace| {
+            (
+                workspace["name"].as_str().unwrap_or_default().to_owned(),
+                workspace["path"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    workspaces.sort();
+    assert_eq!(
+        workspaces,
+        [
+            ("@root/app".into(), "packages/app".into()),
+            ("site-root".into(), "site".into()),
+            ("site-web".into(), "site/packages/web".into()),
+        ]
+    );
+
+    let kinds: Vec<&str> = json["workspace_diagnostics"]
+        .as_array()
+        .expect("workspace_diagnostics array")
+        .iter()
+        .filter_map(|entry| entry["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, ["nested-project-root"]);
 }
 
 /// A nested directory with its own `pnpm-workspace.yaml` is listed as a

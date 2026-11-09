@@ -30,6 +30,7 @@ const CATEGORY_ICONS: Record<IssueCategory, string> = {
   "unused-optional-dependencies": "package",
   "unused-enum-members": "symbol-enum-member",
   "unused-class-members": "symbol-field",
+  "unused-namespace-member": "symbol-namespace",
   "unused-store-member": "symbol-field",
   "unused-server-action": "symbol-method",
   "unused-load-data-keys": "symbol-property",
@@ -51,7 +52,9 @@ const CATEGORY_ICONS: Record<IssueCategory, string> = {
   "dynamic-segment-name-conflict": "git-merge",
   "unresolved-imports": "error",
   "unlisted-dependencies": "package",
+  "unlisted-binaries": "terminal",
   "duplicate-exports": "files",
+  "duplicate-export-aliases": "references",
   "type-only-dependencies": "symbol-interface",
   "test-only-dependencies": "beaker",
   "dev-dependencies-in-production": "package",
@@ -104,6 +107,8 @@ class CategoryItem extends vscode.TreeItem {
       `${ISSUE_CATEGORY_LABELS[category]} (${issues.length})`,
       vscode.TreeItemCollapsibleState.Collapsed,
     );
+    // A stable id keeps the expansion state when a refresh changes the count in the label.
+    this.id = `category:${category}`;
     this.issues = issues;
     this.contextValue = "category";
     this.iconPath = new vscode.ThemeIcon(CATEGORY_ICONS[category] ?? "warning");
@@ -315,6 +320,21 @@ export class DeadCodeTreeProvider implements vscode.TreeDataProvider<DeadCodeIte
               m.line,
               m.col,
               "unused-store-member",
+            ),
+        ),
+      );
+    }
+    if (this.result.unused_namespace_members) {
+      addCategory(
+        "unused-namespace-member",
+        this.result.unused_namespace_members.map(
+          (m) =>
+            new IssueItem(
+              `${m.parent_name}.${m.member_name}`,
+              m.path,
+              m.line,
+              m.col,
+              "unused-namespace-member",
             ),
         ),
       );
@@ -565,6 +585,16 @@ export class DeadCodeTreeProvider implements vscode.TreeDataProvider<DeadCodeIte
     );
 
     addCategory(
+      "unlisted-binaries",
+      (this.result.unlisted_binaries ?? []).flatMap((b) =>
+        b.used_in.map(
+          (site) =>
+            new IssueItem(b.binary_name, site.path, site.line, site.col, "unlisted-binaries"),
+        ),
+      ),
+    );
+
+    addCategory(
       "duplicate-exports",
       this.result.duplicate_exports.flatMap((d) =>
         d.locations.map(
@@ -572,6 +602,22 @@ export class DeadCodeTreeProvider implements vscode.TreeDataProvider<DeadCodeIte
         ),
       ),
     );
+
+    if (this.result.duplicate_export_aliases) {
+      addCategory(
+        "duplicate-export-aliases",
+        this.result.duplicate_export_aliases.map(
+          (alias) =>
+            new IssueItem(
+              `${alias.local_name} as ${alias.export_names.join(", ")}`,
+              alias.path,
+              alias.line,
+              alias.col,
+              "duplicate-export-aliases",
+            ),
+        ),
+      );
+    }
 
     if (this.result.type_only_dependencies) {
       addCategory(

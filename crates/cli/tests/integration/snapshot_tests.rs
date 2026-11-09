@@ -894,6 +894,7 @@ fn sarif_mixed_severity_snapshot() {
         unused_optional_dependencies: fallow_config::Severity::Warn,
         unused_enum_members: fallow_config::Severity::Warn,
         unused_class_members: fallow_config::Severity::Warn,
+        unused_namespace_members: fallow_config::Severity::Warn,
         unused_store_members: fallow_config::Severity::Warn,
         unprovided_injects: fallow_config::Severity::Warn,
         unrendered_components: fallow_config::Severity::Warn,
@@ -922,7 +923,9 @@ fn sarif_mixed_severity_snapshot() {
         complexity_file_lines: fallow_config::Severity::Off,
         unresolved_imports: fallow_config::Severity::Error,
         unlisted_dependencies: fallow_config::Severity::Error,
+        unlisted_binaries: fallow_config::Severity::Warn,
         duplicate_exports: fallow_config::Severity::Warn,
+        duplicate_export_aliases: fallow_config::Severity::Warn,
         type_only_dependencies: fallow_config::Severity::Warn,
         circular_dependencies: fallow_config::Severity::Warn,
         re_export_cycle: fallow_config::Severity::Warn,
@@ -1854,6 +1857,7 @@ fn codeclimate_mixed_severity_snapshot() {
         unused_optional_dependencies: fallow_config::Severity::Warn,
         unused_enum_members: fallow_config::Severity::Warn,
         unused_class_members: fallow_config::Severity::Warn,
+        unused_namespace_members: fallow_config::Severity::Warn,
         unused_store_members: fallow_config::Severity::Warn,
         unprovided_injects: fallow_config::Severity::Warn,
         unrendered_components: fallow_config::Severity::Warn,
@@ -1882,7 +1886,9 @@ fn codeclimate_mixed_severity_snapshot() {
         complexity_file_lines: fallow_config::Severity::Off,
         unresolved_imports: fallow_config::Severity::Error,
         unlisted_dependencies: fallow_config::Severity::Error,
+        unlisted_binaries: fallow_config::Severity::Warn,
         duplicate_exports: fallow_config::Severity::Warn,
+        duplicate_export_aliases: fallow_config::Severity::Warn,
         type_only_dependencies: fallow_config::Severity::Warn,
         circular_dependencies: fallow_config::Severity::Warn,
         re_export_cycle: fallow_config::Severity::Warn,
@@ -3066,6 +3072,7 @@ fn health_report_with_runtime_coverage(root: &Path) -> HealthReport {
         },
         findings: vec![
             RuntimeCoverageFinding {
+                cloud_context: None,
                 id: "fallow:prod:deadbeef".to_string(),
                 stable_id: Some("fallow:fn:00000001".to_string()),
                 path: root.join("src/cold.ts"),
@@ -3092,6 +3099,7 @@ fn health_report_with_runtime_coverage(root: &Path) -> HealthReport {
                 discriminators: None,
             },
             RuntimeCoverageFinding {
+                cloud_context: None,
                 id: "fallow:prod:feedface".to_string(),
                 stable_id: None,
                 path: root.join("src/unknown.ts"),
@@ -3119,6 +3127,7 @@ fn health_report_with_runtime_coverage(root: &Path) -> HealthReport {
             },
         ],
         hot_paths: vec![RuntimeCoverageHotPath {
+            cloud_context: None,
             id: "fallow:hot:cafebabe".to_string(),
             stable_id: Some("fallow:fn:00000002".to_string()),
             path: root.join("src/hot.ts"),
@@ -3138,9 +3147,7 @@ fn health_report_with_runtime_coverage(root: &Path) -> HealthReport {
             message: "One dump was incomplete.".to_string(),
         }],
         actionable: true,
-        actionability_reason: None,
-        actionability_verdict: None,
-        provenance: fallow_output::RuntimeCoverageProvenance::default(),
+        ..Default::default()
     });
     report
 }

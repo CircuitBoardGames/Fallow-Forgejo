@@ -45,8 +45,9 @@ const UNREAD_FILE: &str = "journal.jsonl.unread";
 const STALE_TEMPORARY: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// The fingerprint of a run. A journal resumes only a run with an equal
-/// fingerprint. The run limits (`--max-mutants`, `--time-budget`,
-/// `--concurrency`) are not in it, so a resumed run can use other limits.
+/// fingerprint. The run limits (`--max-mutants`, `--mutants-per-line`,
+/// `--time-budget`, `--concurrency`) are not in it, so a resumed run can use
+/// other limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalHeader {
     pub journal_format: u32,
@@ -65,6 +66,9 @@ pub struct JournalHeader {
     pub allow_side_effects: bool,
     #[serde(default)]
     pub kill_matrix: bool,
+    /// The `--kill-matrix-for` targets. Empty outside target mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kill_matrix_targets: Vec<String>,
 }
 
 impl JournalHeader {
@@ -77,6 +81,13 @@ impl JournalHeader {
                 .map_or_else(|| "each operator".to_owned(), |names| names.join(","))
         };
         let config = |config: &Option<String>| config.clone().unwrap_or_else(|| "none".to_owned());
+        let targets = |targets: &[String]| {
+            if targets.is_empty() {
+                "none".to_owned()
+            } else {
+                targets.join(",")
+            }
+        };
         let hash = |hash: &str| hash.chars().take(SHOWN_HASH_LEN).collect::<String>();
         let pairs = [
             (
@@ -106,6 +117,11 @@ impl JournalHeader {
                 "kill matrix",
                 self.kill_matrix.to_string(),
                 current.kill_matrix.to_string(),
+            ),
+            (
+                "kill matrix targets",
+                targets(&self.kill_matrix_targets),
+                targets(&current.kill_matrix_targets),
             ),
             (
                 "operators",

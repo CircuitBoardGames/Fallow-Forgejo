@@ -4,10 +4,11 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 
 use fallow_config::{EffectKind, ResolvedConfig, RulePackRule, RulePackRuleKind, Severity};
-use fallow_types::extract::{ImportedName, ModuleInfo};
+use fallow_types::extract::{CalleeUse, ImportedName, ModuleInfo};
 use fallow_types::output::IssueAction;
 use fallow_types::output_dead_code::PolicyViolationFinding;
 use fallow_types::results::{PolicyRuleKind, PolicyViolation, PolicyViolationSeverity};
+use fallow_types::security_sinks::node_binding_module;
 
 use crate::discover::FileId;
 use crate::graph::ModuleGraph;
@@ -119,10 +120,10 @@ pub(super) struct PolicyAnalysisInput<'a> {
 /// Banned-call matching mirrors `boundaries.calls.forbidden`: the written
 /// callee path and an import-resolved canonical path are both tried, so
 /// `child_process.*` covers named, namespace, and default imports from
-/// `child_process` / `node:child_process`. One finding is reported per unique
-/// callee path per form per file (the `callee_uses` capture dedups per path
-/// and per call or `new` form, first occurrence wins). Banned-effect matching
-/// reads calls only. Banned-import matching is segment-aware on the RAW
+/// `child_process` / `node:child_process`. One finding is reported per call or
+/// `new` site, so a suppression comment covers only the site on its next line.
+/// Banned-effect matching also reports one finding per site, and reads calls
+/// only. Banned-import matching is segment-aware on the RAW
 /// specifier over imports and re-exports; `require()` calls and dynamic
 /// `import()` are documented false negatives in v1. A rule with `allowNames`
 /// reports each site that does not bind a listed name, with the binding in
@@ -637,11 +638,30 @@ fn collect_banned_effects(input: &mut PolicyCollectionInput<'_>) {
         let Some((rule, severity, effect)) = matched else {
             continue;
         };
-        let (line, col) = byte_offset_to_line_col(
-            input.line_offsets_by_file,
-            input.node.file_id,
-            callee_use.span_start,
+        let matched = format!("{}: {}", effect.as_str(), callee_use.callee_path);
+        push_callee_site_violations(
+            input,
+            callee_use,
+            rule,
+            severity,
+            PolicyRuleKind::BannedEffect,
+            &matched,
         );
+    }
+}
+
+/// Push one finding per site of `callee_use` that no suppression comment covers.
+fn push_callee_site_violations(
+    input: &mut PolicyCollectionInput<'_>,
+    callee_use: &CalleeUse,
+    rule: &CompiledRule<'_>,
+    severity: PolicyViolationSeverity,
+    kind: PolicyRuleKind,
+    matched: &str,
+) {
+    for &span_start in &callee_use.span_starts {
+        let (line, col) =
+            byte_offset_to_line_col(input.line_offsets_by_file, input.node.file_id, span_start);
         if input.suppressions.is_policy_suppressed(
             input.node.file_id,
             line,
@@ -656,15 +676,15 @@ fn collect_banned_effects(input: &mut PolicyCollectionInput<'_>) {
             col,
             pack: rule.pack.to_owned(),
             rule_id: rule.rule.id.clone(),
-            kind: PolicyRuleKind::BannedEffect,
-            matched: format!("{}: {}", effect.as_str(), callee_use.callee_path),
+            kind,
+            matched: matched.to_owned(),
             severity,
             message: rule.rule.message.clone(),
         });
     }
 }
 
-/// Emit one finding per unique callee path per form matched by the first applicable
+/// Emit one finding per call or `new` site matched by the first applicable
 /// `banned-call` rule (config order), mirroring the boundary forbidden-call
 /// first-pattern-wins behavior.
 fn collect_banned_calls(input: &mut PolicyCollectionInput<'_>) {
@@ -680,30 +700,15 @@ fn collect_banned_calls(input: &mut PolicyCollectionInput<'_>) {
         let Some((rule, severity)) = matched else {
             continue;
         };
-        let (line, col) = byte_offset_to_line_col(
-            input.line_offsets_by_file,
-            input.node.file_id,
-            callee_use.span_start,
-        );
-        if input.suppressions.is_policy_suppressed(
-            input.node.file_id,
-            line,
-            rule.pack,
-            &rule.rule.id,
-        ) {
-            continue;
-        }
-        input.violations.push(PolicyViolation {
-            path: input.node.path.clone(),
-            line,
-            col,
-            pack: rule.pack.to_owned(),
-            rule_id: rule.rule.id.clone(),
-            kind: PolicyRuleKind::BannedCall,
-            matched: display_callee(callee_use),
+        let matched = display_callee(callee_use);
+        push_callee_site_violations(
+            input,
+            callee_use,
+            rule,
             severity,
-            message: rule.rule.message.clone(),
-        });
+            PolicyRuleKind::BannedCall,
+            &matched,
+        );
     }
 }
 
@@ -719,11 +724,73 @@ fn effect_for_callee(
     if written.is_some() {
         return written;
     }
-    let canonical = canonical_callee_path(module, callee_path)?;
-    catalogue_matchers()
+    [
+        canonical_callee_path(module, callee_path),
+        node_binding_callee_path(module, callee_path),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|path| {
+        catalogue_matchers()
+            .iter()
+            .find(|matcher| matcher_matches_callee(matcher, module, &path, declared_deps))
+            .map(|matcher| matcher.effect)
+    })
+}
+
+/// The `node:<module>.<member>` path of a callee whose leading identifier an
+/// ES import or a `require()` binds to a module in
+/// [`NODE_BINDING_MODULES`](fallow_types::security_sinks::NODE_BINDING_MODULES).
+/// The extractor writes the same path for a sink site, and the catalogue
+/// rows of those modules match only that path.
+fn node_binding_callee_path(module: &ModuleInfo, callee_path: &str) -> Option<String> {
+    let (head, rest) = match callee_path.split_once('.') {
+        Some((head, rest)) => (head, Some(rest)),
+        None => (callee_path, None),
+    };
+    // `fs.promises.<member>` takes the path of an `fs/promises` import, as in
+    // the extractor.
+    let join = |root: String, member: Option<&str>| -> Option<String> {
+        let path = match (member, rest) {
+            (Some(member), Some(rest)) => format!("{root}.{member}.{rest}"),
+            (Some(member), None) => format!("{root}.{member}"),
+            (None, Some(rest)) => format!("{root}.{rest}"),
+            (None, None) => return None,
+        };
+        Some(match path.strip_prefix("node:fs.promises.") {
+            Some(member) => format!("node:fs.{member}"),
+            None => path,
+        })
+    };
+    if let Some(import) = module
+        .imports
         .iter()
-        .find(|matcher| matcher_matches_callee(matcher, module, &canonical, declared_deps))
-        .map(|matcher| matcher.effect)
+        .find(|import| import.local_name == head && !import.is_type_only)
+    {
+        let root = node_binding_module(&import.source)?;
+        return match &import.imported_name {
+            ImportedName::Named(imported) => join(root, Some(imported)),
+            ImportedName::Namespace | ImportedName::Default => join(root, None),
+            ImportedName::SideEffect => None,
+        };
+    }
+    // A destructured property binds its local name (`run` in
+    // `const { exec: run } = require(...)`), and the path takes the key.
+    module.require_calls.iter().find_map(|call| {
+        if call.is_type_only {
+            return None;
+        }
+        let member = if call.local_name.as_deref() == Some(head) {
+            None
+        } else {
+            let (key, _) = call
+                .destructured_locals
+                .iter()
+                .find(|(_, local)| local == head)?;
+            Some(key.as_str())
+        };
+        join(node_binding_module(&call.source)?, member)
+    })
 }
 
 fn matcher_matches_callee(

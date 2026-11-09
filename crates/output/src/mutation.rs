@@ -18,6 +18,13 @@ pub const MUTATION_SCHEMA_VERSION: u32 = 2;
 pub const MUTATION_PLAN_SCHEMA_VERSION: u32 = 1;
 /// Current mutation inspect schema version.
 pub const MUTATION_INSPECT_SCHEMA_VERSION: u32 = 2;
+/// Current mutation tasks schema version.
+pub const MUTATION_TASKS_SCHEMA_VERSION: u32 = 1;
+/// The code of the run issue for tests that share a test id in the dry run.
+pub const DUPLICATE_TEST_IDS_CODE: &str = "duplicate-test-ids";
+/// The code of the run issue for tests that the dry run skipped or marked as
+/// todo, in a test file of the plan. Such a test checks nothing.
+pub const SKIPPED_TESTS_CODE: &str = "skipped-tests";
 
 /// Version singleton for a mutation report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,6 +77,10 @@ pub enum MutantStatus {
     /// mutant does not count in the score.
     CompileError,
 }
+
+/// The `pending_reason` of a mutant that the `--mutants-per-line` limit left
+/// out of the plan.
+pub const SAMPLED_OUT_REASON: &str = "sampled-out";
 
 /// The number of mutants for each status, and the mutation score.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +203,9 @@ pub enum MutationIncompleteReason {
     RuntimeError,
     /// The mutant limit left covered mutants `pending`.
     MutantLimit,
+    /// The `--mutants-per-line` limit left mutants out of the plan. They are
+    /// `pending` with the reason `sampled-out`.
+    SampledOut,
     /// The time budget ended before each mutant ran.
     TimeBudget,
     /// The plan did not instrument at least one selected file.
@@ -332,8 +346,9 @@ pub struct MutantLocation {
 ///
 /// Each side is an operator token (for example `??` or `<=`), a fixed literal
 /// (`true`, `undefined`, `""`, `"fallow"`, `void 0`), a regular expression
-/// token (`^`, `$`, `[`, `[^`, `\d`), or a placeholder for a side that is
-/// project code: `<condition>`, `<call>`, `<expression>` or `<string>`. An
+/// token (`^`, `$`, `[`, `[^`, `+`, `{n,m}`, `\d`), or a placeholder for a
+/// side that is project code: `<condition>`, `<call>`, `<expression>`,
+/// `<string>` or `<template>`. An
 /// empty side means that the edit removes the token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -356,6 +371,12 @@ pub struct MutantResult {
     /// The static rule of a `pruned` mutant, kebab-case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prune_reason: Option<String>,
+    /// Why a `pending` mutant did not run, kebab-case. Only `sampled-out` has
+    /// a reason: the `--mutants-per-line` limit left the mutant out of the
+    /// plan. A mutant that the mutant limit or the time budget left out has
+    /// no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason: Option<String>,
     /// The test that killed the mutant in this run. Absent for a kill by an
     /// error outside a test.
     ///
@@ -411,6 +432,25 @@ pub struct MutantResult {
     /// `compile_error` mutant, sorted, at most 8.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_error_codes: Vec<u32>,
+    /// An advisory hint that the mutant may be equivalent to the original
+    /// code. The hint never changes the status: the mutant stays `survived`
+    /// and counts in the score. A person decides, and records the decision in
+    /// a verdict file. The hint can be wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivalence_hint: Option<MutantEquivalenceHint>,
+}
+
+/// Why a survivor may be equivalent, as far as the type check can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum MutantEquivalenceHint {
+    /// The mutant removes an optional-chaining link (`?.`), and the declared
+    /// type of the receiver excludes `null` and `undefined`. If no run-time
+    /// value can be nullish, the mutant is equivalent. A run-time value can
+    /// still be nullish, for example in a method that loses its `this`, or
+    /// in a call whose declared return type hides a nullish value.
+    TypeNonNullish,
 }
 
 /// One run of a retried mutant.
@@ -579,6 +619,9 @@ pub struct MutationSummary {
     /// caps reports the coverage of the full run. `equivalent` and `pruned`
     /// mutants never count. `null` when no mutant is covered or unreached.
     pub coverage: Option<f64>,
+    /// The `pending` mutants that the `--mutants-per-line` limit left out of
+    /// the plan. They are part of `counts.pending`.
+    pub sampled_out: usize,
 }
 
 impl MutationSummary {
@@ -587,8 +630,14 @@ impl MutationSummary {
     pub fn from_results(results: &[MutantResult]) -> Self {
         let mut counts = MutationStatusCounts::default();
         let (mut covered, mut uncovered) = (0usize, 0usize);
+        let mut sampled_out = 0usize;
         for result in results {
             counts.add(result.status);
+            if result.status == MutantStatus::Pending
+                && result.pending_reason.as_deref() == Some(SAMPLED_OUT_REASON)
+            {
+                sampled_out += 1;
+            }
             match result.status {
                 MutantStatus::NoCoverage => uncovered += 1,
                 MutantStatus::Pending => covered += 1,
@@ -609,6 +658,7 @@ impl MutationSummary {
             counts,
             score: counts.score(),
             coverage: ratio(covered, covered + uncovered),
+            sampled_out,
         }
     }
 }
@@ -679,9 +729,9 @@ pub struct MutationWorktreeCheck {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MutationRunIssue {
     /// A stable kebab-case code: `cache-write-failed`,
-    /// `journal-write-failed`, `runtime-error`, `static-map-miss`,
-    /// `test-files-not-discovered`, `typecheck-failed`, `worktree-changed`
-    /// or `worktree-check-failed`.
+    /// `duplicate-test-ids`, `journal-write-failed`, `runtime-error`,
+    /// `static-map-miss`, `test-files-not-discovered`, `typecheck-failed`,
+    /// `worktree-changed` or `worktree-check-failed`.
     pub code: String,
     /// A description.
     pub message: String,
@@ -756,9 +806,22 @@ pub struct MutationTypecheckOutput {
     /// The checked survivors that do not type-check. They have the status
     /// `compile_error`.
     pub compile_errors: usize,
+    /// The mutants of the final report that have an `equivalence_hint`. They
+    /// keep the status `survived`. A verdict that makes a mutant `equivalent`
+    /// removes its hint and lowers this count.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hinted: usize,
     /// The survivors that the checker did not check, by reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<MutationTypecheckSkip>,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip predicate signature"
+)]
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// The quality of observed test-to-mutant evidence.
@@ -772,6 +835,17 @@ pub enum MutationKillMatrixStatus {
     Incomplete,
     /// The run did not request a kill matrix.
     Unavailable,
+}
+
+/// The quality of the evidence of one `--kill-matrix-for` target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MutationKillMatrixTargetStatus {
+    /// Each test of the target has complete evidence for each covered mutant.
+    Complete,
+    /// The run or at least one covered mutant has incomplete evidence.
+    Incomplete,
 }
 
 /// The observed mutant kills of one eligible test.
@@ -790,6 +864,44 @@ pub struct MutationTestKillRow {
     pub subsuming_tests: Vec<String>,
     /// Conservative evidence notes, sorted.
     pub notes: Vec<String>,
+    /// The kills that other target tests also detect and no non-target test
+    /// detects, sorted by mutant id. Only `--kill-matrix-for` sets this
+    /// field. The test stays redundant only while one of `targets` for each
+    /// entry stays in the suite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_only_kills: Option<Vec<MutationTargetOnlyKill>>,
+}
+
+/// A kill of a target test that only other target tests share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationTargetOnlyKill {
+    /// The killed mutant.
+    pub mutant_id: String,
+    /// The other target tests that also kill the mutant, sorted.
+    pub targets: Vec<String>,
+}
+
+/// One `--kill-matrix-for` target and the dry-run tests that it selects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationKillMatrixTarget {
+    /// The target as the caller gave it, after path normalization: a test
+    /// file or a runner test id.
+    pub target: String,
+    /// The dry-run test ids that the target selects, sorted.
+    pub test_ids: Vec<String>,
+    /// Whether the evidence of this target supports candidate analysis:
+    /// `complete` or `incomplete`. Only the tests of a complete target can
+    /// be candidates.
+    pub status: MutationKillMatrixTargetStatus,
+    /// Why the evidence of this target is incomplete, sorted. The run-wide
+    /// reasons `partial-mutation-run`, `baseline-failure`, and
+    /// `missing-test-file-metadata` apply to each target.
+    /// `incomplete-mutant-results` means that a test of this target covers a
+    /// mutant with incomplete evidence. `unmatched-target` means that the
+    /// target selects no test.
+    pub reasons: Vec<String>,
 }
 
 /// Redundancy signals over the observed mutants. Candidates need review.
@@ -804,9 +916,15 @@ pub struct MutationKillMatrix {
     /// Each eligible test with observed coverage, sorted by test id.
     pub tests: Vec<MutationTestKillRow>,
     /// Tests with nonempty kills and no unique kills, sorted by test id.
+    /// In target mode, only the tests of complete targets.
     pub candidates: Vec<String>,
     /// Tests with coverage and no observed kills, sorted by test id.
     pub coverage_without_kills: Vec<String>,
+    /// The `--kill-matrix-for` targets, in the given order. Absent outside
+    /// target mode. In target mode, `tests` has only target tests, and
+    /// `subsuming_tests` is empty, because bail hides the other killers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<MutationKillMatrixTarget>>,
 }
 
 impl Default for MutationKillMatrix {
@@ -817,6 +935,7 @@ impl Default for MutationKillMatrix {
             tests: Vec::new(),
             candidates: Vec::new(),
             coverage_without_kills: Vec::new(),
+            targets: None,
         }
     }
 }
@@ -882,6 +1001,134 @@ pub struct MutationReport {
     /// them (`--typecheck` not set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typecheck: Option<MutationTypecheckOutput>,
+    /// The result of each rechecked mutant against its status in the earlier
+    /// report. Absent outside `--recheck`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recheck: Option<MutationRecheck>,
+    /// The mutants whose result differs from a saved report. Absent outside
+    /// `--compare`, and absent when this run is not complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare: Option<MutationCompare>,
+}
+
+/// How one mutant of a compare differs from the saved report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MutationCompareChange {
+    /// The saved report detects the mutant (`killed` or `timeout`), and this
+    /// run does not (`survived` or `no_coverage`). The tests lost the
+    /// detection of the mutant.
+    Regressed,
+    /// The mutant is `flaky` in one of the two runs, so the comparison of
+    /// this mutant proves nothing.
+    Inconclusive,
+    /// Only this run has the mutant id.
+    Added,
+    /// Only the saved report has the mutant id.
+    Removed,
+}
+
+/// One mutant of a compare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationCompareMutant {
+    /// The id of the mutant.
+    pub mutant_id: String,
+    /// The project-root-relative path of the mutated file.
+    pub file: String,
+    /// The 1-based line of the mutant.
+    pub line: u32,
+    /// How the mutant differs from the saved report.
+    pub change: MutationCompareChange,
+    /// The status in the saved report. Absent for an `added` mutant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_status: Option<MutantStatus>,
+    /// The status in this run. Absent for a `removed` mutant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<MutantStatus>,
+    /// The tests that killed the mutant in the saved report, sorted: its
+    /// `killing_tests`, else its `killed_by`. Empty when the saved report
+    /// names no killing test.
+    pub previous_killing_tests: Vec<String>,
+}
+
+/// The compare facts of a `--compare` run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationCompare {
+    /// The SHA-256 digest of the saved report.
+    pub report_sha256: String,
+    /// The number of mutant ids in both runs.
+    pub compared: usize,
+    /// The number of mutants for each change.
+    pub regressed: usize,
+    /// See `regressed`.
+    pub inconclusive: usize,
+    /// See `regressed`.
+    pub added: usize,
+    /// See `regressed`.
+    pub removed: usize,
+    /// Each mutant with a change, sorted by file, line and mutant id. A
+    /// mutant in both runs without a change is not in the list.
+    pub mutants: Vec<MutationCompareMutant>,
+}
+
+/// What a recheck shows for one mutant of the earlier report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MutationRecheckOutcome {
+    /// A test now fails on the mutant (`killed` or `timeout`).
+    Killed,
+    /// Each covering test still passes on the mutant.
+    Survived,
+    /// No test reaches the mutant.
+    NoCoverage,
+    /// A test of the run fails on the original code, so the run proves no
+    /// survivor. Fix that test first.
+    TestsFailOnOriginal,
+    /// The mutant has no final result, for example `runtime_error`, `flaky`
+    /// or `pending`. `status` gives the reason.
+    Unsettled,
+}
+
+/// One rechecked mutant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationRecheckMutant {
+    /// The id of the mutant.
+    pub mutant_id: String,
+    /// The project-root-relative path of the mutated file.
+    pub file: String,
+    /// The 1-based line of the mutant.
+    pub line: u32,
+    /// The status in the earlier report.
+    pub previous_status: MutantStatus,
+    /// The status in this run.
+    pub status: MutantStatus,
+    /// What the recheck shows.
+    pub outcome: MutationRecheckOutcome,
+}
+
+/// The recheck facts of a `--recheck` run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationRecheck {
+    /// The SHA-256 digest of the earlier report.
+    pub report_sha256: String,
+    /// The number of mutants for each outcome.
+    pub killed: usize,
+    /// See `killed`.
+    pub survived: usize,
+    /// See `killed`.
+    pub no_coverage: usize,
+    /// See `killed`.
+    pub tests_fail_on_original: usize,
+    /// See `killed`.
+    pub unsettled: usize,
+    /// The rechecked mutants, sorted by file, line and mutant id.
+    pub mutants: Vec<MutationRecheckMutant>,
 }
 
 /// Version singleton for a mutation verdict document.
@@ -981,6 +1228,12 @@ pub struct MutationPlanMutant {
     /// The static rule of a `pruned` mutant, kebab-case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prune_reason: Option<String>,
+    /// Why a `pending` mutant did not run, kebab-case. Only `sampled-out` has
+    /// a reason: the `--mutants-per-line` limit left the mutant out of the
+    /// plan. A mutant that the mutant limit or the time budget left out has
+    /// no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason: Option<String>,
     /// How tests reach the code of the mutant in the module graph. Only a
     /// `no_coverage` mutant has this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1007,8 +1260,10 @@ pub struct MutationPlanCountsOutput {
     pub total: usize,
     /// Planned mutants.
     pub planned: usize,
-    /// Mutants after the mutant limit.
+    /// Mutants after the mutant limit, and the sampled-out mutants.
     pub pending: usize,
+    /// The `pending` mutants that the `--mutants-per-line` limit left out.
+    pub sampled_out: usize,
     /// Mutants that no test file reaches.
     pub no_coverage: usize,
     /// Mutants in unused files.
@@ -1141,6 +1396,89 @@ pub struct MutationInspectOutput {
     pub kill_matrix_complete: bool,
 }
 
+/// Version singleton for the open tasks of a mutation report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum MutationTasksSchemaVersion {
+    /// The first version.
+    #[serde(rename = "1")]
+    V1,
+}
+
+/// One open task: a `survived` or `no_coverage` mutant of a saved report.
+/// A task holds no source text other than the source lines of the mutant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationTask {
+    /// The id of the mutant. `fallow mutation inspect` takes this id.
+    pub mutant_id: String,
+    /// The project-root-relative path of the mutated file.
+    pub file: String,
+    /// The 1-based line of the mutant.
+    pub line: u32,
+    /// The 1-based column of the mutant.
+    pub column: u32,
+    /// The operator, kebab-case.
+    pub operator: String,
+    /// The name of the enclosing function. Absent at the top level of a
+    /// module and for an anonymous function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    /// `survived` or `no_coverage`.
+    pub status: MutantStatus,
+    /// The source lines that contain the mutant, from the current file.
+    /// `null` when the task is stale.
+    pub original_lines: Option<String>,
+    /// The same lines with the mutation applied. `null` when the task is
+    /// stale.
+    pub mutated_lines: Option<String>,
+    /// An advisory hint that the mutant may be equivalent. The task stays
+    /// open: a person decides, and records an equivalent mutant in a verdict
+    /// file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivalence_hint: Option<MutantEquivalenceHint>,
+    /// Why the current file no longer gives the mutant. Absent for a fresh
+    /// task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<MutationStaleReason>,
+    /// The test files of the tests that reached the mutant in the dry run,
+    /// sorted. Empty for `no_coverage`. `fallow mutation inspect` gives the
+    /// test ids and the static test files of one mutant.
+    pub covering_test_files: Vec<String>,
+}
+
+/// The number of tasks for each status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationTasksSummary {
+    /// The number of tasks.
+    pub tasks: usize,
+    /// The tasks with the status `survived`.
+    pub survived: usize,
+    /// The tasks with the status `no_coverage`.
+    pub no_coverage: usize,
+    /// The tasks whose file changed after the report. They have no code.
+    pub stale: usize,
+}
+
+/// The envelope of `fallow mutation tasks`: the open tasks of one saved
+/// report, as one batch. It runs no user code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationTasksOutput {
+    /// Independent schema version.
+    pub schema_version: MutationTasksSchemaVersion,
+    /// The Fallow version.
+    pub version: ToolVersion,
+    /// The completion status of the report. A `partial` report can miss
+    /// tasks: a `pending` mutant is not a task.
+    pub report_completion: Option<MutationCompletionStatus>,
+    /// The counts of the tasks.
+    pub summary: MutationTasksSummary,
+    /// The tasks, sorted by file, line, column and mutant id.
+    pub tasks: Vec<MutationTask>,
+}
+
 /// Serialize a mutation report with its root discriminator.
 ///
 /// # Errors
@@ -1161,6 +1499,18 @@ pub fn serialize_mutation_plan_json_output(
     output: MutationPlanOutput,
 ) -> Result<serde_json::Value, serde_json::Error> {
     serialize_named_json_output(output, "mutation-plan")
+}
+
+/// Serialize the open tasks of a mutation report with their root
+/// discriminator.
+///
+/// # Errors
+///
+/// Returns a serde error when the envelope cannot be converted to JSON.
+pub fn serialize_mutation_tasks_json_output(
+    output: MutationTasksOutput,
+) -> Result<serde_json::Value, serde_json::Error> {
+    serialize_named_json_output(output, "mutation-tasks")
 }
 
 /// Serialize a mutation inspect packet with its root discriminator.
@@ -1228,6 +1578,7 @@ mod tests {
             },
             status,
             prune_reason: None,
+            pending_reason: None,
             killing_tests: Vec::new(),
             kill_matrix_complete: false,
             killed_by: None,
@@ -1243,6 +1594,7 @@ mod tests {
             cached: false,
             resumed: false,
             type_error_codes: Vec::new(),
+            equivalence_hint: None,
         }
     }
 
@@ -1372,6 +1724,7 @@ mod tests {
             },
             status: MutantStatus::NoCoverage,
             prune_reason: None,
+            pending_reason: None,
             killing_tests: Vec::new(),
             kill_matrix_complete: false,
             killed_by: None,
@@ -1384,6 +1737,7 @@ mod tests {
             cached: false,
             resumed: false,
             type_error_codes: Vec::new(),
+            equivalence_hint: None,
         };
         let value = serde_json::to_value(&result).expect("serializes");
         assert_eq!(
@@ -1430,6 +1784,7 @@ mod tests {
             },
             status: MutantStatus::Flaky,
             prune_reason: None,
+            pending_reason: None,
             killing_tests: Vec::new(),
             kill_matrix_complete: false,
             killed_by: None,
@@ -1449,6 +1804,7 @@ mod tests {
             cached: false,
             resumed: false,
             type_error_codes: Vec::new(),
+            equivalence_hint: None,
         };
         let value = serde_json::to_value(&result).expect("serializes");
         assert_eq!(

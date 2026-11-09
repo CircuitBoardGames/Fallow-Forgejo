@@ -7,7 +7,7 @@ use fallow_config::ResolvedConfig;
 use fallow_output::{BaselineMode, BaselineScopeReasons, ScopeReason};
 use fallow_types::workspace::WorkspaceDiagnostic;
 
-use super::{BaselineIo, IssueFilters};
+use super::{BaselineIo, CheckOptions, IssueFilters};
 use crate::baseline_gate::LoadedBaselineStaleness;
 
 impl IssueFilters {
@@ -29,8 +29,10 @@ impl IssueFilters {
             | "dev_dependencies_in_production" => self.unused_deps,
             "unused_enum_members" => self.unused_enum_members,
             "unused_class_members" => self.unused_class_members,
+            "unused_namespace_members" => self.unused_namespace_members,
             "unused_store_members" => self.unused_store_members,
             "unlisted_dependencies" => self.unlisted_deps,
+            "unlisted_binaries" => self.unlisted_binaries,
             "unprovided_injects" => self.unprovided_injects,
             "unrendered_components" => self.unrendered_components,
             "absent_component_props" => self.absent_component_props,
@@ -51,6 +53,7 @@ impl IssueFilters {
             "route_collisions" => self.route_collisions,
             "dynamic_segment_name_conflicts" => self.dynamic_segment_name_conflicts,
             "duplicate_exports" => self.duplicate_exports,
+            "duplicate_export_aliases" => self.duplicate_export_aliases,
             "circular_dependencies" => self.circular_deps,
             "re_export_cycles" => self.re_export_cycles,
             "package_cycles" => self.package_cycles,
@@ -205,24 +208,35 @@ pub(super) fn warn_about_another_install_state(
     io: &BaselineIo<'_>,
 ) -> Option<WorkspaceDiagnostic> {
     let diagnostic = fallow_engine::baseline::install_state_diagnostic(
-        io.root,
+        &io.config.root,
         baseline_path,
         content,
-        fallow_config::node_modules_state(io.root),
+        fallow_config::node_modules_state(&io.config.root),
     )?;
     eprintln!("Warning: {}", diagnostic.message);
     Some(diagnostic)
 }
 
 /// The notes that the run adds to `workspace_diagnostics`: the unmatched
-/// config patterns, and the install-state note of the loaded baseline.
+/// config patterns, the requested checks whose rule is off, and the
+/// install-state note of the loaded baseline.
 pub(super) fn run_notes(
     config: &ResolvedConfig,
-    reports_dependencies: bool,
+    opts: &CheckOptions<'_>,
     loaded: Option<&LoadedBaselineStaleness>,
 ) -> Vec<WorkspaceDiagnostic> {
+    // A `--file` run drops dependency findings, so it reports none, like a
+    // filter without the dependency issue types.
+    let reports_dependencies = opts.filters.reports_dependency_findings() && opts.file.is_empty();
     let mut notes =
         fallow_engine::dead_code::config_pattern_diagnostics(config, reports_dependencies);
+    notes.extend(
+        fallow_engine::requested_rule_off::requested_rule_off_diagnostics(
+            config,
+            &opts.surface.requested_flags(opts.filters),
+            reports_dependencies,
+        ),
+    );
     notes.extend(loaded.and_then(|loaded| loaded.install_state.clone()));
     notes
 }

@@ -3,6 +3,7 @@ mod jsonc;
 mod knip;
 mod knip_fields;
 mod knip_regex;
+mod knip_scoped;
 mod knip_tables;
 mod stylelint;
 #[cfg(test)]
@@ -12,6 +13,7 @@ mod toml_gen;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::exit_codes::exit_invalid_input;
 use jscpd::migrate_jscpd;
 use jsonc::generate_jsonc;
 use knip::migrate_knip;
@@ -111,13 +113,13 @@ pub fn run_migrate(
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {e}");
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
     };
 
     if result.sources.is_empty() {
         eprintln!("No knip, jscpd, or stylelint configuration found to migrate.");
-        return ExitCode::from(2);
+        return exit_invalid_input();
     }
 
     let format = OutputFormat::pick(use_toml, use_jsonc, &result);
@@ -136,7 +138,7 @@ pub fn run_migrate(
         let output_path = root.join(filename);
         if let Err(e) = std::fs::write(&output_path, &output_content) {
             eprintln!("Error: failed to write {filename}: {e}");
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
         eprintln!("Created {filename}");
     }
@@ -157,7 +159,7 @@ fn reject_existing_fallow_config(root: &Path) -> Option<ExitCode> {
     for name in &existing_names {
         if root.join(name).exists() {
             eprintln!("Error: {name} already exists. Remove it first or use --dry-run to preview.");
-            return Some(ExitCode::from(2));
+            return Some(exit_invalid_input());
         }
     }
     None

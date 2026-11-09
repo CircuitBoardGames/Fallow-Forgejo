@@ -425,6 +425,11 @@ impl DupesReportPayload {
     }
 }
 
+/// The number of fragment characters in the CodeClimate fingerprint of a
+/// clone instance. The count leaves out `\r`, so a CRLF checkout and an LF
+/// checkout of the same code give the same fingerprint.
+const CODECLIMATE_FRAGMENT_PREFIX_CHARS: usize = 64;
+
 /// Build CodeClimate issues from duplication analysis results.
 ///
 /// `fallow-output` owns the CodeClimate wire DTOs. This API layer combines
@@ -449,7 +454,13 @@ pub fn build_duplication_codeclimate(
         let fragment_prefix: String = group
             .instances
             .first()
-            .map(|inst| inst.fragment.chars().take(64).collect())
+            .map(|inst| {
+                inst.fragment
+                    .chars()
+                    .filter(|&c| c != '\r')
+                    .take(CODECLIMATE_FRAGMENT_PREFIX_CHARS)
+                    .collect()
+            })
             .unwrap_or_default();
 
         for (instance_index, instance) in group.instances.iter().enumerate() {
@@ -500,6 +511,29 @@ pub fn build_duplication_codeclimate(
     issues
 }
 
+/// Set the audit attribution on the issues of [`build_duplication_codeclimate`].
+///
+/// `introduced` holds one audit flag per clone group, in report order. Each
+/// group gives one issue per instance, so the instances of one group get the
+/// flag of that group. The inline review comment then states if the change
+/// introduced the clone group.
+pub fn set_duplication_audit_attribution(
+    issues: &mut [CodeClimateIssue],
+    report: &DuplicationReport,
+    introduced: impl IntoIterator<Item = bool>,
+) {
+    let mut remaining = issues;
+    for (group, introduced) in report.clone_groups.iter().zip(introduced) {
+        let count = group.instances.len().min(remaining.len());
+        let (group_issues, rest) = remaining.split_at_mut(count);
+        let context = crate::dead_code_codeclimate::audit_review_context(introduced);
+        for issue in group_issues {
+            issue.audit = Some(context);
+        }
+        remaining = rest;
+    }
+}
+
 fn codeclimate_path(path: &Path, root: &Path) -> String {
     normalize_uri(
         &path
@@ -543,6 +577,95 @@ mod tests {
             token_count: 100,
             line_count: 20,
             similarity: None,
+        }
+    }
+
+    fn report_with_fragment(fragment: &str) -> DuplicationReport {
+        let mut clones = group(2);
+        for instance in &mut clones.instances {
+            instance.fragment = fragment.to_owned();
+        }
+        DuplicationReport {
+            clone_groups: vec![clones],
+            clone_families: Vec::new(),
+            mirrored_directories: Vec::new(),
+            stats: DuplicationStats::default(),
+        }
+    }
+
+    fn codeclimate_fingerprints(fragment: &str) -> Vec<String> {
+        build_duplication_codeclimate(&report_with_fragment(fragment), Path::new("/root"))
+            .into_iter()
+            .map(|issue| issue.fingerprint)
+            .collect()
+    }
+
+    /// The prefix holds more than 64 characters, so each `\r` moves a later
+    /// character out of a raw 64-character prefix.
+    const LF_FRAGMENT: &str = "export function total(items) {\n  let sum = 0;\n  for (const item of items) {\n    sum += item.price;\n  }\n  return sum;\n}\n";
+
+    #[test]
+    fn codeclimate_clone_fingerprints_ignore_crlf_line_endings() {
+        let crlf = LF_FRAGMENT.replace('\n', "\r\n");
+        assert_eq!(
+            codeclimate_fingerprints(LF_FRAGMENT),
+            codeclimate_fingerprints(&crlf)
+        );
+    }
+
+    #[test]
+    fn codeclimate_clone_fingerprints_keep_the_lf_hash() {
+        let prefix: String = LF_FRAGMENT.chars().take(64).collect();
+        let expected: Vec<String> = ["/root/file_0.ts", "/root/file_1.ts"]
+            .iter()
+            .map(|path| {
+                codeclimate_fingerprint_hash(&[
+                    "fallow/code-duplication",
+                    &codeclimate_path(Path::new(path), Path::new("/root")),
+                    "1",
+                    "100",
+                    "20",
+                    &prefix,
+                ])
+            })
+            .collect();
+        assert_eq!(codeclimate_fingerprints(LF_FRAGMENT), expected);
+    }
+
+    #[test]
+    fn duplication_audit_attribution_follows_each_group() {
+        use fallow_output::AuditFindingAttribution as A;
+        let report = DuplicationReport {
+            clone_groups: vec![group(2), group(3)],
+            clone_families: Vec::new(),
+            mirrored_directories: Vec::new(),
+            stats: DuplicationStats::default(),
+        };
+        let root = Path::new("/root");
+        let plain = build_duplication_codeclimate(&report, root);
+        let mut issues = plain.clone();
+        set_duplication_audit_attribution(&mut issues, &report, [false, true]);
+        let attributions: Vec<_> = issues
+            .iter()
+            .map(|issue| issue.audit.map(|context| context.attribution))
+            .collect();
+        assert_eq!(
+            attributions,
+            [
+                Some(A::Inherited),
+                Some(A::Inherited),
+                Some(A::Introduced),
+                Some(A::Introduced),
+                Some(A::Introduced),
+            ]
+        );
+        for (with, without) in issues.iter().zip(&plain) {
+            assert_eq!(with.fingerprint, without.fingerprint);
+            assert_eq!(
+                serde_json::to_value(with).expect("issue serializes"),
+                serde_json::to_value(without).expect("issue serializes"),
+                "the wire shape does not carry the attribution"
+            );
         }
     }
 

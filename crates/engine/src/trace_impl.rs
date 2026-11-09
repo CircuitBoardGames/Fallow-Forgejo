@@ -724,7 +724,7 @@ pub fn trace_class_member(
         MemberKind::ClassProperty => ("class-property", Some("--unused-class-members")),
         MemberKind::EnumMember => ("enum-member", Some("--unused-enum-members")),
         MemberKind::StoreMember => ("store-member", Some("--unused-store-members")),
-        MemberKind::NamespaceMember => ("namespace-member", None),
+        MemberKind::NamespaceMember => ("namespace-member", Some("--unused-namespace-members")),
     };
 
     let reason = class_member_trace_reason(
@@ -904,7 +904,7 @@ pub fn trace_file(graph: &ModuleGraph, root: &Path, file_path: &str) -> Option<F
         imports_from: traced_imports_from(graph, root, module),
         imported_by: traced_imported_by(graph, root, module),
         re_exports: traced_re_exports(graph, root, module),
-        sources: Vec::new(),
+        ..FileTrace::default()
     })
 }
 
@@ -3600,7 +3600,7 @@ mod tests {
                 imported_name: "foo".to_string(),
                 exported_name: "foo".to_string(),
             }],
-            sources: Vec::new(),
+            ..FileTrace::default()
         };
         let json = serde_json::to_string(&trace).expect("serializes");
         assert!(json.contains("\"file\":\"src/utils.ts\""), "got {json}");

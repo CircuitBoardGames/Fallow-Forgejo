@@ -10,9 +10,10 @@
 //! stays TypeScript, JSX stays JSX) and runner transforms see the original
 //! syntax.
 //!
-//! Subsumption is a static rule: negate-condition gives no mutant for a test
-//! that is a comparison or a logical expression, because the relational and
-//! logical operator mutants of that test cover it.
+//! Two rules can give the same replacement at the same span, for example the
+//! relational constant `true` of `a === b` and the `negate-condition` mutant
+//! of `a === b` as an operand of `&&`. The site keeps the first candidate
+//! that the selected operators allow, so each mutated text is one mutant.
 
 mod blocks;
 mod collect;
@@ -21,6 +22,7 @@ mod id;
 mod logging_only;
 mod operator;
 mod regex;
+mod replacements;
 
 use serde::Serialize;
 
@@ -154,14 +156,16 @@ pub struct MutantChange {
 
 impl MutantChange {
     /// Placeholder for the test of a condition.
-    pub const CONDITION: &'static str = "<condition>";
+    const CONDITION: &'static str = "<condition>";
     /// Placeholder for a call statement.
-    pub const CALL: &'static str = "<call>";
+    const CALL: &'static str = "<call>";
     /// Placeholder for an expression, for example a returned value or a
     /// comparison.
-    pub const EXPRESSION: &'static str = "<expression>";
+    const EXPRESSION: &'static str = "<expression>";
     /// Placeholder for a non-empty string literal.
     pub const STRING: &'static str = "<string>";
+    /// Placeholder for a non-empty template literal.
+    const TEMPLATE: &'static str = "<template>";
 
     /// A change from `from` to `to`.
     pub const fn new(from: &'static str, to: &'static str) -> Self {
@@ -305,7 +309,7 @@ pub fn instrument(
 }
 
 /// One source text for [`instrument_text`]: a whole file or one script block.
-pub(crate) struct TextInput<'s> {
+struct TextInput<'s> {
     pub(crate) source: &'s str,
     pub(crate) path: &'s str,
     pub(crate) kind: SourceKind,
@@ -318,7 +322,7 @@ pub(crate) struct TextInput<'s> {
 /// Instruments one text. The spans, lines and columns of the result are
 /// relative to the text. `seen_ids` holds the ids of earlier texts of the
 /// same file, so that each id stays unique in the file.
-pub(crate) fn instrument_text(
+fn instrument_text(
     input: &TextInput<'_>,
     options: &MutationOptions,
     seen_ids: &mut std::collections::BTreeSet<MutantId>,

@@ -131,7 +131,16 @@ mod orchestration {
     use std::path::PathBuf;
 
     fn find_dead_code(graph: &ModuleGraph, config: &ResolvedConfig) -> AnalysisResults {
-        find_dead_code_full(graph, config, &[], None, &[], &[], false)
+        find_dead_code_full(
+            graph,
+            config,
+            &[],
+            None,
+            &[],
+            &[],
+            false,
+            &FxHashSet::default(),
+        )
     }
 
     fn make_config_with_rules(rules: RulesConfig) -> ResolvedConfig {
@@ -161,6 +170,7 @@ mod orchestration {
         unused_optional_dependencies: Severity::Off,
         unused_enum_members: Severity::Off,
         unused_class_members: Severity::Off,
+        unused_namespace_members: Severity::Off,
         unused_store_members: Severity::Off,
         unprovided_injects: Severity::Off,
         unrendered_components: Severity::Off,
@@ -189,7 +199,9 @@ mod orchestration {
         complexity_file_lines: Severity::Off,
         unresolved_imports: Severity::Off,
         unlisted_dependencies: Severity::Off,
+        unlisted_binaries: Severity::Off,
         duplicate_exports: Severity::Off,
+        duplicate_export_aliases: Severity::Off,
         type_only_dependencies: Severity::Off,
         circular_dependencies: Severity::Off,
         re_export_cycle: Severity::Off,
@@ -386,6 +398,7 @@ mod orchestration {
             &[],
             &[],
             false, // collect_usages = false
+            &FxHashSet::default(),
         );
         assert!(
             results_no_collect.export_usages.is_empty(),
@@ -400,6 +413,7 @@ mod orchestration {
             &[],
             &[],
             true, // collect_usages = true
+            &FxHashSet::default(),
         );
         assert!(
             !results_with_collect.export_usages.is_empty(),
@@ -474,7 +488,16 @@ mod orchestration {
         };
         let config = make_config_with_rules(rules);
 
-        let results = find_dead_code_full(&graph, &config, &[], None, &[], &modules, false);
+        let results = find_dead_code_full(
+            &graph,
+            &config,
+            &[],
+            None,
+            &[],
+            &modules,
+            false,
+            &FxHashSet::default(),
+        );
 
         assert!(
             !results.unused_files.iter().any(|f| f

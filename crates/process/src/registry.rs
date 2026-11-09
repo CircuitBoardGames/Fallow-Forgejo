@@ -47,13 +47,31 @@ pub fn register_process_tree(process_tree: ProcessTreeHandle) -> u64 {
     register_target(KillTarget::ProcessTree(process_tree))
 }
 
+/// A target that registers after a drain began misses the drain snapshot,
+/// so it is killed at once. The drain sets `DRAINING` before it takes the
+/// registry lock for the snapshot, so each target is in the snapshot or
+/// sees the flag.
 fn register_target(target: KillTarget) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, target);
+    if let Some(late) = insert_unless_draining(registry(), &DRAINING, id, target) {
+        kill_target(&late);
+    }
     id
+}
+
+/// Inserts `target`, or gives it back when `draining` is set.
+fn insert_unless_draining(
+    registry: &Mutex<FxHashMap<u64, KillTarget>>,
+    draining: &AtomicU64,
+    id: u64,
+    target: KillTarget,
+) -> Option<KillTarget> {
+    let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if draining.load(Ordering::SeqCst) != 0 {
+        return Some(target);
+    }
+    registry.insert(id, target);
+    None
 }
 
 /// Remove the registry entry for `id`. Idempotent.
@@ -82,6 +100,7 @@ pub fn drain_and_kill() {
     if !begin_drain() {
         return;
     }
+    crate::cleanup_paths::close_registry();
     let targets: Vec<KillTarget> = registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -89,25 +108,34 @@ pub fn drain_and_kill() {
         .map(|(_id, target)| target)
         .collect();
     kill_and_wait(&targets);
+    crate::cleanup_paths::delete_registered();
 }
 
 /// Like [`drain_and_kill`], but returns at once when another thread holds
 /// the registry lock. A panic hook calls this: a blocking lock would
 /// deadlock when the panicking thread itself holds the lock.
 pub fn try_drain_and_kill() {
-    let targets: Vec<KillTarget> = match registry().try_lock() {
+    let targets = match registry().try_lock() {
         Ok(mut guard) => drain_targets(&mut guard),
         Err(TryLockError::Poisoned(error)) => drain_targets(&mut error.into_inner()),
         Err(TryLockError::WouldBlock) => return,
     };
+    // Another drain owns the shutdown and deletes the paths after its
+    // children end. A deletion here could run under live children.
+    let Some(targets) = targets else {
+        return;
+    };
     kill_and_wait(&targets);
+    crate::cleanup_paths::try_delete_registered();
 }
 
-fn drain_targets(registry: &mut FxHashMap<u64, KillTarget>) -> Vec<KillTarget> {
+/// The targets of the registry, or `None` when another drain already began.
+fn drain_targets(registry: &mut FxHashMap<u64, KillTarget>) -> Option<Vec<KillTarget>> {
     if !begin_drain() {
-        return Vec::new();
+        return None;
     }
-    registry.drain().map(|(_id, target)| target).collect()
+    crate::cleanup_paths::close_registry();
+    Some(registry.drain().map(|(_id, target)| target).collect())
 }
 
 fn begin_drain() -> bool {
@@ -384,6 +412,26 @@ mod tests {
             !alive,
             "killed and unreaped process tree still counts as alive"
         );
+    }
+
+    /// A mutation companion can start while the signal thread kills the
+    /// drained children. It is not in the drain snapshot, so the
+    /// registration must give it back for an immediate kill.
+    #[test]
+    fn a_target_that_registers_during_a_drain_is_given_back() {
+        let local = Mutex::new(FxHashMap::default());
+        let draining = AtomicU64::new(0);
+        assert!(insert_unless_draining(&local, &draining, 1, KillTarget::Process(42)).is_none());
+        draining.store(1, Ordering::SeqCst);
+        let late = insert_unless_draining(&local, &draining, 2, KillTarget::Process(43));
+        assert!(matches!(late, Some(KillTarget::Process(43))));
+        let registered: Vec<u64> = local
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(registered, vec![1]);
     }
 
     #[test]

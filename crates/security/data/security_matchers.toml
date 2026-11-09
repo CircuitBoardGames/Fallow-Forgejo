@@ -48,6 +48,19 @@
 # binding sourced from a [[source]] path. Use this for broad sinks like
 # Object.assign, where source-free non-literal values are too noisy.
 #
+# Optional requires_module_source = true is a looser gate for broad sinks whose
+# input usually arrives through a helper call: the row fires when the argument
+# traces to a source, or when the sink module itself reads untrusted input. A
+# module that only imports or is imported by such a module does not count: a
+# dev server imports its whole build pipeline. A `secret = true` source never
+# counts. Optional ignored_source_kinds lists source kinds that neither back
+# the row nor satisfy this gate.
+#
+# A `secret = true` source (`process.env`) is a deployment secret, not attacker
+# input. It backs a row only when the row names its kind in
+# `requires_source_kinds`, or sets `secret_sources = true` (a secret in a log is
+# the defect itself).
+#
 # Optional literal_values / literal_contains match captured string literals.
 # Optional literal_integers matches captured integer literals. Optional
 # object_properties matches exact literal object keys. Optional
@@ -86,6 +99,18 @@ callee_patterns = ["*.insertAdjacentHTML"]
 arg_index = 1
 evidence_template = "Non-literal HTML passed to {callee}(). Candidate for verification: confirm the markup is not attacker-controlled or is sanitized."
 
+# `Range.createContextualFragment()` parses its argument as markup, and any
+# script in the fragment runs when the fragment enters the document.
+[[matcher]]
+id = "dangerous-html"
+cwe = 79
+title = "Dangerous HTML sink"
+effect = "dom"
+sink_shape = "member-call"
+callee_patterns = ["*.createContextualFragment"]
+arg_index = 0
+evidence_template = "Non-literal HTML passed to {callee}(). Candidate for verification: confirm the markup is not attacker-controlled or is sanitized."
+
 [[matcher]]
 id = "dangerous-html"
 cwe = 79
@@ -95,6 +120,30 @@ sink_shape = "jsx-attr"
 callee_patterns = ["dangerouslySetInnerHTML"]
 arg_index = 0
 evidence_template = "Non-literal value bound to {callee}. Candidate for verification: confirm the HTML is sanitized (e.g. via DOMPurify) before render."
+
+# An iframe `srcdoc` renders its value as a full HTML document, so it is the
+# same XSS class as innerHTML. The extractor maps `el.setAttribute("srcdoc", x)`
+# to the `el.srcdoc` member-assign shape, and framework template bindings
+# (`:srcdoc`, `[srcdoc]`, `srcdoc={x}`) to `template.srcdoc`.
+[[matcher]]
+id = "dangerous-html"
+cwe = 79
+title = "Dangerous HTML sink"
+effect = "dom"
+sink_shape = "member-assign"
+callee_patterns = ["*.srcdoc"]
+arg_index = 0
+evidence_template = "Non-literal HTML assigned to {callee} (the iframe renders it as a full document). Candidate for verification: confirm the markup is not attacker-controlled or is sanitized."
+
+[[matcher]]
+id = "dangerous-html"
+cwe = 79
+title = "Dangerous HTML sink"
+effect = "dom"
+sink_shape = "jsx-attr"
+callee_patterns = ["srcDoc", "srcdoc"]
+arg_index = 0
+evidence_template = "Non-literal HTML bound to the iframe {callee} prop (rendered as a full document). Candidate for verification: confirm the markup is not attacker-controlled or is sanitized."
 
 # ── CWE-79: Template escape bypass (issue #897) ─────────────────────────────
 # Wrapping a non-literal value in a template engine's "safe string" marker tells
@@ -131,11 +180,50 @@ id = "command-injection"
 cwe = 78
 title = "OS command injection sink"
 effect = "shell"
-sink_shape = "call"
-callee_patterns = ["exec", "execSync", "spawn", "spawnSync"]
+sink_shape = "member-call"
+callee_patterns = ["node:child_process.exec", "node:child_process.execSync", "node:child_process.spawn", "node:child_process.spawnSync"]
 arg_index = 0
 import_provenance = "node:child_process"
 evidence_template = "Non-literal command passed to {callee}(). Candidate for verification: confirm the command/args are not attacker-controlled."
+
+[[matcher]]
+id = "command-injection"
+cwe = 78
+title = "OS command injection sink"
+effect = "shell"
+sink_shape = "member-call"
+callee_patterns = ["shell.exec", "shelljs.exec"]
+arg_index = 0
+import_provenance = "shelljs"
+evidence_template = "Non-literal command passed to {callee}(). Candidate for verification: confirm the command/args are not attacker-controlled."
+
+# `execFile` runs no shell, and tooling code runs computed binary paths all the
+# time. These rows therefore need untrusted input in the argument or module.
+[[matcher]]
+id = "command-injection"
+cwe = 78
+title = "OS command injection sink"
+effect = "shell"
+sink_shape = "member-call"
+callee_patterns = ["child_process.execFile", "child_process.execFileSync"]
+arg_index = 0
+import_provenance = "node:child_process"
+requires_module_source = true
+ignored_source_kinds = ["process-argv"]
+evidence_template = "Non-literal program path passed to {callee}(). Candidate for verification: confirm the program is not attacker-controlled."
+
+[[matcher]]
+id = "command-injection"
+cwe = 78
+title = "OS command injection sink"
+effect = "shell"
+sink_shape = "member-call"
+callee_patterns = ["node:child_process.execFile", "node:child_process.execFileSync"]
+arg_index = 0
+import_provenance = "node:child_process"
+requires_module_source = true
+ignored_source_kinds = ["process-argv"]
+evidence_template = "Non-literal program path passed to {callee}(). Candidate for verification: confirm the program is not attacker-controlled."
 
 # ── CWE-94/95: Code injection ───────────────────────────────────────────────
 [[matcher]]
@@ -154,10 +242,29 @@ cwe = 94
 title = "Code injection sink"
 effect = "process"
 sink_shape = "member-call"
-callee_patterns = ["vm.runInNewContext", "vm.runInThisContext", "vm.runInContext"]
+# The extractor resolves a named import (`import { runInNewContext } from "vm"`),
+# a default or namespace import (`import vm from "vm"`) and a CommonJS binding
+# (`const { runInThisContext } = require("vm")`) to the `node:vm.<member>`
+# path. That path proves the provenance on its own.
+callee_patterns = ["vm.runInNewContext", "vm.runInThisContext", "vm.runInContext", "vm.compileFunction", "node:vm.runInNewContext", "node:vm.runInThisContext", "node:vm.runInContext", "node:vm.compileFunction"]
 arg_index = 0
 import_provenance = "node:vm"
 evidence_template = "Non-literal code passed to {callee}(). Candidate for verification: confirm the script source is trusted."
+
+# `new vm.Script(code)` compiles its first argument. A named import
+# (`import { Script } from "vm"`) and a `require("vm")` binding resolve to
+# `node:vm.Script`. A local class named `Script` keeps the bare name and
+# matches no row.
+[[matcher]]
+id = "code-injection"
+cwe = 94
+title = "Code injection sink"
+effect = "process"
+sink_shape = "new-expression"
+callee_patterns = ["vm.Script", "node:vm.Script"]
+arg_index = 0
+import_provenance = "node:vm"
+evidence_template = "Non-literal code passed to new {callee}(). Candidate for verification: confirm the script source is trusted."
 
 [[matcher]]
 id = "code-injection"
@@ -169,6 +276,17 @@ callee_patterns = ["setTimeout", "setInterval"]
 arg_index = 0
 arg_kinds = ["literal"]
 evidence_template = "String code passed to {callee}(). Candidate for verification: prefer a function callback over evaluating a string."
+
+[[matcher]]
+id = "code-injection"
+cwe = 95
+title = "String-code timer sink"
+effect = "process"
+sink_shape = "call"
+callee_patterns = ["setTimeout", "setInterval"]
+arg_index = 0
+arg_kinds = ["concat", "template-with-subst"]
+evidence_template = "Built string code passed to {callee}(). Candidate for verification: prefer a function callback over evaluating a string."
 
 [[matcher]]
 id = "code-injection"
@@ -191,9 +309,57 @@ callee_patterns = ["Function"]
 arg_index = 0
 evidence_template = "Non-literal value passed to new {callee}(). Candidate for verification: confirm generated code cannot be influenced by attacker input."
 
+# `Function(code)` without `new`, `Function.prototype.constructor(code)` and
+# `x.constructor.constructor(code)` all reach the Function constructor.
+[[matcher]]
+id = "code-injection"
+cwe = 95
+title = "Function constructor sink"
+effect = "process"
+sink_shape = "call"
+callee_patterns = ["Function"]
+arg_index = 0
+evidence_template = "Non-literal value passed to {callee}(). Candidate for verification: confirm generated code cannot be influenced by attacker input."
+
+[[matcher]]
+id = "code-injection"
+cwe = 95
+title = "Function constructor sink"
+effect = "process"
+sink_shape = "member-call"
+callee_patterns = ["Function.prototype.constructor", "*.constructor.constructor"]
+arg_index = 0
+evidence_template = "Non-literal value passed to {callee}() (reaches the Function constructor). Candidate for verification: confirm generated code cannot be influenced by attacker input."
+
+# A `<script>` element loads its `src` and runs its text. The extractor maps an
+# assignment on a local bound to `document.createElement("script")` to the
+# `HTMLScriptElement.<property>` path. The same property on another element
+# (`img.src`, `span.textContent`) keeps its member path and matches no row.
+[[matcher]]
+id = "code-injection"
+cwe = 94
+title = "Script element source sink"
+effect = "dom"
+sink_shape = "member-assign"
+callee_patterns = ["HTMLScriptElement.src"]
+arg_index = 0
+evidence_template = "Non-literal URL assigned to {callee} (the browser loads and runs the script). Candidate for verification: confirm the script URL is not attacker-controlled or comes from an allowlisted origin."
+
+[[matcher]]
+id = "code-injection"
+cwe = 94
+title = "Inline script sink"
+effect = "dom"
+sink_shape = "member-assign"
+callee_patterns = ["HTMLScriptElement.text", "HTMLScriptElement.textContent", "HTMLScriptElement.innerText"]
+arg_index = 0
+evidence_template = "Non-literal code assigned to {callee} (the browser runs it as a script). Candidate for verification: confirm generated code cannot be influenced by attacker input."
+
 # Dynamic regex construction from a non-literal pattern can let untrusted input
 # select a pathological expression or alter matching semantics. Literal regex
-# complexity analysis is intentionally out of scope for this row.
+# complexity analysis is intentionally out of scope for this row. Libraries
+# build regexes from their own option values and escape helpers all the time,
+# so the rows require a source-backed pattern, like `redos-regex`.
 [[matcher]]
 id = "dynamic-regex"
 cwe = 1333
@@ -202,6 +368,7 @@ effect = "process"
 sink_shape = "call"
 callee_patterns = ["RegExp"]
 arg_index = 0
+requires_source = true
 evidence_template = "Non-literal pattern passed to {callee}(). Candidate for verification: confirm attacker input cannot control the regular expression."
 
 [[matcher]]
@@ -212,6 +379,7 @@ effect = "process"
 sink_shape = "new-expression"
 callee_patterns = ["RegExp"]
 arg_index = 0
+requires_source = true
 evidence_template = "Non-literal pattern passed to new {callee}(). Candidate for verification: confirm attacker input cannot control the regular expression."
 
 [[matcher]]
@@ -330,8 +498,62 @@ cwe = 918
 title = "Server-side request forgery sink"
 effect = "network"
 sink_shape = "member-call"
-callee_patterns = ["axios.get", "axios.post", "http.request", "https.request", "superagent.get", "undici.request"]
+callee_patterns = [
+  "axios.get",
+  "axios.post",
+  "axios.put",
+  "axios.patch",
+  "axios.delete",
+  "axios.head",
+  "got.get",
+  "got.post",
+  "got.put",
+  "got.patch",
+  "got.delete",
+  "http.request",
+  "https.request",
+  "superagent.get",
+  "undici.request",
+]
 arg_index = 0
+evidence_template = "Non-literal URL passed to {callee}(). Candidate for verification: confirm the destination is not attacker-controlled."
+
+# A bare axios() call usually takes a config object, inline or in a variable,
+# so this row admits only a template, a concatenation or a call result.
+[[matcher]]
+id = "ssrf"
+cwe = 918
+title = "Server-side request forgery sink"
+effect = "network"
+sink_shape = "call"
+callee_patterns = ["axios"]
+arg_index = 0
+arg_kinds = ["template-with-subst", "concat", "call"]
+import_provenance = "axios"
+evidence_template = "Non-literal URL passed to {callee}(). Candidate for verification: confirm the destination is not attacker-controlled."
+
+# An Angular HttpClient is often a local named `http`, so `get` needs the Node
+# module import.
+[[matcher]]
+id = "ssrf"
+cwe = 918
+title = "Server-side request forgery sink"
+effect = "network"
+sink_shape = "member-call"
+callee_patterns = ["http.get"]
+arg_index = 0
+import_provenance = "node:http"
+evidence_template = "Non-literal URL passed to {callee}(). Candidate for verification: confirm the destination is not attacker-controlled."
+
+[[matcher]]
+id = "ssrf"
+cwe = 918
+title = "Server-side request forgery sink"
+effect = "network"
+sink_shape = "member-call"
+callee_patterns = ["https.get"]
+arg_index = 0
+import_provenance = "node:https"
 evidence_template = "Non-literal URL passed to {callee}(). Candidate for verification: confirm the destination is not attacker-controlled."
 
 [[matcher]]
@@ -390,6 +612,15 @@ requires_source_kinds = ["process-env", "import-meta-env"]
 evidence_template = "A non-public env secret reaches the body/options of {callee}(). Candidate for verification: confirm this credential is intended for this destination (an auth header sent to the credential's own provider is normal); review only if the destination is untrusted or not the credential's provider."
 
 # ── CWE-22: Path traversal ──────────────────────────────────────────────────
+# Build, CLI and config code joins paths from options all the time. The
+# `path.join` / `path.resolve` row therefore needs untrusted input in the
+# argument, in the same module (a static-file middleware reads `req.url`), or
+# in every direct importer (a handler passes its input to a helper). A module
+# that build code also imports, and a module two imports away, stay quiet,
+# because a dev server imports its config and its whole build pipeline.
+# CLI arguments do not count: the user who runs a CLI owns its file system.
+# The `fs.readFile` and `fs.rename` rows stay ungated. The other file-system
+# rows use this gate.
 [[matcher]]
 id = "path-traversal"
 cwe = 22
@@ -400,6 +631,8 @@ callee_patterns = ["path.join", "path.resolve"]
 arg_index = 0
 variadic = true
 import_provenance = "node:path"
+requires_module_source = true
+ignored_source_kinds = ["process-argv"]
 evidence_template = "Non-literal path component passed to {callee}(). Candidate for verification: confirm the input cannot escape the intended directory (reject `..`)."
 
 [[matcher]]
@@ -413,6 +646,67 @@ arg_index = 0
 import_provenance = "node:fs"
 evidence_template = "Non-literal file-system path passed to {callee}(). Candidate for verification: confirm the input cannot escape the intended directory (reject `..`)."
 
+# The rows below cover the other write and delete calls, and named imports
+# (`import { readFile } from "node:fs/promises"`). Build and CLI code calls
+# them with computed paths all the time, so they use the `path.join` source
+# gate. The extractor writes a named binding (`readFile`, also aliased or
+# destructured from `require()`) as `node:fs.readFile`. A default or namespace
+# ES import keeps its written path (`fs.readFile` after `import fs from "fs"`),
+# so the rows above match it. A `require()` module binding and a member
+# binding (`fsp.readFile` after `import { promises as fsp } from "fs"`) take
+# the `node:fs` path.
+[[matcher]]
+id = "path-traversal"
+cwe = 22
+title = "File-system path traversal sink"
+effect = "storage"
+sink_shape = "member-call"
+callee_patterns = [
+  "fs.writeFileSync",
+  "fs.appendFile",
+  "fs.appendFileSync",
+  "fs.createWriteStream",
+  "fs.unlinkSync",
+  "fs.rm",
+  "fs.rmSync",
+  "fs.copyFile",
+  "fs.copyFileSync",
+]
+arg_index = 0
+import_provenance = "node:fs"
+requires_module_source = true
+ignored_source_kinds = ["process-argv"]
+evidence_template = "Non-literal file-system path passed to {callee}(). Candidate for verification: confirm the input cannot escape the intended directory (reject `..`)."
+
+[[matcher]]
+id = "path-traversal"
+cwe = 22
+title = "File-system path traversal sink"
+effect = "storage"
+sink_shape = "member-call"
+callee_patterns = [
+  "node:fs.readFile",
+  "node:fs.readFileSync",
+  "node:fs.writeFile",
+  "node:fs.writeFileSync",
+  "node:fs.appendFile",
+  "node:fs.appendFileSync",
+  "node:fs.createReadStream",
+  "node:fs.createWriteStream",
+  "node:fs.unlink",
+  "node:fs.unlinkSync",
+  "node:fs.rm",
+  "node:fs.rmSync",
+  "node:fs.rename",
+  "node:fs.copyFile",
+  "node:fs.copyFileSync",
+]
+arg_index = 0
+import_provenance = "node:fs"
+requires_module_source = true
+ignored_source_kinds = ["process-argv"]
+evidence_template = "Non-literal file-system path passed to {callee}(). Candidate for verification: confirm the input cannot escape the intended directory (reject `..`)."
+
 [[matcher]]
 id = "path-traversal"
 cwe = 22
@@ -424,7 +718,22 @@ arg_index = 1
 import_provenance = "node:fs"
 evidence_template = "Non-literal file-system path passed to {callee}(). Candidate for verification: confirm the destination cannot escape the intended directory (reject `..`)."
 
+[[matcher]]
+id = "path-traversal"
+cwe = 22
+title = "File-system path traversal sink"
+effect = "storage"
+sink_shape = "member-call"
+callee_patterns = ["node:fs.rename", "node:fs.copyFile", "node:fs.copyFileSync", "fs.copyFile", "fs.copyFileSync"]
+arg_index = 1
+import_provenance = "node:fs"
+requires_module_source = true
+ignored_source_kinds = ["process-argv"]
+evidence_template = "Non-literal file-system path passed to {callee}(). Candidate for verification: confirm the destination cannot escape the intended directory (reject `..`)."
+
 # ── CWE-113: HTTP response header injection ─────────────────────────────────
+# Node rejects CR/LF in header values, and adapters copy their own header maps
+# into the response. The rows therefore require a source-backed value.
 [[matcher]]
 id = "header-injection"
 cwe = 113
@@ -433,6 +742,7 @@ effect = "network"
 sink_shape = "member-call"
 callee_patterns = ["*.setHeader"]
 arg_index = 1
+requires_source = true
 evidence_template = "Non-literal header value passed to {callee}(). Candidate for verification: confirm CR/LF and untrusted header content are rejected before writing the response."
 
 [[matcher]]
@@ -443,6 +753,7 @@ effect = "network"
 sink_shape = "member-call"
 callee_patterns = ["*.writeHead"]
 arg_index = 1
+requires_source = true
 evidence_template = "Non-literal headers object passed to {callee}(). Candidate for verification: confirm attacker input cannot inject response header names or values."
 
 # ── CWE-601: Open redirect ──────────────────────────────────────────────────
@@ -678,8 +989,8 @@ id = "world-writable-permission"
 cwe = 732
 title = "World-writable chmod mode"
 effect = "storage"
-sink_shape = "call"
-callee_patterns = ["chmod", "chmodSync"]
+sink_shape = "member-call"
+callee_patterns = ["node:fs.chmod", "node:fs.chmodSync"]
 arg_index = 1
 arg_kinds = ["literal"]
 literal_integers = [511]
@@ -704,8 +1015,8 @@ id = "insecure-temp-file"
 cwe = 377
 title = "Predictable temporary file path"
 effect = "storage"
-sink_shape = "call"
-callee_patterns = ["writeFile", "writeFileSync", "appendFile", "appendFileSync", "createWriteStream"]
+sink_shape = "member-call"
+callee_patterns = ["node:fs.writeFile", "node:fs.writeFileSync", "node:fs.appendFile", "node:fs.appendFileSync", "node:fs.createWriteStream"]
 arg_index = 0
 arg_kinds = ["literal"]
 literal_contains = ["/tmp/", "/var/tmp/"]
@@ -1015,6 +1326,17 @@ arg_index = 0
 import_provenance = "js-yaml"
 evidence_template = "js-yaml load() without a safe schema. Candidate for verification: use load with the default safe schema (js-yaml >=4) or an explicit SAFE_SCHEMA."
 
+[[matcher]]
+id = "unsafe-deserialization"
+cwe = 502
+title = "Unsafe deserialization sink"
+effect = "process"
+sink_shape = "member-call"
+callee_patterns = ["yaml.loadAll", "jsyaml.loadAll"]
+arg_index = 0
+import_provenance = "js-yaml"
+evidence_template = "js-yaml loadAll() without a safe schema. Candidate for verification: use loadAll with the default safe schema (js-yaml >=4) or an explicit SAFE_SCHEMA."
+
 # ════════════════════════════════════════════════════════════════════════════
 # FRAMEWORK-SCOPED ROWS (issue #861)
 #
@@ -1094,6 +1416,17 @@ arg_index = 0
 enabler = "jquery"
 evidence_template = "Non-literal value passed to jQuery {callee}(). Candidate for verification: jQuery .html() parses its argument as markup; confirm the value is not attacker-controlled or is sanitized."
 
+[[matcher]]
+id = "jquery-html"
+cwe = 79
+title = "jQuery parseHTML() sink"
+effect = "dom"
+sink_shape = "member-call"
+callee_patterns = ["$.parseHTML", "jQuery.parseHTML"]
+arg_index = 0
+enabler = "jquery"
+evidence_template = "Non-literal value passed to jQuery {callee}(). Candidate for verification: the parsed nodes run inline event handlers once they are inserted; confirm the value is not attacker-controlled or is sanitized."
+
 # ── Express / Fastify / Hono: res.sendFile route sink (CWE-22) ──────────────
 # A route handler that serves a file whose path is a non-literal is a path-
 # traversal candidate. One row per framework so each is gated on its own
@@ -1104,7 +1437,7 @@ cwe = 22
 title = "Route file-send path traversal sink"
 effect = "storage"
 sink_shape = "member-call"
-callee_patterns = ["*.sendFile"]
+callee_patterns = ["*.sendFile", "res.download", "response.download"]
 arg_index = 0
 enabler = "express"
 evidence_template = "Non-literal path passed to {callee}(). Candidate for verification: confirm the served path cannot escape the intended directory (reject `..`)."
@@ -1202,6 +1535,18 @@ title = "HTTP request input"
 # a guaranteed false negative, and a `.searchParams` member almost never
 # collides with a data-access receiver.
 path_patterns = ["*.searchParams"]
+
+[[source]]
+id = "http-request-input"
+title = "HTTP request input"
+# The raw request URL and headers of Node `IncomingMessage`, Express and the
+# Fetch `Request`: `req.url`, `req.originalUrl`, `request.headers`. A static
+# file or dev-server middleware reads the path from `req.url`. Gated to the
+# two request receiver names, because `ctx.url` / `event.headers` have other
+# meanings in other frameworks. A module that reads one of these also arms the
+# `path.join` gate above, also when `request` is an outgoing Fetch `Request`.
+path_patterns = ["*.url", "*.originalUrl", "*.headers"]
+receiver_allowlist = ["req", "request"]
 
 [[source]]
 id = "framework-handler-input"
@@ -1315,6 +1660,7 @@ title = "Environment secret"
 # as secret sources. Public-by-convention vars (NEXT_PUBLIC_, VITE_, ...) are
 # excluded at extraction time (issue #890), so they never count as a secret.
 path_patterns = ["process.env"]
+secret = true
 
 [[source]]
 id = "import-meta-env"
@@ -1323,20 +1669,29 @@ title = "Environment secret (Vite)"
 # class as `process.env` for the secret-to-network category (issue #890).
 # Public-by-convention vars (VITE_, ...) are excluded at extraction time.
 path_patterns = ["import.meta.env"]
+secret = true
 
 [[source]]
 id = "message-event-data"
 title = "Message-event data"
 # `postMessage` / WebSocket / worker `message` event payloads: `event.data`,
-# `e.data`, `message.data`. Wildcard object so any event binding name matches.
+# `e.data`, `message.data`. Receiver-gated like the HTTP-input row: a bare
+# `*.data` also matched parse results, responses and stores (`input.data`,
+# `result.data`), which are not message payloads. A message handler that names
+# its parameter something else is a cheap false negative.
 path_patterns = ["*.data"]
+receiver_allowlist = ["event", "e", "evt", "ev", "msg", "message", "messageevent"]
 
 [[source]]
 id = "location-input"
 title = "Browser location input"
 # `location.search`, `location.hash`, `window.location.href`,
 # `document.location.search`. Attacker-influenceable URL surface in the browser.
+# The wildcard patterns are receiver-gated: `location` for `*.search` and
+# `*.hash`, `window` / `document` for `*.location.href`. A bare `*.hash` also
+# matched content hashes (`crypto.hash`, `metadata.hash`).
 path_patterns = ["*.search", "*.hash", "location.href", "*.location.href"]
+receiver_allowlist = ["location", "window", "document"]
 
 [[source]]
 id = "dom-xss-source"
@@ -1464,7 +1819,7 @@ cwe = 1336
 title = "Server-side template injection sink"
 effect = "process"
 sink_shape = "member-call"
-callee_patterns = ["handlebars.compile", "eta.render", "eta.compile", "pug.compile", "ejs.render", "nunjucks.renderString", "nunjucks.compile"]
+callee_patterns = ["handlebars.compile", "Handlebars.compile", "eta.render", "eta.compile", "pug.compile", "pug.render", "ejs.render", "nunjucks.renderString", "nunjucks.compile", "_.template", "lodash.template"]
 arg_index = 0
 arg_kinds = ["template-with-subst", "concat", "call", "other"]
 evidence_template = "Non-literal template source passed to {callee}(). Candidate for verification: confirm the template body is not attacker-controlled (SSTI executes template directives server-side)."
@@ -1483,7 +1838,7 @@ cwe = 611
 title = "XML external entity (XXE) sink"
 effect = "read"
 sink_shape = "member-call"
-callee_patterns = ["libxml.parseXml", "libxml.parseXmlString", "*.parseXmlString", "*.parseStringPromise"]
+callee_patterns = ["libxml.parseXml", "libxml.parseXmlString", "libxmljs.parseXml", "*.parseXmlString", "*.parseStringPromise"]
 arg_index = 0
 evidence_template = "Non-literal XML document passed to {callee}(). Candidate for verification: confirm the parser disables external-entity / DTD expansion (no `noent`), guarding against XXE and entity-expansion attacks."
 
@@ -1526,6 +1881,7 @@ callee_patterns = [
 ]
 arg_index = 0
 requires_source = true
+secret_sources = true
 evidence_template = "Source-backed value passed to {callee}(). Candidate for verification: confirm no secret or PII reaches logs, observability pipelines, or telemetry."
 
 # ── CWE-643: XPath injection (issue #897) ───────────────────────────────────

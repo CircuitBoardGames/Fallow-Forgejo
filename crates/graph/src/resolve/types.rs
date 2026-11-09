@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use oxc_resolver::Resolver;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use fallow_config::TsconfigOutputMap;
 use fallow_types::discover::FileId;
+
+use crate::read_trace::Resolver;
 
 /// Result of resolving an import specifier.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -70,7 +71,7 @@ impl ResolveResult {
 
     /// Return whether this edge originated from CommonJS `require()`.
     #[must_use]
-    pub const fn is_commonjs_require(&self) -> bool {
+    pub(crate) const fn is_commonjs_require(&self) -> bool {
         matches!(
             self,
             Self::CommonJsInternalModule(_)
@@ -87,7 +88,7 @@ impl ResolveResult {
 
     /// Retain CommonJS provenance on targets that can participate in upgrades.
     #[must_use]
-    pub fn into_commonjs_require(self) -> Self {
+    pub(crate) fn into_commonjs_require(self) -> Self {
         match self {
             Self::InternalModule(file_id) => Self::CommonJsInternalModule(file_id),
             Self::InternalPackageModule {
@@ -98,23 +99,6 @@ impl ResolveResult {
                 package_name,
             },
             Self::NpmPackage(package_name) => Self::CommonJsNpmPackage(package_name),
-            other => other,
-        }
-    }
-
-    /// Remove CommonJS provenance while preserving the resolved destination.
-    #[must_use]
-    pub fn into_es_module(self) -> Self {
-        match self {
-            Self::CommonJsInternalModule(file_id) => Self::InternalModule(file_id),
-            Self::CommonJsInternalPackageModule {
-                file_id,
-                package_name,
-            } => Self::InternalPackageModule {
-                file_id,
-                package_name,
-            },
-            Self::CommonJsNpmPackage(package_name) => Self::NpmPackage(package_name),
             other => other,
         }
     }
@@ -146,6 +130,16 @@ pub struct ResolvedProject {
     /// Deterministic work counts of the resolution that built this project.
     /// Zero for a project restored from the graph cache.
     pub work: super::ResolveWork,
+    /// The paths below the root that the resolution checked and did not
+    /// find. A file that appears at one of them can change a resolution, so
+    /// the graph cache stores them (see [`crate::missed_probes`]).
+    pub missed_probes: crate::missed_probes::MissedProbes,
+    /// The package manifests below `node_modules` that the resolution read,
+    /// sorted. A path above the root has `../` steps. The graph cache keys
+    /// the versions of the Bun installs among them (see
+    /// [`crate::installed_versions`]). Empty for a project restored from the
+    /// graph cache.
+    pub package_manifests: Vec<String>,
 }
 
 /// One project-internal module replacement resolved from its declaring source file.
@@ -303,6 +297,23 @@ pub struct ResolvedModule {
     pub missing_export_targets: Vec<MissingExportTarget>,
 }
 
+/// A plugin path alias that applies only to the files of one workspace package.
+///
+/// A framework alias such as SvelteKit `$lib` or Nuxt `~/` maps to a directory
+/// of the package that owns the framework config. Two packages can declare the
+/// same prefix, so the resolver must apply an alias only to an importing file
+/// inside the package that declared it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedPathAlias {
+    /// The workspace root, relative to the project root. A workspace outside
+    /// the project tree keeps its absolute path.
+    pub scope: String,
+    /// The import prefix, for example `$lib/`.
+    pub prefix: String,
+    /// The replacement directory, relative to the project root.
+    pub replacement: String,
+}
+
 /// The missing paths that the `exports` map of a project package names for
 /// one unresolved bare specifier.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -401,6 +412,8 @@ pub(super) struct ResolveContext<'a> {
     pub condition_names: &'a [String],
     /// Plugin-provided path aliases (prefix, replacement).
     pub path_aliases: &'a [(String, String)],
+    /// Plugin-provided path aliases that apply only inside one workspace.
+    pub scoped_path_aliases: &'a [ScopedPathAlias],
     /// Absolute directories to search when resolving bare SCSS/Sass
     /// `@import` / `@use` specifiers. Populated from Angular's
     /// `stylePreprocessorOptions.includePaths` and equivalent settings.
@@ -451,7 +464,7 @@ impl CanonicalizeCache {
         if let Some(value) = self.map.get(path) {
             return value.clone();
         }
-        let value = dunce::canonicalize(path).ok();
+        let value = crate::read_trace::canonicalize(path).ok();
         self.map.insert(path.to_path_buf(), value.clone());
         value
     }
@@ -564,7 +577,7 @@ impl<'a> CanonicalFallback<'a> {
             self.files
                 .iter()
                 .filter_map(|f| {
-                    dunce::canonicalize(&f.path)
+                    crate::read_trace::canonicalize(&f.path)
                         .ok()
                         .map(|canonical| (canonical, f.id))
                 })

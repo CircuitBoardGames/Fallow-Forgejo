@@ -5,15 +5,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use fallow_config::{IgnoreDependencyMatcher, PackageJson, ResolvedConfig};
 
-use crate::discover::FileId;
-use crate::extract::ModuleInfo;
-use crate::graph::ModuleGraph;
-use crate::resolve::ResolvedModule;
 use crate::results::{
     DependencyLocation, DevDependencyInProduction, ImportSite, TestOnlyDependency,
     TypeOnlyDependency, UnlistedDependency, UnresolvedImport, UnusedDependency,
 };
 use crate::suppress::{IssueKind, SuppressionContext};
+use crate::{discover::FileId, extract::ModuleInfo, graph::ModuleGraph, resolve::ResolvedModule};
 
 use super::bundle_externalization::source_sets_packages_external;
 use super::gitignored_targets::GitignoredTargets;
@@ -27,9 +24,16 @@ use crate::plugins::{CompiledPathRule, ProvidedDependencyRule};
 
 #[path = "unused_deps_peer_closure.rs"]
 mod peer_closure;
-pub use peer_closure::peer_closure_seeds;
-pub use peer_closure::peer_dependency_hosts;
+#[path = "unused_deps_production_only.rs"]
+mod production_only;
+#[path = "unused_deps_required.rs"]
+mod required;
+#[path = "unused_deps_workspace_scope.rs"]
+mod workspace_scope;
 use peer_closure::{PeerDependencyResolver, PeerSeedInput, peer_closure_shared_seeds};
+pub use peer_closure::{peer_closure_seeds, peer_dependency_hosts};
+pub use production_only::{credit_production_ignores, find_type_only_dependencies};
+use workspace_scope::{collect_unlisted_dependencies, drop_workspace_ignored};
 
 /// Return `true` if a virtual-module `prefix` from the active plugin set covers
 /// `spec`. Two shapes are recognised:
@@ -197,6 +201,9 @@ struct WorkspaceManifest<'a> {
     /// private siblings: a sibling's source reaches this workspace whether it is
     /// pulled in for the shipped build or only for the local one.
     declared: FxHashSet<String>,
+    /// The `dependencies` names, the only section a `--production` run reports
+    /// as unused.
+    production: Vec<String>,
     /// Names the package manager installs for this workspace: `dependencies`,
     /// `devDependencies` and `optionalDependencies`. A `peerDependencies`
     /// entry alone installs nothing, so a consumer or an ancestor manifest
@@ -320,6 +327,7 @@ fn read_workspace_manifests<'a>(
                 name: pkg.name.clone().unwrap_or_else(|| workspace.name.clone()),
                 is_private: pkg.private == Some(true),
                 declared: pkg.all_dependency_names().into_iter().collect(),
+                production: pkg.production_dependency_names(),
                 installed: pkg
                     .production_dependency_names()
                     .into_iter()
@@ -1581,7 +1589,14 @@ fn collect_workspace_unused_dependencies<'a>(
         inputs.root_flagged,
     );
 
-    collect_workspace_unused_categories(&ws_pkg, &ws_shared, &usage, &ws_pkg_path, &ws_pkg_content)
+    let categories = collect_workspace_unused_categories(
+        &ws_pkg,
+        &ws_shared,
+        &usage,
+        &ws_pkg_path,
+        &ws_pkg_content,
+    );
+    drop_workspace_ignored(categories, inputs.config, &ws_pkg_path)
 }
 
 fn read_workspace_package(
@@ -1694,56 +1709,6 @@ fn collect_workspace_unused_categories(
     });
 
     (prod, dev, optional)
-}
-
-/// Find production dependencies that are only imported via type-only imports.
-///
-/// In production mode, `import type { Foo } from 'pkg'` is erased at compile time,
-/// meaning the dependency is not needed at runtime. Such dependencies should be
-/// moved to devDependencies.
-///
-/// Only importers that reach the package through the root declaration count,
-/// see [`RootImporters`]. A root entry without such an importer is an unused
-/// dependency, not a type-only one.
-pub fn find_type_only_dependencies(
-    graph: &ModuleGraph,
-    pkg: &PackageJson,
-    config: &ResolvedConfig,
-    workspaces: &[fallow_config::WorkspaceInfo],
-) -> Vec<TypeOnlyDependency> {
-    let root_pkg_path = config.root.join("package.json");
-    let root_pkg_content = read_pkg_json_content(&root_pkg_path);
-    let workspace_names: FxHashSet<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
-    let root_importers = RootImporters::new(graph, config, workspaces);
-    let production_peers = root_importers.production_peers(pkg, config);
-
-    let mut type_only_deps = Vec::new();
-
-    for dep in pkg.production_dependency_names() {
-        if workspace_names.contains(dep.as_str()) {
-            continue;
-        }
-        if production_peers.contains(&dep) {
-            continue;
-        }
-
-        let total_count = root_importers.of(&dep).len();
-        let type_only_count = root_importers.type_only_of(&dep).len();
-
-        let reported = total_count > 0 && type_only_count == total_count;
-        if reported && !config.ignore_dependencies.suppresses(&dep) {
-            let line = root_pkg_content
-                .as_deref()
-                .map_or(1, |c| find_dep_line_in_json(c, &dep));
-            type_only_deps.push(TypeOnlyDependency {
-                package_name: dep,
-                path: root_pkg_path.clone(),
-                line,
-            });
-        }
-    }
-
-    type_only_deps
 }
 
 /// Return the process-wide glob set matching production-excluded test/story files.
@@ -2389,7 +2354,8 @@ pub fn find_unlisted_dependencies(input: UnlistedDependencyInput<'_>) -> Vec<Unl
         workspace_ownership: &workspace_ownership,
     };
 
-    collect_unlisted_dependencies(&ctx)
+    let unlisted = collect_unlisted_dependencies(&ctx);
+    required::extend(unlisted, input.plugin_result, &ctx)
 }
 
 struct UnlistedDependencyContextParts<'a> {
@@ -2490,31 +2456,6 @@ fn build_unlisted_dependency_context_parts<'a>(
         import_spans_by_file,
         ignore_deps,
     }
-}
-
-/// Walk `package_usage`, gathering per-package import sites into findings.
-fn collect_unlisted_dependencies(ctx: &UnlistedDependencyContext<'_>) -> Vec<UnlistedDependency> {
-    let mut unlisted: FxHashMap<String, Vec<ImportSite>> = FxHashMap::default();
-
-    for (package_name, file_ids) in &ctx.graph.package_usage {
-        if should_skip_unlisted_package(package_name, ctx) {
-            continue;
-        }
-        let mut unlisted_sites = collect_unlisted_import_sites(package_name, file_ids, ctx);
-        if !unlisted_sites.is_empty() && !ctx.ignore_deps.suppresses(package_name) {
-            unlisted_sites.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-            unlisted_sites.dedup_by(|a, b| a.path == b.path);
-            unlisted.insert(package_name.clone(), unlisted_sites);
-        }
-    }
-
-    unlisted
-        .into_iter()
-        .map(|(name, sites)| UnlistedDependency {
-            package_name: name,
-            imported_from: sites,
-        })
-        .collect()
 }
 
 struct UnlistedDependencyContext<'a> {

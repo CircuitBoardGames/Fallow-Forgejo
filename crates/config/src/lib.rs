@@ -35,8 +35,12 @@ mod fixability;
 /// JSONC parsing helpers pinning the dialect fallow accepts.
 pub mod jsonc;
 pub mod levenshtein;
+mod package_manager;
+#[doc(hidden)]
+pub mod permutation;
 mod rule_pack;
 mod source_walk;
+pub mod toml_input;
 mod workspace;
 /// YAML parsing behind one internal API.
 pub mod yaml;
@@ -46,6 +50,9 @@ pub use config_inputs::*;
 pub use config_writer::*;
 pub use external_plugin::*;
 pub use fixability::*;
+pub use package_manager::PackageManager;
+#[doc(hidden)]
+pub use permutation::{PermutationSite, sort_permuted};
 pub use rule_pack::*;
 pub use source_walk::{source_walk_builder, source_walked_workspaces};
 pub use workspace::*;

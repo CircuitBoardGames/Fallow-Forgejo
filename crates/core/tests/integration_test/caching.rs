@@ -185,7 +185,7 @@ fn warm_metadata_cache_misses_an_equal_length_rewrite_with_a_restored_mtime() {
 }
 
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "roundtrip fixture enumerates cache fields"
 )]
@@ -252,6 +252,7 @@ fn cache_roundtrip() {
         sanitized_sink_args: Vec::new(),
         security_control_sites: Vec::new(),
         callee_uses: Vec::new(),
+        command_invocations: Vec::new(),
         imported_call_sites: Vec::new(),
         import_binding_references: Vec::new(),
         misplaced_directives: Vec::new(),
@@ -535,6 +536,7 @@ fn incremental_cache_prune_stale_entries() {
         sanitized_sink_args: Vec::new(),
         security_control_sites: Vec::new(),
         callee_uses: Vec::new(),
+        command_invocations: Vec::new(),
         imported_call_sites: Vec::new(),
         import_binding_references: Vec::new(),
         misplaced_directives: Vec::new(),

@@ -21,11 +21,11 @@ use tempfile::{TempDir, tempdir};
 use crate::common::{CommandOutput, fallow_bin, parse_json};
 use crate::http_stub::read_request;
 
-type Captured = Arc<Mutex<Vec<String>>>;
+pub type Captured = Arc<Mutex<Vec<String>>>;
 
 /// Serve the scripted `(status, body)` answers in order, one connection each,
 /// and capture every request.
-fn serve(responses: Vec<(u16, String)>) -> (String, Captured, thread::JoinHandle<()>) {
+pub fn serve(responses: Vec<(u16, String)>) -> (String, Captured, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let addr = listener.local_addr().expect("mock addr");
     let captured: Captured = Arc::new(Mutex::new(Vec::new()));
@@ -75,7 +75,7 @@ fn write_project(root: &Path) {
 /// A file-context body: `loadUser` with the stable id of its local line,
 /// `parseRow` deployed at another line (so only the name ordinal pairs it),
 /// and `removedFn`, which the local file no longer has.
-fn file_context_body() -> String {
+pub fn file_context_body() -> String {
     let load_user = function_identity_id("src/api.ts", "loadUser", 1);
     let parse_row_old = function_identity_id("src/api.ts", "parseRow", 9);
     let removed = function_identity_id("src/api.ts", "removedFn", 20);
@@ -120,10 +120,10 @@ fn file_context_body() -> String {
     )
 }
 
-struct Env<'a> {
-    api_url: Option<&'a str>,
-    api_key: Option<&'a str>,
-    home: &'a Path,
+pub struct Env<'a> {
+    pub api_url: Option<&'a str>,
+    pub api_key: Option<&'a str>,
+    pub home: &'a Path,
 }
 
 fn run(args: &[&str], root: &Path, env: &Env<'_>) -> CommandOutput {
@@ -132,7 +132,7 @@ fn run(args: &[&str], root: &Path, env: &Env<'_>) -> CommandOutput {
 
 /// [`run`] with a last change to the command, for example to give it a
 /// keychain.
-fn run_with(
+pub fn run_with(
     args: &[&str],
     root: &Path,
     env: &Env<'_>,
@@ -170,13 +170,13 @@ fn run_with(
     }
 }
 
-fn project() -> (TempDir, TempDir) {
+pub fn project() -> (TempDir, TempDir) {
     let dir = tempdir().unwrap();
     write_project(dir.path());
     (dir, tempdir().unwrap())
 }
 
-const INSPECT_JSON: &[&str] = &[
+pub const INSPECT_JSON: &[&str] = &[
     "inspect",
     "--file",
     "src/api.ts",
@@ -405,9 +405,11 @@ fn inspect_cloud_maps_the_tier_gate_to_plan_required() {
 #[test]
 fn inspect_cloud_reports_an_unreachable_cloud_as_unavailable() {
     let (dir, home) = project();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // A freed port from `bind("127.0.0.1:0")` is not safe here: a parallel
+    // test can bind the same port, and this run then reaches its server.
+    // Port 1 needs privileges to bind, so no test listens there, and a
+    // connection is refused at once.
+    let endpoint = "http://127.0.0.1:1".to_owned();
     let output = run(
         INSPECT_JSON,
         dir.path(),
@@ -493,6 +495,75 @@ fn inspect_compact_prints_one_line_per_item() {
     assert!(output.stdout.len() <= 1024, "{}", output.stdout.len());
 }
 
+/// A file-context answer in the shape that Fallow Cloud sends, with the
+/// paths, names and ids changed to the project of [`write_project`]. The
+/// recorded project had no browser data and no static caller count, so the
+/// `browser` and `static_callers` values of `loadUser` are set by hand.
+const RECORDED_FILE_CONTEXT: &str = include_str!("fixtures/cloud-file-context-recorded.json");
+
+#[test]
+fn inspect_cloud_reads_browser_and_caller_signals() {
+    let (dir, home) = project();
+    let (endpoint, _captured, handle) = serve(vec![
+        (200, RECORDED_FILE_CONTEXT.to_owned()),
+        (200, RECORDED_FILE_CONTEXT.to_owned()),
+    ]);
+    let env = Env {
+        api_url: Some(&endpoint),
+        api_key: Some("fallow_read_k1_test"),
+        home: home.path(),
+    };
+    let output = run(INSPECT_JSON, dir.path(), &env);
+    assert_eq!(output.code, 0, "stderr={}", output.stderr);
+    let json = parse_json(&output);
+    let functions = json["evidence"]["cloud"]["functions"].as_array().unwrap();
+    assert_eq!(functions[0]["name"], "loadUser");
+    assert_eq!(functions[0]["browser_long_frame_ms_per_hour"], 412.6);
+    assert_eq!(functions[0]["static_callers"], 3);
+    let callers = functions[0]["production_callers"].as_array().unwrap();
+    assert_eq!(callers.len(), 2);
+    assert_eq!(callers[0]["function"], "boot");
+    assert_eq!(callers[0]["file"], "src/index.ts");
+    assert_eq!(callers[0]["samples"], 94);
+    assert_eq!(functions[1]["name"], "parseRow");
+    assert!(
+        functions[1]["browser_long_frame_ms_per_hour"].is_null(),
+        "untracked browser time is null, never zero"
+    );
+    assert!(functions[1]["static_callers"].is_null());
+    assert!(
+        functions[1]["production_callers"].is_null(),
+        "no CPU profile gives null, not an empty list"
+    );
+
+    let compact = run(
+        &[
+            "inspect",
+            "--file",
+            "src/api.ts",
+            "--cloud",
+            "--repo",
+            "acme/app",
+            "--format",
+            "compact",
+            "--quiet",
+        ],
+        dir.path(),
+        &env,
+    );
+    handle.join().expect("server joins");
+    assert_eq!(compact.code, 0, "stderr={}", compact.stderr);
+    let line = compact
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("prod loadUser:1 "))
+        .unwrap_or_else(|| panic!("{}", compact.stdout));
+    assert_eq!(
+        line,
+        "prod loadUser:1 called 1401060 calls, 7.8 ms CPU/h, 412.6 ms long frames/h, 3 static callers, prod callers boot (src/index.ts), runJob (src/jobs/worker.ts)"
+    );
+}
+
 #[test]
 fn inspect_compact_names_a_non_ok_cloud_status() {
     let (dir, home) = project();
@@ -543,10 +614,10 @@ fn inspect_compact_without_cloud_prints_static_findings() {
     assert!(!output.stdout.contains("cloud "), "{}", output.stdout);
 }
 
-const DEVICE_START: &str = r#"{"data":{"deviceCode":"dev-code","userCode":"ABCD-EFGH","verificationUri":"https://fallow.cloud/device","expiresIn":900,"interval":0}}"#;
+pub const DEVICE_START: &str = r#"{"data":{"deviceCode":"dev-code","userCode":"ABCD-EFGH","verificationUri":"https://fallow.cloud/device","expiresIn":900,"interval":0}}"#;
 const DEVICE_PENDING: &str =
     r#"{"error":true,"message":"Authorization pending","code":"authorization_pending"}"#;
-const DEVICE_TOKEN: &str = r#"{"data":{"licenseJwt":"jwt","apiKey":{"id":"key_1","key":"fallow_read_k1_fromlogin","prefix":"fallow_read_k1_fro","type":"read","name":"fallow cloud login (ci-box)"}}}"#;
+pub const DEVICE_TOKEN: &str = r#"{"data":{"licenseJwt":"jwt","apiKey":{"id":"key_1","key":"fallow_read_k1_fromlogin","prefix":"fallow_read_k1_fro","type":"read","name":"fallow cloud login (ci-box)"}}}"#;
 
 #[test]
 fn cloud_login_stores_the_key_and_inspect_uses_it_until_logout() {

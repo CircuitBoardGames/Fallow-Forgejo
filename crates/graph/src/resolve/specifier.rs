@@ -1,26 +1,29 @@
 //! Main resolution engine: creates the oxc_resolver instance and resolves individual specifiers.
 
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use oxc_resolver::{Resolution, ResolveError, ResolveOptions, Resolver};
+use oxc_resolver::{Resolution, ResolveError, ResolveOptions};
 use serde_json::Value;
 
 use super::fallbacks::{
-    installed_workspace_package_target, lookup_internal_file_id, nearest_package_manifest,
-    normalize_path_lexically, package_imports_workspace_target, try_canonical_source_fallbacks,
-    try_css_extension_fallback, try_package_imports_fallback, try_path_alias_fallback,
-    try_pnpm_workspace_fallback, try_relative_package_root_source_fallback,
-    try_relative_tsconfig_output_fallback, try_scss_include_path_fallback,
+    installed_workspace_package_target, lookup_internal_file_id, matches_plugin_path_alias,
+    nearest_package_manifest, normalize_path_lexically, package_imports_workspace_target,
+    try_canonical_source_fallbacks, try_css_extension_fallback, try_package_imports_fallback,
+    try_path_alias_fallback, try_pnpm_workspace_fallback, try_relative_output_source_fallbacks,
+    try_relative_package_root_source_fallback, try_scss_include_path_fallback,
     try_scss_node_modules_fallback, try_scss_partial_fallback, try_source_fallback,
     try_workspace_package_fallback,
+};
+use super::file_attempt::{
+    ResolveFileAttempt, resolve_file_with_resolver_and_tsconfig_fallback,
+    resolve_file_with_tsconfig_fallback, skip_platform_self_resolution,
 };
 use super::inline_loaders::InlineLoaderRequest;
 use super::package_credit::{
     package_usage_name_for_external_bare_specifier, package_usage_name_for_import,
-    uninstalled_tsconfig_alias_target_package,
+    uninstalled_plugin_alias_target_package, uninstalled_tsconfig_alias_target_package,
 };
 use super::path_info::{
     extract_package_name, is_bare_specifier, is_path_alias, is_valid_package_name,
@@ -29,9 +32,13 @@ use super::path_info::{
 use super::react_native::{build_condition_names, build_extensions};
 use super::tsconfig_scope::{glob_values_match, resolve_tsconfig_relative_path};
 use super::types::{DenoImportMapEntry, ResolveContext, ResolveResult};
+use super::url_suffix::{
+    resolve_failed_bare_asset_query_specifier, strip_url_suffix, strip_vite_asset_query,
+};
 use super::workspace_alias::{
     resolve_failed_bare_package_specifier, try_aliased_workspace_package_fallback,
 };
+use crate::read_trace::{Resolver, TracedPath};
 
 /// Create an `oxc_resolver` instance with standard configuration.
 ///
@@ -151,7 +158,7 @@ pub(super) fn build_resolve_options(
     // issuers fallow feeds it are canonical.
     let manifest_dir = find_yarn_pnp_manifest_dir(root);
     options.yarn_pnp = manifest_dir.is_some();
-    options.cwd = manifest_dir.map(|dir| dunce::canonicalize(&dir).unwrap_or(dir));
+    options.cwd = manifest_dir.map(|dir| crate::read_trace::canonicalize(&dir).unwrap_or(dir));
 
     options
 }
@@ -179,152 +186,8 @@ const YARN_PNP_MANIFEST: &str = ".pnp.cjs";
 /// named like the manifest is not an install, hence `is_file`.
 fn find_yarn_pnp_manifest_dir(root: &Path) -> Option<PathBuf> {
     root.ancestors()
-        .find(|dir| dir.join(YARN_PNP_MANIFEST).is_file())
+        .find(|dir| dir.join(YARN_PNP_MANIFEST).traced_is_file())
         .map(Path::to_path_buf)
-}
-
-/// Return `true` for errors raised while loading a tsconfig file (as opposed to
-/// errors about the specifier itself). When `resolve_file` fails with one of these,
-/// a broken sibling tsconfig is poisoning resolution for the current file, retrying
-/// via `resolve(dir, specifier)` bypasses `TsconfigDiscovery::Auto` and restores
-/// resolution for everything that does not need path aliases (relative, absolute,
-/// bare package specifiers).
-///
-/// `IOError` and `Json` are included because a malformed or unreadable tsconfig
-/// surfaces as one of these. The variants are shared with package.json parsing,
-/// but a retry is still safe: if the error really came from the specifier's own
-/// resolution, `resolve()` will fail the same way and we fall through to the
-/// existing error handling.
-const fn is_tsconfig_error(err: &ResolveError) -> bool {
-    matches!(
-        err,
-        ResolveError::TsconfigNotFound(_)
-            | ResolveError::TsconfigCircularExtend(_)
-            | ResolveError::TsconfigSelfReference(_)
-            | ResolveError::Json(_)
-            | ResolveError::IOError(_)
-    )
-}
-
-pub(super) enum ResolveFileAttempt {
-    Resolved {
-        resolution: Resolution,
-        used_tsconfig_fallback: bool,
-    },
-    Failed {
-        used_tsconfig_fallback: bool,
-    },
-}
-
-/// Try `resolve_file` first (honors per-file tsconfig discovery); on a
-/// tsconfig-loading failure, retry with `resolve(dir, specifier)` which skips
-/// tsconfig entirely. Emits a single `tracing::warn!` per unique error message
-/// so users get one actionable hint per broken tsconfig without log spam.
-pub(super) fn resolve_file_with_tsconfig_fallback(
-    ctx: &ResolveContext<'_>,
-    from_file: &Path,
-    specifier: &str,
-    from_style: bool,
-) -> ResolveFileAttempt {
-    if from_style || is_style_file(from_file) {
-        return resolve_file_with_resolver_and_tsconfig_fallback(
-            ctx,
-            ctx.resolver,
-            from_file,
-            specifier,
-        );
-    }
-    // Most Node-protocol requests resolve externally. One broad attempt
-    // preserves that path and tsconfig remaps, including implicit assets.
-    // Only successful remaps need the script lookup for directory priority.
-    if specifier.starts_with("node:") {
-        let broad = resolve_file_with_resolver_and_tsconfig_fallback(
-            ctx,
-            ctx.resolver,
-            from_file,
-            specifier,
-        );
-        if matches!(broad, ResolveFileAttempt::Failed { .. }) {
-            return broad;
-        }
-        let attempt = resolve_file_with_resolver_and_tsconfig_fallback(
-            ctx,
-            ctx.script_resolver,
-            from_file,
-            specifier,
-        );
-        if matches!(attempt, ResolveFileAttempt::Resolved { .. }) {
-            return attempt;
-        }
-        return broad;
-    }
-    let attempt = resolve_file_with_resolver_and_tsconfig_fallback(
-        ctx,
-        ctx.script_resolver,
-        from_file,
-        specifier,
-    );
-    if matches!(attempt, ResolveFileAttempt::Resolved { .. }) {
-        return attempt;
-    }
-    resolve_file_with_resolver_and_tsconfig_fallback(ctx, ctx.resolver, from_file, specifier)
-}
-
-fn resolve_file_with_resolver_and_tsconfig_fallback(
-    ctx: &ResolveContext<'_>,
-    resolver: &Resolver,
-    from_file: &Path,
-    specifier: &str,
-) -> ResolveFileAttempt {
-    super::work::note_oxc_resolve();
-    match resolver.resolve_file(from_file, specifier) {
-        Ok(resolution) => ResolveFileAttempt::Resolved {
-            resolution,
-            used_tsconfig_fallback: false,
-        },
-        Err(err) if is_tsconfig_error(&err) => {
-            warn_once_tsconfig(ctx, &err);
-            let dir = from_file.parent().unwrap_or(from_file);
-            super::work::note_oxc_resolve();
-            match resolver.resolve(dir, specifier) {
-                Ok(resolution) => ResolveFileAttempt::Resolved {
-                    resolution,
-                    used_tsconfig_fallback: true,
-                },
-                Err(_) => ResolveFileAttempt::Failed {
-                    used_tsconfig_fallback: true,
-                },
-            }
-        }
-        Err(_) => ResolveFileAttempt::Failed {
-            used_tsconfig_fallback: false,
-        },
-    }
-}
-
-/// Warn the first time a tsconfig error message is seen. The shared set in the
-/// resolver context dedupes across all threads for one analysis run.
-fn warn_once_tsconfig(ctx: &ResolveContext<'_>, err: &ResolveError) {
-    let message = err.to_string();
-    let should_warn = {
-        let Ok(mut seen) = ctx.tsconfig_warned.lock() else {
-            return;
-        };
-        seen.insert(message.clone())
-    };
-    if should_warn {
-        tracing::warn!(
-            target: fallow_types::ANALYSIS_DIAGNOSTIC_LOG_TARGET,
-            "tsconfig chain not fully loaded: {message}. Falling back to resolver-less \
-             resolution for the affected files. Relative imports, bare imports, and path \
-             aliases declared in a discovered root or workspace tsconfig still resolve (fallow \
-             applies those project-wide), so this is usually harmless and is common when \
-             analyzing before dependencies are installed. Only aliases declared solely in the \
-             unreadable inherited config are affected: if imports look misreported, install \
-             dependencies so the referenced config resolves, or fix the extends/references \
-             chain."
-        );
-    }
 }
 
 fn try_root_relative_specifier(
@@ -370,7 +233,7 @@ fn nearest_package_dir_below_root<'p>(root: &Path, source_dir: &'p Path) -> Opti
         .ancestors()
         .skip(1)
         .take_while(|dir| *dir != root && dir.starts_with(root))
-        .find(|dir| dir.join("package.json").is_file())
+        .find(|dir| dir.join("package.json").traced_is_file())
 }
 
 fn is_root_relative_importer(from_file: &Path) -> bool {
@@ -421,7 +284,7 @@ fn nearest_tsconfig_path(root: &Path, from_file: &Path) -> Option<PathBuf> {
     let mut current = from_file.parent()?;
     loop {
         let candidate = current.join("tsconfig.json");
-        if candidate.is_file() {
+        if candidate.traced_is_file() {
             return Some(candidate);
         }
         if current == root {
@@ -478,14 +341,14 @@ fn collect_local_tsconfig_chain(
     let root = ctx.root;
     let tsconfig_dir = tsconfig_path.parent().unwrap_or(root);
     for reference in referenced_tsconfig_paths(tsconfig_dir, &json) {
-        if reference.is_file() && tsconfig_applies_to_file(ctx, &reference, from_file) {
+        if reference.traced_is_file() && tsconfig_applies_to_file(ctx, &reference, from_file) {
             collect_local_tsconfig_chain(ctx, from_file, &reference, chain, seen);
         }
     }
 
     for extends in tsconfig_extends_values(&json) {
         let next = resolve_tsconfig_extends_path(tsconfig_dir, extends);
-        if next.is_file() {
+        if next.traced_is_file() {
             collect_local_tsconfig_chain(ctx, from_file, &next, chain, seen);
         }
     }
@@ -510,13 +373,13 @@ fn resolve_tsconfig_reference_path(base_dir: &Path, reference: &str) -> PathBuf 
     {
         return path;
     }
-    if path.is_dir() {
+    if path.traced_is_dir() {
         return path.join("tsconfig.json");
     }
     let mut with_json = OsString::from(path.as_os_str());
     with_json.push(".json");
     let with_json = PathBuf::from(with_json);
-    if with_json.is_file() {
+    if with_json.traced_is_file() {
         with_json
     } else {
         path.join("tsconfig.json")
@@ -566,14 +429,14 @@ fn tsconfig_applies_to_file(
         .is_some_and(|exclude| glob_values_match(tsconfig_dir, exclude, from_file))
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub(super) fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
     super::work::note_canonicalize(2);
-    dunce::canonicalize(left)
+    crate::read_trace::canonicalize(left)
         .ok()
-        .zip(dunce::canonicalize(right).ok())
+        .zip(crate::read_trace::canonicalize(right).ok())
         .is_some_and(|(left, right)| left == right)
 }
 
@@ -594,27 +457,6 @@ fn is_storybook_preview_html(from_file: &Path) -> bool {
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         == Some(".storybook")
-}
-
-/// Return `true` when `specifier` matches the plugin alias `prefix` at a
-/// path-segment boundary.
-///
-/// Mirrors `alias_match_remainder` in `fallbacks.rs`: a prefix that already
-/// ends with `/` matches any continuation. For bare prefixes (e.g. `@` or
-/// `~`) the match is only admitted when the specifier equals the prefix
-/// exactly or the remainder after stripping the prefix starts with `/`, so
-/// `prefix = "@"` does NOT match `@radix-ui/react-checkbox`.
-fn specifier_matches_alias_prefix(specifier: &str, prefix: &str) -> bool {
-    let Some(remainder) = specifier.strip_prefix(prefix) else {
-        return false;
-    };
-    remainder.is_empty() || prefix.ends_with('/') || remainder.starts_with('/')
-}
-
-fn strip_url_suffix(specifier: &str) -> &str {
-    specifier
-        .find(['?', '#'])
-        .map_or(specifier, |idx| &specifier[..idx])
 }
 
 fn static_mount_url_path(specifier: &str) -> Option<String> {
@@ -667,7 +509,7 @@ fn resolve_filesystem_path(ctx: &ResolveContext<'_>, path: &Path) -> Option<Reso
     {
         return Some(ResolveResult::InternalModule(file_id));
     }
-    path.exists()
+    path.traced_exists()
         .then_some(ResolveResult::ExternalFile(canonical))
 }
 
@@ -760,7 +602,7 @@ fn resolve_package_tsconfig_extends(base_dir: &Path, extends: &str) -> Option<Pa
     for ancestor in base_dir.ancestors() {
         let candidate = ancestor.join("node_modules").join(extends);
         let candidate = resolve_tsconfig_extends_candidate(candidate);
-        if candidate.is_file() {
+        if candidate.traced_is_file() {
             return Some(candidate);
         }
     }
@@ -775,13 +617,13 @@ fn resolve_tsconfig_extends_candidate(path: PathBuf) -> PathBuf {
     {
         return path;
     }
-    if path.is_dir() {
+    if path.traced_is_dir() {
         return path.join("tsconfig.json");
     }
     let mut with_json = OsString::from(path.as_os_str());
     with_json.push(".json");
-    let with_json = PathBuf::from(with_json);
-    if with_json.is_file() { with_json } else { path }
+    let json = PathBuf::from(with_json);
+    if json.traced_is_file() { json } else { path }
 }
 
 fn read_tsconfig_json(path: &Path) -> Option<Value> {
@@ -796,7 +638,7 @@ pub(super) fn read_tsconfig_json_cached(
 }
 
 fn read_json_file(path: &Path) -> Option<Value> {
-    let content = fs::read_to_string(path).ok()?;
+    let content = crate::read_trace::read_to_string(path).ok()?;
     if let Ok(json) = serde_json::from_str::<Value>(&content) {
         return Some(json);
     }
@@ -1122,7 +964,7 @@ fn try_tsconfig_alias_directory(
     target: &Path,
     style_context: bool,
 ) -> Option<ResolveResult> {
-    if !target.is_dir() {
+    if !target.traced_is_dir() {
         return None;
     }
     if let Some(package_json) = read_json_file(&target.join("package.json")) {
@@ -1250,7 +1092,7 @@ fn try_scss_fallbacks(
     try_scss_node_modules_fallback(ctx, from_file, specifier, from_style)
 }
 
-fn is_style_file(path: &Path) -> bool {
+pub(super) fn is_style_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| matches!(ext, "css" | "scss" | "sass"))
@@ -1731,7 +1573,7 @@ fn resolve_plain_specifier(
         return result;
     }
 
-    let flags = FailedSpecifierFlags::new(ctx, specifier);
+    let flags = FailedSpecifierFlags::new(ctx, from_file, specifier);
     resolve_file_or_failed(ctx, from_file, specifier, from_style, flags)
 }
 
@@ -1804,14 +1646,21 @@ fn resolve_file_or_failed(
 ) -> ResolveResult {
     match resolve_file_with_tsconfig_fallback(ctx, from_file, specifier, from_style) {
         ResolveFileAttempt::Resolved {
-            resolution: resolved,
+            resolution,
             used_tsconfig_fallback,
         } => resolve_resolved_specifier(
             ctx,
             from_file,
             specifier,
             from_style,
-            resolved.path(),
+            skip_platform_self_resolution(
+                ctx,
+                from_file,
+                specifier,
+                resolution,
+                used_tsconfig_fallback,
+            )
+            .path(),
             FailedSpecifierFlags {
                 used_tsconfig_fallback,
                 ..flags
@@ -1948,15 +1797,12 @@ struct FailedSpecifierFlags {
 }
 
 impl FailedSpecifierFlags {
-    fn new(ctx: &ResolveContext<'_>, specifier: &str) -> Self {
+    fn new(ctx: &ResolveContext<'_>, from_file: &Path, specifier: &str) -> Self {
         Self {
             used_tsconfig_fallback: false,
             is_bare: is_bare_specifier(specifier),
             is_alias: is_path_alias(specifier),
-            matches_plugin_alias: ctx
-                .path_aliases
-                .iter()
-                .any(|(prefix, _)| specifier_matches_alias_prefix(specifier, prefix)),
+            matches_plugin_alias: matches_plugin_path_alias(ctx, from_file, specifier),
         }
     }
 }
@@ -1999,7 +1845,6 @@ fn resolve_failed_specifier(
             specifier,
             from_style || is_style_file(from_file),
             flags.is_bare,
-            matches_tsconfig_path_alias,
         );
     }
     resolve_failed_regular_specifier(
@@ -2025,6 +1870,16 @@ fn resolve_failed_regular_specifier(
     }
     if is_plain_css_file(from_file) && is_bare_style_subpath(specifier) {
         return ResolveResult::Unresolvable(specifier.to_string());
+    }
+    if is_bare && let Some(base) = strip_vite_asset_query(specifier) {
+        return resolve_failed_bare_asset_query_specifier(
+            ctx,
+            from_file,
+            specifier,
+            base,
+            from_style || is_style_file(from_file),
+            matches_tsconfig_path_alias,
+        );
     }
     if is_bare && is_valid_package_name(specifier) {
         return resolve_failed_bare_package_specifier(
@@ -2076,7 +1931,7 @@ fn try_failed_package_fallbacks(
     if let Some(result) = try_relative_package_root_source_fallback(ctx, from_file, specifier) {
         return Some(result);
     }
-    try_relative_tsconfig_output_fallback(ctx, from_file, specifier)
+    try_relative_output_source_fallbacks(ctx, from_file, specifier)
 }
 
 fn resolve_failed_alias_specifier(
@@ -2085,9 +1940,8 @@ fn resolve_failed_alias_specifier(
     specifier: &str,
     style_context: bool,
     is_bare: bool,
-    matches_tsconfig_path_alias: bool,
 ) -> ResolveResult {
-    if let Some(result) = try_path_alias_fallback(ctx, specifier, style_context) {
+    if let Some(result) = try_path_alias_fallback(ctx, from_file, specifier, style_context) {
         return result;
     }
     if is_bare
@@ -2097,10 +1951,12 @@ fn resolve_failed_alias_specifier(
     {
         return result;
     }
-    if matches_tsconfig_path_alias {
-        return ResolveResult::Unresolvable(specifier.to_string());
+    match uninstalled_plugin_alias_target_package(ctx, from_file, specifier) {
+        Some(pkg) if is_bare && !ctx.workspace_roots.contains_key(pkg.as_str()) => {
+            ResolveResult::NpmPackage(pkg)
+        }
+        _ => ResolveResult::Unresolvable(specifier.to_string()),
     }
-    ResolveResult::Unresolvable(specifier.to_string())
 }
 
 fn try_tsconfig_root_dirs(
@@ -2171,19 +2027,19 @@ mod tests {
     use crate::resolve::react_native;
     use crate::resolve::types::{CanonicalizeCache, ResolveContext, TsconfigCache};
 
+    use super::super::file_attempt::is_tsconfig_error;
     use super::super::package_credit::package_usage_name_for_resolved_package;
     use super::{
         SpecifierNormalization, extension_alias_matches, glob_values_match,
         is_bare_style_package_reference, is_bare_style_subpath, is_js_ts_extension,
         is_node_modules_path, is_plain_css_file, is_relative_tsconfig_extends,
-        is_safe_static_dir_relative_path, is_style_file, is_tsconfig_error,
-        matches_nearest_tsconfig_path_alias, normalize_resolve_specifier,
-        package_usage_name_for_external_bare_specifier, path_alias_capture,
-        path_alias_pattern_matches, path_alias_specificity, resolve_tsconfig_extends_candidate,
-        resolve_tsconfig_extends_path, resolve_tsconfig_reference_path, serves_static_dir_mounts,
-        should_preserve_node_modules_style_file, specifier_matches_alias_prefix,
-        static_dir_relative_path, static_mount_url_path, strip_url_suffix, tsconfig_extends_values,
-        with_appended_extension, with_exact_extension,
+        is_safe_static_dir_relative_path, is_style_file, matches_nearest_tsconfig_path_alias,
+        normalize_resolve_specifier, package_usage_name_for_external_bare_specifier,
+        path_alias_capture, path_alias_pattern_matches, path_alias_specificity,
+        resolve_tsconfig_extends_candidate, resolve_tsconfig_extends_path,
+        resolve_tsconfig_reference_path, serves_static_dir_mounts,
+        should_preserve_node_modules_style_file, static_dir_relative_path, static_mount_url_path,
+        tsconfig_extends_values, with_appended_extension, with_exact_extension,
     };
 
     #[test]
@@ -2372,6 +2228,7 @@ mod tests {
             has_deno_import_maps: false,
             condition_names: &condition_names,
             path_aliases: &[],
+            scoped_path_aliases: &[],
             scss_include_paths: &[],
             static_dir_mappings: &[],
             framework_static_dir_mappings: &[],
@@ -2459,7 +2316,11 @@ mod tests {
         assert_eq!(s, "react");
     }
 
-    // ---- specifier_matches_alias_prefix (lines 412-417) ----
+    // ---- plugin alias prefix matching ----
+
+    fn specifier_matches_alias_prefix(specifier: &str, prefix: &str) -> bool {
+        super::super::fallbacks::alias_match_remainder(specifier, prefix).is_some()
+    }
 
     #[test]
     fn alias_prefix_bare_at_sign_does_not_match_scoped_package() {
@@ -2499,23 +2360,6 @@ mod tests {
             !specifier_matches_alias_prefix("~utils", "~"),
             "'~' prefix must NOT match '~utils' (no slash)"
         );
-    }
-
-    // ---- strip_url_suffix (lines 419-423) ----
-
-    #[test]
-    fn strip_url_suffix_removes_query_string() {
-        assert_eq!(strip_url_suffix("./style.css?inline"), "./style.css");
-    }
-
-    #[test]
-    fn strip_url_suffix_removes_hash_fragment() {
-        assert_eq!(strip_url_suffix("./page.html#section"), "./page.html");
-    }
-
-    #[test]
-    fn strip_url_suffix_passes_through_plain_specifier() {
-        assert_eq!(strip_url_suffix("react"), "react");
     }
 
     // ---- static_mount_url_path ----
@@ -3182,6 +3026,7 @@ mod tests {
             has_deno_import_maps: false,
             condition_names: &condition_names,
             path_aliases: &[],
+            scoped_path_aliases: &[],
             scss_include_paths: &[],
             static_dir_mappings: &[],
             framework_static_dir_mappings: &[],

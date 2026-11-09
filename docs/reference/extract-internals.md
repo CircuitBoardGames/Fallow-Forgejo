@@ -35,8 +35,10 @@ Shared extraction result types live in `crates/types/src/extract.rs`.
   limit, and a stack overflow aborts the whole process. Run every parse of
   user source, and the walks over its AST, inside
   `fallow_extract::parse_bounded` (`crates/extract/src/nesting.rs`).
-  `scripts/check-parse-sites.mjs` lists each production parser call and
-  fails on a new one.
+  The cargo-fallow source rule `parse-through-parse-bounded` in the root
+  `Cargo.toml` lists each file with production parser calls, with the count,
+  and fails on a new call or on a count below `max`. A file that wraps its own
+  calls has `require = ["parse_bounded("]`.
   - `parse_bounded` first scans the bracket depth. A file past
     `MAX_NESTING_DEPTH` returns `None`. Extraction turns it into a failed
     parse (`parse_panicked`) with no facts, and the other callers skip it.
@@ -45,6 +47,12 @@ Shared extraction result types live in `crates/types/src/extract.rs`.
     Sass or Less file is scanned with stylesheet rules: strings, escapes,
     `/* */` comments and unquoted `url()` only, because `//` in
     `url(//host/a.png)` is not a comment.
+  - The same scan counts the `<` tokens that the TypeScript parser can try
+    as nested type-argument lists: an open `<` with a later `<` behind a
+    deeper `(` or `[`. Each such level makes the parser try the inner part
+    again, so the parse time grows exponentially with the level. A file past
+    `MAX_TYPE_ARGUMENT_NESTING` returns `None` in the same way as a file
+    past `MAX_NESTING_DEPTH`.
   - It then runs the parse on a stack of
     `256 KiB + 1024 * source length + 4096 * bracket depth`
     (`crates/extract/src/stack.rs`). A need over 64 GiB (a source over 64 MB in
@@ -79,6 +87,13 @@ Shared extraction result types live in `crates/types/src/extract.rs`.
   `fallow_extract::parse_style_bounded`. Past the cap, CSS Modules class
   extraction falls back to the plain class scan, and CSS analytics and color
   parsing return `None`.
+  - The same scan also counts nested color functions (`rgb(`, `hsl(`,
+    `light-dark(` and the other names in `COLOR_FUNCTIONS` in
+    `crates/extract/src/nesting.rs`). lightningcss parses the content of a
+    color function again as a plain function when the color is not valid, so
+    its parse time doubles at each nested level. Past
+    `MAX_COLOR_FUNCTION_DEPTH`, the same fallback applies. A function name
+    with a CSS escape counts as a color function.
 - A walk that the visitor runs at each link of a member or call chain stops
   after `MAX_RECORDED_CHAIN_LINKS` links
   (`crates/extract/src/visitor/visit_impl_chain_names.rs`). Past the cap, the
@@ -324,6 +339,19 @@ The dev runtime (`<source>/jsx-dev-runtime`) is not recorded, because a build
 can omit it and a missing relative dev runtime would be a false unresolved
 import. The tsconfig `jsxImportSource` option only credits the package as a
 referenced dependency.
+
+A `/// <reference types="pkg" />` directive is an import fact too. TypeScript
+loads the type declarations of `pkg` for the file, so the visitor records a
+type-only side-effect import of `pkg`. The dependency checks then apply the
+`import type` rules: the import uses the package, and in production mode a
+production dependency that only such imports use is a type-only dependency.
+TypeScript reads a triple-slash directive only in the comments before the
+first statement or directive prologue, so a directive after code records
+nothing. A `types` value that starts with `.` or `/` names a file and records
+nothing. `types="node"` records nothing: it resolves to `@types/node`, which
+the dependency checks always credit, and an import of `node` would only add a
+false unlisted dependency. A `path` directive is a separate fact
+(`triple_slash_reference_paths`) that keeps a declaration file reachable.
 
 A Vitest config can set the source for a group of files with
 `oxc.jsx.importSource` (or the older `esbuild.jsxImportSource`). Vitest runs

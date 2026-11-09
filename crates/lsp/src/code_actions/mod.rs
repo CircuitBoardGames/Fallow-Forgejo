@@ -1,11 +1,13 @@
 mod absent_props;
 mod quick_fix;
 mod suppress;
+#[cfg(test)]
+#[path = "quick_fix_unicode_span_oracle.rs"]
+mod unicode_span_oracle;
 
 use std::path::Path;
 
 use fallow_api::EditorAnalysisResults as AnalysisResults;
-#[allow(clippy::wildcard_imports, reason = "many LSP types used")]
 use ls_types::*;
 
 pub use absent_props::*;

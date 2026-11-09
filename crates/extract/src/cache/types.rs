@@ -10,12 +10,12 @@ use crate::MemberKind;
 /// extraction semantics change, and give the reason in the commit message and
 /// the CHANGELOG. A stale version serves old extraction results from a warm
 /// cache. The `assert_cached_type_size!` guards below catch shape changes.
-pub(super) const CACHE_VERSION: u32 = 397;
+pub(super) const CACHE_VERSION: u32 = 426;
 
 /// Duplication token cache version. Bump it when duplicate tokenization,
 /// normalization, or the on-disk token cache schema changes, and give the
 /// reason in the commit message and the CHANGELOG.
-pub const DUPES_CACHE_VERSION: u32 = 18;
+pub const DUPES_CACHE_VERSION: u32 = 21;
 
 /// Default maximum cache size (256 MB). Overridable per-project via
 /// `cache.maxSizeMb` in the config file or `FALLOW_CACHE_MAX_SIZE` env var.
@@ -54,7 +54,7 @@ macro_rules! assert_cached_type_size {
     };
 }
 
-assert_cached_type_size!(CachedModule, 1504);
+assert_cached_type_size!(CachedModule, 1528);
 assert_cached_type_size!(CachedNamespaceObjectAlias, 72);
 assert_cached_type_size!(CachedLocalTypeDeclaration, 32);
 assert_cached_type_size!(CachedPublicSignatureTypeReference, 64);
@@ -63,13 +63,13 @@ assert_cached_type_size!(CachedUnknownSuppressionKind, 56);
 assert_cached_type_size!(CachedExport, 152);
 assert_cached_type_size!(CachedImport, 96);
 assert_cached_type_size!(CachedDynamicImport, 88);
-assert_cached_type_size!(CachedRequireCall, 96);
+assert_cached_type_size!(CachedRequireCall, 120);
 assert_cached_type_size!(CachedReExport, 104);
 assert_cached_type_size!(CachedMember, 88);
 assert_cached_type_size!(CachedDynamicImportPattern, 88);
 assert_cached_type_size!(crate::MemberAccess, 48);
 assert_cached_type_size!(fallow_types::extract::SemanticFact, 80);
-assert_cached_type_size!(fallow_types::extract::CalleeUse, 32);
+assert_cached_type_size!(fallow_types::extract::CalleeUse, 56);
 assert_cached_type_size!(fallow_types::extract::ImportedCallSite, 80);
 assert_cached_type_size!(fallow_types::extract::ImportBindingReference, 64);
 assert_cached_type_size!(fallow_types::extract::MisplacedDirectiveSite, 8);
@@ -77,7 +77,7 @@ assert_cached_type_size!(fallow_types::extract::SinkSite, 216);
 assert_cached_type_size!(fallow_types::extract::FunctionComplexity, 104);
 assert_cached_type_size!(fallow_types::extract::ComplexityContribution, 16);
 assert_cached_type_size!(fallow_types::extract::FlagUse, 80);
-assert_cached_type_size!(fallow_types::extract::ClassHeritageInfo, 168);
+assert_cached_type_size!(fallow_types::extract::ClassHeritageInfo, 216);
 assert_cached_type_size!(fallow_types::extract::FactoryReturnExport, 56);
 assert_cached_type_size!(fallow_types::extract::TypeMemberTypeEntry, 72);
 assert_cached_type_size!(fallow_types::extract::LoadReturnKey, 32);
@@ -239,10 +239,11 @@ pub struct CachedModule {
     pub sanitized_sink_args: Vec<fallow_types::extract::SanitizedSinkArg>,
     /// Defensive control call sites for security surface output.
     pub security_control_sites: Vec<fallow_types::extract::SecurityControlSite>,
-    /// Deduped statically flattenable callee paths. Round-trips so the
-    /// `boundaries.calls.forbidden` detector sees call sites on warm-cache
-    /// loads.
+    /// Statically flattenable callee paths with every site. Round-trips so
+    /// the callee rules see each call site on warm-cache loads.
     pub callee_uses: Vec<fallow_types::extract::CalleeUse>,
+    /// Literal commands of process-spawning calls for `unlisted-binaries`.
+    pub command_invocations: Vec<fallow_types::extract::CommandInvocation>,
     /// Scope-resolved imported calls, preserving each occurrence and argument.
     pub imported_call_sites: Vec<fallow_types::extract::ImportedCallSite>,
     /// Import binding references for `fallow trace --dependency`. Round-trips
@@ -538,6 +539,8 @@ pub struct CachedRequireCall {
     pub(crate) source_span_end: u32,
     /// Names destructured from the require result.
     pub(crate) destructured_names: Vec<String>,
+    /// The `(property key, local name)` pairs of the destructured properties.
+    pub(crate) destructured_locals: Vec<(String, String)>,
     /// Local variable name for namespace requires.
     pub(crate) local_name: Option<String>,
     /// `true` for the type-erased `import type X = require('...')` spelling.

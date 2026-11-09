@@ -9,6 +9,7 @@
 //! telemetry recording, exit-code gating, and human / machine rendering.
 
 pub mod coverage;
+mod coverage_rows;
 pub mod mutation_report;
 pub mod optimization_target;
 mod runtime_static_signals;
@@ -29,7 +30,8 @@ use fallow_engine::health::{
 };
 
 use crate::check::resolve_workspace_scope;
-use crate::error::emit_error;
+use crate::error::{emit_error, emit_input_error};
+use crate::exit_codes::ErrorExitCode;
 use crate::report;
 use crate::report::OwnershipResolver;
 
@@ -201,7 +203,9 @@ fn build_health_scope_inputs<'a>(
 /// seam), so its exit code is honored without a second error document.
 fn health_err_to_exit(error: HealthError, output: OutputFormat) -> ExitCode {
     match error {
-        HealthError::Message { message, exit_code } => emit_error(&message, exit_code, output),
+        HealthError::Message { message, exit_code } => {
+            emit_error(&message, ErrorExitCode::passthrough(exit_code), output)
+        }
         HealthError::Printed(code) => ExitCode::from(code),
     }
 }
@@ -219,7 +223,7 @@ pub fn load_health_config(
         return Err(code);
     }
     fallow_engine::health::validate_coverage_root_absolute(opts.coverage_inputs.coverage_root)
-        .map_err(|e| emit_error(&e, 2, opts.output))?;
+        .map_err(|e| emit_input_error(&e, opts.output))?;
     validate_health_churn_file(opts).map_err(|e| health_err_to_exit(e, opts.output))?;
     let t = Instant::now();
     let mut config = crate::load_config_for_analysis(
@@ -311,14 +315,14 @@ fn execute_health_with_config_and_seams(
 ) -> Result<HealthResult, ExitCode> {
     let t = Instant::now();
     let session = fallow_engine::session::AnalysisSession::from_resolved_config(config)
-        .map_err(|e| emit_error(&format!("analysis failed: {e}"), 2, opts.output))?;
+        .map_err(|e| emit_input_error(&format!("analysis failed: {e}"), opts.output))?;
     let discover_ms = t.elapsed().as_secs_f64() * 1000.0;
     let parts = session.parsed_parts_uncached(true);
     let pre_computed_analysis =
         fallow_engine::health::should_precompute_dead_code_analysis(opts, session.config())
             .then(|| session.analyze_dead_code_with_parsed_modules(&parts.modules))
             .transpose()
-            .map_err(|e| emit_error(&format!("analysis failed: {e}"), 2, opts.output))?;
+            .map_err(|e| emit_input_error(&format!("analysis failed: {e}"), opts.output))?;
     let config = parts.config;
     let files = parts.files;
     let modules = parts.modules;
@@ -414,16 +418,15 @@ pub fn run_health(
     };
     let resolved_type_aware = match resolve_type_aware_health_options(type_aware, &config) {
         Ok(options) => options,
-        Err(message) => return emit_error(&message, 2, opts.output),
+        Err(message) => return emit_input_error(&message, opts.output),
     };
     let requested = type_aware.requested || (type_aware.unfiltered && resolved_type_aware.enabled);
     let mut degraded_meta = None;
     let semantic = if requested {
         let enabled = resolved_type_aware.enabled;
         if !enabled {
-            return emit_error(
+            return emit_input_error(
                 "--type-coupling requires --type-aware or typeAware.enabled in config",
-                2,
                 opts.output,
             );
         }
@@ -995,6 +998,7 @@ fn maybe_print_score_gate_note(result: &HealthResult, options: HealthPrintOption
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exit_codes::exit_gate_failed;
     use fallow_config::{FallowConfig, OutputFormat};
     use fallow_output::{ComplexityViolation, ExceededThreshold, FindingSeverity};
     use std::path::PathBuf;
@@ -1193,7 +1197,7 @@ mod tests {
     #[test]
     fn plain_health_with_findings_fails() {
         let result = fx_gate_result(vec![moderate_finding()], Some(fx_health_score(87.5, "A")));
-        assert_eq!(gate_exit(&result, None, None, false), ExitCode::from(1));
+        assert_eq!(gate_exit(&result, None, None, false), exit_gate_failed());
     }
 
     #[test]
@@ -1225,7 +1229,7 @@ mod tests {
         let result = fx_gate_result(vec![moderate_finding()], Some(fx_health_score(50.0, "D")));
         assert_eq!(
             gate_exit(&result, Some(80.0), None, false),
-            ExitCode::from(1)
+            exit_gate_failed()
         );
     }
 
@@ -1243,7 +1247,7 @@ mod tests {
         );
         assert_eq!(
             gate_exit(&with_critical, None, Some(FindingSeverity::Critical), false),
-            ExitCode::from(1),
+            exit_gate_failed(),
         );
     }
 
@@ -1262,7 +1266,7 @@ mod tests {
                 Some(FindingSeverity::Critical),
                 false
             ),
-            ExitCode::from(1),
+            exit_gate_failed(),
         );
         let critical = fx_gate_result(vec![critical_finding()], Some(fx_health_score(87.5, "A")));
         assert_eq!(
@@ -1272,7 +1276,7 @@ mod tests {
                 Some(FindingSeverity::Critical),
                 false
             ),
-            ExitCode::from(1),
+            exit_gate_failed(),
         );
     }
 
@@ -1290,7 +1294,7 @@ mod tests {
         let result = fx_low_traffic_runtime_result();
         assert_eq!(
             gate_exit(&result, Some(0.0), None, false),
-            ExitCode::from(1)
+            exit_gate_failed()
         );
         assert_eq!(gate_exit(&result, None, None, true), ExitCode::SUCCESS);
     }
@@ -1300,11 +1304,13 @@ mod tests {
             branching_by_file: fallow_engine::health::BranchingByFile::default(),
             report: fallow_output::HealthReport {
                 runtime_coverage: Some(fallow_output::RuntimeCoverageReport {
+                    cloud_context: None,
                     schema_version: fallow_output::RuntimeCoverageSchemaVersion::V1,
                     verdict: fallow_output::RuntimeCoverageReportVerdict::ColdCodeDetected,
                     signals: Vec::new(),
                     summary: fx_summary(1, 0, 1, 0),
                     findings: vec![fallow_output::RuntimeCoverageFinding {
+                        cloud_context: None,
                         id: "fallow:prod:lowtraffic".to_owned(),
                         stable_id: None,
                         path: PathBuf::from("/project/src/cold.ts"),
@@ -1365,7 +1371,7 @@ mod tests {
                     exit_reason: true,
                 },
             ),
-            ExitCode::from(1),
+            exit_gate_failed(),
         );
     }
 
@@ -1398,8 +1404,8 @@ mod tests {
     fn a_failed_type_aware_completeness_gate_fails_the_health_print() {
         let mut result = fx_gate_result(vec![], Some(fx_health_score(100.0, "A")));
         result.type_aware_meta = Some(incomplete_required_type_aware_meta());
-        assert_eq!(gate_exit(&result, None, None, false), ExitCode::from(1));
-        assert_eq!(gate_exit(&result, None, None, true), ExitCode::from(1));
+        assert_eq!(gate_exit(&result, None, None, false), exit_gate_failed());
+        assert_eq!(gate_exit(&result, None, None, true), exit_gate_failed());
 
         let options = HealthPrintOptions {
             quiet: true,

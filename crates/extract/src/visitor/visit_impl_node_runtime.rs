@@ -1,7 +1,3 @@
-#[allow(
-    clippy::wildcard_imports,
-    reason = "many Node runtime helper AST types used"
-)]
 use oxc_ast::ast::*;
 
 use crate::js_text::JsText;
@@ -11,16 +7,28 @@ use fallow_types::extract::ImportLoadKind;
 use super::super::ModuleInfoExtractor;
 use super::super::declarations::ModulePathBinding;
 use super::{
-    collect_pino_config_targets, extract_object_pattern_bindings, is_child_process_source,
-    is_meta_url_arg, is_node_path_source, is_node_url_source, loader_hook_exports_for_source,
-    local_fork_source, new_url_import_source, node_module_register_specifier,
-    normalize_module_file_relative_path, pino_factory_callee_name,
+    NEW_URL_LOADER_EXPORT, collect_pino_config_targets, extract_object_pattern_bindings,
+    is_child_process_source, is_meta_url_arg, is_node_path_source, is_node_url_source,
+    loader_hook_exports_for_source, local_fork_source, new_url_import_source,
+    node_module_register_specifier, normalize_module_file_relative_path, pino_factory_callee_name,
 };
+
+#[path = "visit_impl_commands.rs"]
+mod visit_commands;
 
 /// The CommonJS globals that name a path of the current module.
 const MODULE_PATH_GLOBALS: &[&str] = &["__filename", "__dirname"];
 
 impl ModuleInfoExtractor {
+    /// Record the facts of a Node runtime call: pino transports, `register`
+    /// loaders, `child_process.fork` targets and process commands.
+    pub(super) fn record_node_runtime_call(&mut self, expr: &CallExpression<'_>) {
+        self.try_record_pino_transport_targets(expr);
+        self.try_record_node_module_register(expr);
+        self.try_record_child_process_fork(expr);
+        self.try_record_command_call(expr);
+    }
+
     fn is_pino_factory_binding(&self, local_name: &str) -> bool {
         let imported = self.imports.iter().any(|import| {
             import.source == super::PINO_PACKAGE
@@ -40,7 +48,7 @@ impl ModuleInfoExtractor {
         (imported || required) && !self.nested_scope_shadows(local_name)
     }
 
-    pub(super) fn try_record_pino_transport_targets(&mut self, expr: &CallExpression<'_>) {
+    fn try_record_pino_transport_targets(&mut self, expr: &CallExpression<'_>) {
         let Some(local_name) = pino_factory_callee_name(&expr.callee) else {
             return;
         };
@@ -67,8 +75,28 @@ impl ModuleInfoExtractor {
         }
     }
 
+    /// Narrow each `new URL()` edge to a registered loader hook module, so
+    /// the `register()` edge credits only the hook exports. The URL is often
+    /// bound to a local before the `register()` call, so this runs after the
+    /// walk of the program.
+    pub(super) fn finish_register_loader_new_urls(&mut self) {
+        if self.new_url_context.register_loader_sources.is_empty() {
+            return;
+        }
+        for import in &mut self.dynamic_imports {
+            if import.destructured_names == [NEW_URL_LOADER_EXPORT]
+                && self
+                    .new_url_context
+                    .register_loader_sources
+                    .contains(&import.source)
+            {
+                import.destructured_names.clear();
+            }
+        }
+    }
+
     /// Record `register('loader', ...)` from `node:module` as a dynamic import.
-    pub(super) fn try_record_node_module_register(&mut self, expr: &CallExpression<'_>) {
+    fn try_record_node_module_register(&mut self, expr: &CallExpression<'_>) {
         let register_match = match &expr.callee {
             Expression::Identifier(ident) => {
                 self.is_node_module_register(ident.name.as_str(), false)
@@ -87,6 +115,11 @@ impl ModuleInfoExtractor {
         let sources = self.node_module_register_sources(expr);
         for source in sources.into_iter().filter(|source| !source.is_empty()) {
             let destructured_names = loader_hook_exports_for_source(&source);
+            if !destructured_names.is_empty() {
+                self.new_url_context
+                    .register_loader_sources
+                    .insert(source.clone());
+            }
             self.dynamic_imports.push(DynamicImportInfo {
                 source,
                 span: expr.span,
@@ -434,7 +467,7 @@ impl ModuleInfoExtractor {
         Some(format!("{prefix}{}", parts.join("/")))
     }
 
-    pub(super) fn try_record_child_process_fork(&mut self, expr: &CallExpression<'_>) {
+    fn try_record_child_process_fork(&mut self, expr: &CallExpression<'_>) {
         if !self.is_module_or_function_runtime_scope() {
             return;
         }

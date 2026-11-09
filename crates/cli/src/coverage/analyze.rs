@@ -21,11 +21,15 @@ use crate::coverage::cloud_client::{
     CloudError, CloudNeverCalledSource, CloudRequest, CloudRuntimeContext, CloudRuntimeFunction,
     CloudRuntimeProvenance, CloudRuntimeWarning, CloudTrackingState, fetch_runtime_context,
 };
+use crate::coverage::cloud_rows;
 use crate::coverage::upload_common::parse_git_remote_to_project_id;
 use crate::coverage::upload_inventory::extension_supported;
-use crate::error::emit_error;
 use crate::health::HealthOptions;
 use crate::health::optimization_target::{StaticCost, optimization_target};
+use crate::{
+    error::{emit_error, emit_input_error},
+    exit_codes::exit_invalid_input,
+};
 use fallow_output::{
     RUNTIME_STALE_AFTER_DAYS, RuntimeCoverageAction, RuntimeCoverageCaptureQuality,
     RuntimeCoverageConfidence, RuntimeCoverageDataSource, RuntimeCoverageEvidence,
@@ -86,15 +90,14 @@ impl fmt::Debug for AnalyzeArgs {
 
 pub fn run(args: &AnalyzeArgs, ctx: &RunContext<'_>) -> ExitCode {
     if let Err(message) = validate_output_format(ctx.output) {
-        return emit_error(&message, 2, ctx.output);
+        return emit_input_error(&message, ctx.output);
     }
 
     let env_cloud = runtime_coverage_source_env_is_cloud();
     let cloud = args.cloud || env_cloud;
     if cloud && args.runtime_coverage.is_some() {
-        return emit_error(
+        return emit_input_error(
             "Choose one runtime coverage source: --cloud or --runtime-coverage <path>.",
-            2,
             ctx.output,
         );
     }
@@ -104,9 +107,8 @@ pub fn run(args: &AnalyzeArgs, ctx: &RunContext<'_>) -> ExitCode {
     }
 
     let Some(path) = args.runtime_coverage.as_deref() else {
-        return emit_error(
+        return emit_input_error(
             "No runtime coverage source selected. Pass --runtime-coverage <path>, --cloud, or set FALLOW_RUNTIME_COVERAGE_SOURCE=cloud.",
-            2,
             ctx.output,
         );
     };
@@ -156,7 +158,7 @@ fn run_local(path: &Path, args: &AnalyzeArgs, ctx: &RunContext<'_>) -> ExitCode 
         Err(code) => return code,
     };
     let Some(report) = result.report.runtime_coverage else {
-        return emit_error("runtime coverage report was not produced", 2, ctx.output);
+        return emit_input_error("runtime coverage report was not produced", ctx.output);
     };
     print_runtime_report(&report, ctx, result.elapsed, args)
 }
@@ -202,12 +204,12 @@ pub fn benchmark_local_json(
     let report = result
         .report
         .runtime_coverage
-        .ok_or_else(|| ExitCode::from(2))?;
+        .ok_or_else(exit_invalid_input)?;
     let output =
-        runtime_json_output(&report, result.elapsed, false).map_err(|_| ExitCode::from(2))?;
+        runtime_json_output(&report, result.elapsed, false).map_err(|_| exit_invalid_input())?;
     let rendered = crate::json_style::JsonStyle::Compact
         .serialize(&output)
-        .map_err(|_| ExitCode::from(2))?;
+        .map_err(|_| exit_invalid_input())?;
     Ok((
         report.findings.len(),
         report.hot_paths.len(),
@@ -511,10 +513,10 @@ fn run_static_analysis(
         fallow_config::ProductionAnalysis::Health,
     )?;
     let session = fallow_engine::session::AnalysisSession::from_resolved_config(config)
-        .map_err(|err| emit_error(&format!("analysis failed: {err}"), 2, ctx.output))?;
+        .map_err(|err| emit_input_error(&format!("analysis failed: {err}"), ctx.output))?;
     let artifacts = session
         .analyze_dead_code_with_artifacts(true, true)
-        .map_err(|err| emit_error(&format!("analysis failed: {err}"), 2, ctx.output))?;
+        .map_err(|err| emit_input_error(&format!("analysis failed: {err}"), ctx.output))?;
     Ok(StaticAnalysisRun { session, artifacts })
 }
 
@@ -535,16 +537,14 @@ fn build_static_index(ctx: &RunContext<'_>, production: bool) -> Result<StaticIn
     let run = run_static_analysis(ctx, production)?;
     let analysis_output = &run.artifacts;
     let Some(modules) = analysis_output.modules.as_deref() else {
-        return Err(emit_error(
+        return Err(emit_input_error(
             "analysis failed: engine did not retain parsed modules",
-            2,
             ctx.output,
         ));
     };
     let Some(files) = analysis_output.files.as_deref() else {
-        return Err(emit_error(
+        return Err(emit_input_error(
             "analysis failed: engine did not retain discovered files",
-            2,
             ctx.output,
         ));
     };
@@ -862,8 +862,9 @@ fn merge_cloud_snapshot(
     } = collect_cloud_merge_entries(snapshot, static_index, min_invocations_hot);
 
     sort_cloud_runtime_entries(&mut findings, &mut hot_paths);
-    let blast_radius = cloud_blast_radius_entries(snapshot, synthesized_blast_radius);
-    let importance = cloud_importance_entries(snapshot, synthesized_importance);
+    let blast_radius = cloud_rows::cloud_blast_radius_entries(snapshot, synthesized_blast_radius);
+    let importance =
+        cloud_rows::cloud_importance_entries(snapshot, rank_importance(synthesized_importance));
 
     let warnings = cloud_warnings(snapshot, unmatched_cloud_functions.len());
     let trust_output = cloud_runtime_trust_output(snapshot);
@@ -886,6 +887,7 @@ fn merge_cloud_snapshot(
         actionability_reason: trust_output.actionability_reason,
         actionability_verdict: trust_output.actionability_verdict,
         provenance: trust_output.provenance,
+        cloud_context: cloud_rows::cloud_context(&snapshot.extra),
     };
     CloudMergeOutput {
         report,
@@ -1095,7 +1097,9 @@ fn collect_called_cloud_function(
     if let Some(invocations) = function.hit_count
         && invocations >= min_invocations_hot
     {
-        entries.hot_paths.push(cloud_hot_path(local, invocations));
+        entries
+            .hot_paths
+            .push(cloud_hot_path(local, invocations, function));
     }
     if let Some(invocations) = function.hit_count {
         entries
@@ -1107,56 +1111,11 @@ fn collect_called_cloud_function(
     }
 }
 
-fn cloud_blast_radius_entries(
-    snapshot: &CloudRuntimeContext,
-    synthesized: Vec<fallow_output::RuntimeCoverageBlastRadiusEntry>,
-) -> Vec<fallow_output::RuntimeCoverageBlastRadiusEntry> {
-    if snapshot.blast_radius.is_empty() {
-        return synthesized;
-    }
-    snapshot
-        .blast_radius
-        .iter()
-        .map(|entry| fallow_output::RuntimeCoverageBlastRadiusEntry {
-            id: entry.id.clone(),
-            stable_id: entry.stable_id.clone(),
-            file: PathBuf::from(&entry.file),
-            function: entry.function.clone(),
-            line: entry.line,
-            caller_count: entry.caller_count.unwrap_or(0),
-            caller_count_weighted_by_traffic: entry.caller_count_weighted_by_traffic.unwrap_or(0),
-            deploys_touched: entry.deploys_touched,
-            risk_band: map_cloud_risk_band(entry.risk_band),
-        })
-        .collect()
-}
-
-fn cloud_importance_entries(
-    snapshot: &CloudRuntimeContext,
-    synthesized: Vec<(fallow_output::RuntimeCoverageImportanceEntry, Option<u32>)>,
-) -> Vec<fallow_output::RuntimeCoverageImportanceEntry> {
-    if snapshot.importance.is_empty() {
-        return rank_importance(synthesized);
-    }
-    snapshot
-        .importance
-        .iter()
-        .map(|entry| fallow_output::RuntimeCoverageImportanceEntry {
-            id: entry.id.clone(),
-            stable_id: entry.stable_id.clone(),
-            file: PathBuf::from(&entry.file),
-            function: entry.function.clone(),
-            line: entry.line,
-            invocations: entry.invocations,
-            cyclomatic: entry.cyclomatic.unwrap_or(0),
-            owner_count: entry.owner_count.unwrap_or(0),
-            importance_score: entry.importance_score,
-            reason: entry.reason.clone(),
-        })
-        .collect()
-}
-
-fn cloud_hot_path(local: &StaticFunctionInfo, invocations: u64) -> RuntimeCoverageHotPath {
+fn cloud_hot_path(
+    local: &StaticFunctionInfo,
+    invocations: u64,
+    function: &CloudRuntimeFunction,
+) -> RuntimeCoverageHotPath {
     RuntimeCoverageHotPath {
         id: stable_runtime_id("hot", &local.path, &local.name, local.start_line),
         stable_id: Some(local.stable_id.clone()),
@@ -1170,6 +1129,7 @@ fn cloud_hot_path(local: &StaticFunctionInfo, invocations: u64) -> RuntimeCovera
         optimization_target: local
             .cost
             .map(|cost| optimization_target(invocations, cost, None)),
+        cloud_context: cloud_rows::cloud_context(&function.extra),
     }
 }
 
@@ -1189,6 +1149,7 @@ fn cloud_blast_radius(
         caller_count_weighted_by_traffic: weighted,
         deploys_touched: Some(function.deployments_observed),
         risk_band: blast_radius_risk_band(local.caller_count, weighted),
+        cloud_context: None,
     }
 }
 
@@ -1253,10 +1214,11 @@ fn cloud_finding(
         // trace_count + thresholds here, so it omits the #321 discriminator
         // block; that surface's discriminator contract is #328 territory.
         discriminators: None,
+        cloud_context: cloud_rows::cloud_context(&function.extra),
     }
 }
 
-fn rank_importance(
+pub(super) fn rank_importance(
     entries: Vec<(fallow_output::RuntimeCoverageImportanceEntry, Option<u32>)>,
 ) -> Vec<fallow_output::RuntimeCoverageImportanceEntry> {
     let max_log = entries
@@ -1326,21 +1288,6 @@ fn blast_radius_risk_band(caller_count: u32, weighted: u64) -> RuntimeCoverageRi
         RuntimeCoverageRiskBand::Medium
     } else {
         RuntimeCoverageRiskBand::Low
-    }
-}
-
-const fn map_cloud_risk_band(
-    risk_band: crate::coverage::cloud_client::CloudRuntimeRiskBand,
-) -> RuntimeCoverageRiskBand {
-    match risk_band {
-        crate::coverage::cloud_client::CloudRuntimeRiskBand::Low => RuntimeCoverageRiskBand::Low,
-        crate::coverage::cloud_client::CloudRuntimeRiskBand::Medium => {
-            RuntimeCoverageRiskBand::Medium
-        }
-        crate::coverage::cloud_client::CloudRuntimeRiskBand::High => RuntimeCoverageRiskBand::High,
-        crate::coverage::cloud_client::CloudRuntimeRiskBand::Unknown => {
-            RuntimeCoverageRiskBand::Low
-        }
     }
 }
 
@@ -1801,7 +1748,7 @@ fn print_runtime_json(
         Ok(value) => value,
         Err(err) => {
             eprintln!("Error: failed to serialize runtime coverage report: {err}");
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
     };
     crate::report::emit_report_json(&output, "runtime coverage JSON", json_style)
@@ -2256,6 +2203,7 @@ mod tests {
             importance: vec![],
             functions: vec![function],
             warnings: vec![],
+            extra: serde_json::Map::new(),
         };
 
         let report = merge_cloud_snapshot(&snapshot, &static_index, 100).report;
@@ -2954,6 +2902,7 @@ export const createStore = (rows: string[]) => {
                         .to_owned(),
                 ),
             }],
+            extra: serde_json::Map::new(),
         };
         let warnings = cloud_warnings(&snapshot, 0);
         let no_data_count = warnings
@@ -2996,6 +2945,7 @@ export const createStore = (rows: string[]) => {
                     "No runtime coverage data received for apps/dashboard in fallow-cloud in the last 30 days.".to_owned(),
                 ),
             }],
+            extra: serde_json::Map::new(),
         };
         let warnings = cloud_warnings(&snapshot, 0);
         let no_data_count = warnings
@@ -3033,6 +2983,7 @@ export const createStore = (rows: string[]) => {
             importance: vec![],
             functions: vec![],
             warnings: vec![],
+            extra: serde_json::Map::new(),
         };
         assert!(cloud_capture_quality(&snapshot).is_none());
 
@@ -3111,7 +3062,6 @@ export const createStore = (rows: string[]) => {
         let mut report = RuntimeCoverageReport {
             schema_version: RuntimeCoverageSchemaVersion::V1,
             verdict: RuntimeCoverageReportVerdict::Clean,
-            signals: Vec::new(),
             summary: fallow_output::RuntimeCoverageSummary::default(),
             findings: vec![
                 runtime_finding("fallow:prod:00000001"),
@@ -3129,12 +3079,8 @@ export const createStore = (rows: string[]) => {
                 runtime_importance("fallow:importance:00000001"),
                 runtime_importance("fallow:importance:00000002"),
             ],
-            watermark: None,
-            warnings: vec![],
             actionable: true,
-            actionability_reason: None,
-            actionability_verdict: None,
-            provenance: fallow_output::RuntimeCoverageProvenance::default(),
+            ..Default::default()
         };
         apply_top_limit(&mut report, Some(1));
         assert_eq!(report.findings.len(), 1);
@@ -3238,6 +3184,7 @@ export const createStore = (rows: string[]) => {
 
     fn runtime_finding(id: &str) -> RuntimeCoverageFinding {
         RuntimeCoverageFinding {
+            cloud_context: None,
             id: id.to_owned(),
             stable_id: None,
             source_hash: None,
@@ -3311,6 +3258,7 @@ export const createStore = (rows: string[]) => {
             untracked_reason: None,
             repo_path: None,
             period_tracking_state: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -3338,11 +3286,13 @@ export const createStore = (rows: string[]) => {
             blast_radius: vec![],
             importance: vec![],
             warnings: vec![],
+            extra: serde_json::Map::new(),
         }
     }
 
     fn runtime_hot_path(id: &str) -> RuntimeCoverageHotPath {
         RuntimeCoverageHotPath {
+            cloud_context: None,
             id: id.to_owned(),
             stable_id: None,
             path: PathBuf::from("src/a.ts"),
@@ -3358,6 +3308,7 @@ export const createStore = (rows: string[]) => {
 
     fn runtime_blast_radius(id: &str) -> RuntimeCoverageBlastRadiusEntry {
         RuntimeCoverageBlastRadiusEntry {
+            cloud_context: None,
             id: id.to_owned(),
             stable_id: None,
             file: PathBuf::from("src/a.ts"),

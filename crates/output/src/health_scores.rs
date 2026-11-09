@@ -586,10 +586,6 @@ pub const FILE_LINES_FINDING_NAME: &str = "<file>";
 /// Resolved thresholds used to evaluate a health finding.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[allow(
-    clippy::struct_field_names,
-    reason = "target-dependent clippy lint; wire fields mirror max_* config keys"
-)]
 pub struct HealthEffectiveThresholds {
     /// Effective cyclomatic-complexity ceiling for the matched file.
     pub max_cyclomatic: u16,
@@ -606,10 +602,6 @@ pub struct HealthEffectiveThresholds {
 /// Threshold values configured by a single override entry.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[allow(
-    clippy::struct_field_names,
-    reason = "target-dependent clippy lint; wire fields mirror max_* config keys"
-)]
 pub struct HealthConfiguredThresholds {
     /// Cyclomatic ceiling set by the override, when it sets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -642,11 +634,13 @@ pub enum ThresholdSource {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ThresholdOverrideStatus {
-    /// The override matches a finding that still needs the raised ceiling.
+    /// The override is in force on the matched unit. Either it raises a
+    /// ceiling that the unit needs to pass, or it lowers a ceiling that the
+    /// unit breaches. In the second case `outstanding` names the breach.
     Active,
-    /// The override is not what keeps the matched unit quiet, so it can go:
-    /// either the unit passes the global thresholds on its own, or an inline
-    /// suppression already covers it.
+    /// The override changes no result on the matched unit, so it can go:
+    /// either the unit gives the same result with the global thresholds, or
+    /// an inline suppression already covers it.
     Stale,
     /// The override raises the ceiling for this dimension but the matched code
     /// still exceeds the raised value, so the finding survives the override.

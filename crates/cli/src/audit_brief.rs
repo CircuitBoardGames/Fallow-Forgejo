@@ -44,10 +44,6 @@ const COORDINATION_GAP_NOTE: &str = "syntactic attention pointer, not a correctn
 
 /// Build the deltas from head sets vs a base set, sorted for determinism.
 #[must_use]
-#[allow(
-    clippy::implicit_hasher,
-    reason = "callers always pass the audit FxHashSet key sets; generalizing the hasher adds noise"
-)]
 pub fn build_review_deltas(
     head_boundary: &FxHashSet<String>,
     base_boundary: &FxHashSet<String>,
@@ -725,9 +721,8 @@ pub fn build_brief_json(
     let subtract = build_brief_subtract_sections(result)?;
     let mut output = fallow_output::build_review_brief_json_output(brief, audit_header, subtract)
         .map_err(|err| {
-        crate::error::emit_error(
+        crate::error::emit_input_error(
             &format!("JSON serialization error: {err}"),
-            2,
             fallow_config::OutputFormat::Json,
         )
     })?;

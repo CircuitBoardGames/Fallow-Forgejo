@@ -60,9 +60,9 @@ impl CacheStore {
     ///
     /// Returns the [`CacheRejection`] that decided against reuse. Every branch
     /// names itself instead of collapsing into a bare miss: a run that read a
-    /// multi-megabyte blob and then refused it costs the same as a cold run
-    /// but used to be indistinguishable from having no cache at all, and the
-    /// config-hash branch in particular said nothing whatsoever. Callers carry
+    /// multi-megabyte blob and then refused it costs the same as a cold run,
+    /// and without a named reason it is indistinguishable from having no cache
+    /// at all. Callers carry
     /// the reason into the perf table and `fallow doctor`.
     ///
     /// The version is read from the file header BEFORE the payload is
@@ -469,7 +469,7 @@ impl CacheStore {
 /// Constant across format bumps: only the version field beside it moves. That
 /// lets future upgrades report an explicit version mismatch; older unframed
 /// caches still report an ambiguous decode failure.
-pub(super) const CACHE_MAGIC: [u8; 4] = *b"FLWX";
+const CACHE_MAGIC: [u8; 4] = *b"FLWX";
 
 /// Bytes the framing adds ahead of the payload: the magic plus a little-endian
 /// `u32` format version.

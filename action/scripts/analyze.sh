@@ -1936,6 +1936,18 @@ if [ -n "$DEGRADED_SUMMARY" ]; then
   ANALYSIS_DEGRADED=true
   echo "::warning::Fallow ran with degraded inputs: ${DEGRADED_SUMMARY}. Some findings or scores were computed over less than the whole project, or from an input that did not load."
 fi
+# --- Requested checks whose rule is off (issue #4067) ---
+#
+# This step runs fallow with `--quiet --format json`, so the stderr note never
+# reaches the job log. The kind does not degrade the analysis, so the block
+# above skips it. One aggregated line, for the same annotation budget.
+REQUESTED_RULES_OFF=$(jq_debug -r '
+  [ (.workspace_diagnostics // .dead_code.workspace_diagnostics // [])[] | select(.kind == "requested-rule-off") | "\(.rule) (\(.flag))" ]
+  | join(", ")
+' "$RESULTS_FILE" || true)
+if [ -n "$REQUESTED_RULES_OFF" ]; then
+  echo "::warning::Fallow did not run these requested checks because their rules are off in config: ${REQUESTED_RULES_OFF}. Set each rule to error or warn to run the check."
+fi
 # --- Requests the run could not apply (issues #2687, #2688) ---
 #
 # The CLI writes this to stderr too, and this step replays stderr as
@@ -2149,10 +2161,9 @@ fi
 # already published its outputs and artifacts, so the downstream steps still
 # run; this is the last thing the script does.
 #
-# The count gate lives here too. It used to sit in an inline `run:` block in
-# action.yml whose first line returned when `fail-on-issues` was not true,
-# which is what made the security gate unreachable for anyone who set
-# `fail-on-issues: false` (issue #2685).
+# The count gate lives here too. An inline `run:` block in action.yml that
+# returns early when `fail-on-issues` is not true makes the security gate
+# unreachable for anyone who sets `fail-on-issues: false` (issue #2685).
 COUNT_FAILURES_BEFORE=${#GATE_FAILURES[@]}
 if [ "${INPUT_FAIL_ON_ISSUES:-}" = "true" ]; then
   if [ "$INPUT_COMMAND" = "audit" ]; then

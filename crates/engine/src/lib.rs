@@ -25,6 +25,7 @@ use std::path::Path;
 /// across runs.
 pub mod baseline;
 pub mod baseline_growth;
+pub mod baseline_location;
 /// Read-only inspection of the persisted extraction cache, for `fallow doctor`.
 pub mod cache_status;
 pub mod change_coupling;
@@ -34,6 +35,7 @@ pub mod churn;
 /// Continuous integration detection shared by the API runtime and the CLI.
 pub mod ci_env;
 pub mod clock;
+pub mod code_routes;
 pub mod codeowners;
 mod core_backend;
 pub mod cross_reference;
@@ -73,6 +75,7 @@ pub mod project_analysis;
 pub mod project_config;
 mod public_api;
 pub mod repo_refs;
+pub mod requested_rule_off;
 mod results;
 pub mod search_visibility;
 mod security;
@@ -80,6 +83,7 @@ pub mod session;
 mod session_reuse;
 pub mod shell_quote;
 pub mod similar_code;
+pub mod sink_substitution;
 pub mod source;
 mod suppress;
 pub mod test_paths;
@@ -151,7 +155,7 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
-pub(crate) fn engine_error(err: impl fmt::Display) -> EngineError {
+fn engine_error(err: impl fmt::Display) -> EngineError {
     EngineError::new(err.to_string())
 }
 
@@ -455,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn analysis_session_can_be_consumed_into_parsed_pipeline_parts() {
+    fn analysis_session_parses_only_its_discovered_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let src = temp.path().join("src");
         std::fs::create_dir(&src).expect("src dir");
@@ -463,7 +467,7 @@ mod tests {
 
         let session = AnalysisSession::load(temp.path(), None).expect("session loads");
         std::fs::write(src.join("late.ts"), "export const late = 1;\n").expect("late source file");
-        let parts = session.into_parsed_parts(false);
+        let parts = session.parsed_parts_uncached(false);
 
         assert_eq!(parts.config.root, temp.path());
         assert!(parts.config_path.is_none());
@@ -511,7 +515,7 @@ mod tests {
         std::fs::write(src.join("util.ts"), "export const value = 1;\n").expect("source file");
 
         let session = AnalysisSession::load(temp.path(), None).expect("session loads");
-        let parts = session.into_parsed_parts(false);
+        let parts = session.parsed_parts_uncached(false);
         let analysis = crate::dead_code::analyze_with_parse_result(&parts.config, &parts.modules)
             .expect("reused parse analysis succeeds");
 

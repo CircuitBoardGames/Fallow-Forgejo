@@ -18,11 +18,13 @@
 mod auto_imports;
 mod dynamic_imports;
 pub(crate) mod fallbacks;
-pub(crate) mod inline_loaders;
+mod file_attempt;
+mod inline_loaders;
 mod jsx_runtime;
 mod memo;
 mod output_entry;
 mod package_credit;
+mod package_import_conditions;
 mod path_info;
 mod re_exports;
 mod react_native;
@@ -34,6 +36,7 @@ mod tests;
 mod tsconfig_scope;
 mod types;
 mod upgrades;
+mod url_suffix;
 mod work;
 mod workspace_alias;
 
@@ -47,9 +50,9 @@ pub use path_info::{
 };
 pub use react_native::{PlatformFamilyKey, has_react_native_plugin, platform_family_key};
 pub use types::{
-    MISSING_ONLY_OUTPUT_DIRS, MissingExportTarget, OUTPUT_DIRS, ResolveResult, ResolvedImport,
-    ResolvedModule, ResolvedProject, ResolvedReExport, ResolvedReplacedModuleTarget,
-    ResolvedSourceEdge,
+    MissingExportTarget, OUTPUT_DIRS, ResolveResult, ResolvedImport, ResolvedModule,
+    ResolvedProject, ResolvedReExport, ResolvedReplacedModuleTarget, ResolvedSourceEdge,
+    ScopedPathAlias,
 };
 pub use work::ResolveWork;
 
@@ -70,6 +73,7 @@ use auto_imports::synthesize_auto_import_edges;
 use dynamic_imports::{GlobMatcherCache, resolve_dynamic_imports, resolve_dynamic_patterns};
 use jsx_runtime::resolve_config_jsx_runtime_imports;
 pub use jsx_runtime::{CompiledJsxRule, compile_jsx_rules};
+use package_import_conditions::synthesize_package_import_condition_edges;
 use re_exports::resolve_re_exports;
 use react_native::{build_condition_names, build_extensions, synthesize_platform_family_edges};
 use require_imports::resolve_require_imports;
@@ -90,6 +94,8 @@ pub struct ResolveAllImportsInput<'a> {
     pub active_plugins: &'a [String],
     /// Configured TypeScript path alias pairs.
     pub path_aliases: &'a [(String, String)],
+    /// Plugin path aliases that apply only to the files of one workspace.
+    pub scoped_path_aliases: &'a [ScopedPathAlias],
     /// Auto-import rules that synthesize implicit graph edges.
     pub auto_imports: &'a [AutoImportRule],
     /// JSX import sources from bundler and test configs. Each adds a runtime
@@ -118,9 +124,9 @@ pub struct ResolveAllImportsInput<'a> {
 /// stylesheets one file at a time) builds a session once and reuses it across
 /// every resolution instead of rebuilding this state per call.
 pub struct ResolverSession {
-    resolver: oxc_resolver::Resolver,
-    script_resolver: oxc_resolver::Resolver,
-    style_resolver: oxc_resolver::Resolver,
+    resolver: crate::read_trace::Resolver,
+    script_resolver: crate::read_trace::Resolver,
+    style_resolver: crate::read_trace::Resolver,
     extensions: Vec<String>,
     condition_names: Vec<String>,
     package_manifests: Vec<PackageManifestInfo>,
@@ -142,13 +148,14 @@ impl ResolverSession {
         let canonical_ws_roots: Vec<PathBuf> = input
             .workspaces
             .par_iter()
-            .map(|ws| dunce::canonicalize(&ws.root).unwrap_or_else(|_| ws.root.clone()))
+            .map(|ws| crate::read_trace::canonicalize(&ws.root).unwrap_or_else(|_| ws.root.clone()))
             .collect();
         let package_manifests = build_package_manifests(input, &canonical_ws_roots);
         let has_deno_import_maps = package_manifests
             .iter()
             .any(|manifest| !manifest.deno_import_map.is_empty());
-        let root_is_canonical = dunce::canonicalize(input.root).is_ok_and(|c| c == input.root);
+        let root_is_canonical =
+            crate::read_trace::canonicalize(input.root).is_ok_and(|c| c == input.root);
 
         let extensions = build_extensions(input.active_plugins);
         let condition_names = build_condition_names(input.active_plugins, input.extra_conditions);
@@ -198,6 +205,9 @@ pub fn resolve_all_imports_with_session(
     input: &ResolveAllImportsInput<'_>,
     session: &ResolverSession,
 ) -> ResolvedProject {
+    // `ResolverSession::new` reads only the root, the workspace roots and
+    // their manifests, which the graph cache key covers by name.
+    let missed_probes = crate::missed_probes::MissRecorder::start(input.root);
     let root_is_canonical = session.root_is_canonical;
     let workspace_roots = build_workspace_roots(input.workspaces, &session.canonical_ws_roots);
     let canonical_paths = build_canonical_file_paths(input.files, root_is_canonical);
@@ -223,14 +233,14 @@ pub fn resolve_all_imports_with_session(
     let tsconfig_warned: Mutex<FxHashSet<String>> = Mutex::new(FxHashSet::default());
     let tsconfig_cache = types::TsconfigCache::default();
     let canonicalize_cache = types::CanonicalizeCache::default();
-    let glob_matcher_cache = GlobMatcherCache::default();
+    let glob_matcher_cache = GlobMatcherCache::with_module_extensions(&session.extensions);
     // Dynamic import patterns match against canonical file paths when the
     // root is not canonical, so their root containment check needs the
     // canonical root too.
     let pattern_root = if canonical_paths.is_empty() {
         input.root.to_path_buf()
     } else {
-        dunce::canonicalize(input.root).unwrap_or_else(|_| input.root.to_path_buf())
+        crate::read_trace::canonicalize(input.root).unwrap_or_else(|_| input.root.to_path_buf())
     };
     let jsx_rules = compile_jsx_rules(input.jsx_import_sources);
 
@@ -246,6 +256,7 @@ pub fn resolve_all_imports_with_session(
         has_deno_import_maps: session.has_deno_import_maps,
         condition_names: &session.condition_names,
         path_aliases: input.path_aliases,
+        scoped_path_aliases: input.scoped_path_aliases,
         scss_include_paths: input.scss_include_paths,
         static_dir_mappings: input.static_dir_mappings,
         framework_static_dir_mappings: input.framework_static_dir_mappings,
@@ -287,6 +298,8 @@ pub fn resolve_all_imports_with_session(
 
     synthesize_platform_family_edges(&mut resolved, input.files, input.active_plugins);
 
+    synthesize_package_import_condition_edges(&mut resolved, &ctx);
+
     synthesize_auto_import_edges(
         &mut resolved,
         input.modules,
@@ -296,11 +309,14 @@ pub fn resolve_all_imports_with_session(
     );
 
     let replaced_module_targets = final_replaced_module_targets(vitest_mock_operations);
+    let probes = missed_probes.finish();
 
     ResolvedProject {
         modules: resolved,
         replaced_module_targets,
         work,
+        missed_probes: probes.missed,
+        package_manifests: probes.package_manifests,
     }
 }
 
@@ -322,7 +338,7 @@ fn build_canonical_file_paths(files: &[DiscoveredFile], root_is_canonical: bool)
 
     files
         .par_iter()
-        .map(|f| dunce::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone()))
+        .map(|f| crate::read_trace::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone()))
         .collect()
 }
 
@@ -337,7 +353,7 @@ fn build_package_manifests(
     canonical_ws_roots: &[PathBuf],
 ) -> Vec<PackageManifestInfo> {
     let root_canonical =
-        dunce::canonicalize(input.root).unwrap_or_else(|_| input.root.to_path_buf());
+        crate::read_trace::canonicalize(input.root).unwrap_or_else(|_| input.root.to_path_buf());
     let root_probe = fallow_config::probe_dir_manifest(input.root);
     let root_import_map = merge_deno_import_maps(&[], input.root, root_probe.deno_import_map);
     let mut package_manifests = Vec::new();

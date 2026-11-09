@@ -287,7 +287,7 @@ pub fn run_architecture(
         resolved.ensure_not_cancelled("config load and file discovery")?;
         let session = load_dead_code_session(&dead_code, &resolved)?;
         resolve_package_map_before_analysis(&resolved, &session)?;
-        run_dead_code_with_changed_files(
+        let mut output = run_dead_code_with_changed_files(
             &dead_code,
             &resolved,
             &session,
@@ -297,8 +297,16 @@ pub fn run_architecture(
                 envelope: CheckEnvelope::Architecture,
             },
             |_| {},
-        )
-        .map(Into::into)
+        )?;
+        output.output.workspace_diagnostics = fallow_types::workspace::merge_workspace_diagnostics(
+            std::mem::take(&mut output.output.workspace_diagnostics),
+            fallow_engine::requested_rule_off::requested_rule_off_diagnostics(
+                session.config(),
+                &options.requested_flags(),
+                true,
+            ),
+        );
+        Ok(output.into())
     })
 }
 
@@ -743,12 +751,27 @@ fn build_dead_code_programmatic_output(
     // dependency issue types. The CLI applies the same rule.
     let reports_dependencies =
         options.filters.reports_dependency_findings() && options.files.is_empty();
+    // The filters of an architecture run hold no request: no selector sets
+    // every filter. `run_architecture` adds the entries of its own selectors.
+    let requested_flags = match envelope {
+        CheckEnvelope::DeadCode => options.filters.requested_flags(),
+        CheckEnvelope::Architecture => Vec::new(),
+    };
     let workspace_diagnostics = fallow_types::workspace::merge_workspace_diagnostics(
         session.current_workspace_diagnostics(),
         fallow_engine::dead_code::config_pattern_diagnostics(
             session.config(),
             reports_dependencies,
-        ),
+        )
+        .into_iter()
+        .chain(
+            fallow_engine::requested_rule_off::requested_rule_off_diagnostics(
+                session.config(),
+                &requested_flags,
+                reports_dependencies,
+            ),
+        )
+        .collect(),
     );
     let mut output = build_check_output(CheckOutputInput {
         schema_version: envelope.schema_version(),
@@ -877,7 +900,7 @@ fn configure_project_for_dead_code(
     options: &DeadCodeOptions,
 ) -> ProjectConfig {
     if options.include_entry_exports {
-        project_config.config.include_entry_exports = true;
+        project_config.config.force_include_entry_exports();
     }
     if options.show_cascade {
         project_config.config.show_cascade = true;
@@ -991,6 +1014,7 @@ fn dead_code_filters_active(filters: &DeadCodeFilters) -> bool {
         || filters.deprecated_exports_in_use
         || filters.unused_enum_members
         || filters.unused_class_members
+        || filters.unused_namespace_members
         || filters.unused_store_members
         || filters.unprovided_injects
         || filters.unrendered_components
@@ -1007,7 +1031,9 @@ fn dead_code_filters_active(filters: &DeadCodeFilters) -> bool {
         || filters.unused_load_data_keys
         || filters.unresolved_imports
         || filters.unlisted_deps
+        || filters.unlisted_binaries
         || filters.duplicate_exports
+        || filters.duplicate_export_aliases
         || filters.circular_deps
         || filters.re_export_cycles
         || filters.package_cycles
@@ -1050,8 +1076,14 @@ fn apply_dead_code_core_filters(filters: &DeadCodeFilters, results: &mut Analysi
     if !filters.unused_store_members {
         results.unused_store_members.clear();
     }
+    if !filters.unused_namespace_members {
+        results.unused_namespace_members.clear();
+    }
     if !filters.unlisted_deps {
         results.unlisted_dependencies.clear();
+    }
+    if !filters.unlisted_binaries {
+        results.unlisted_binaries.clear();
     }
 }
 
@@ -1112,6 +1144,9 @@ fn apply_dead_code_component_filters(filters: &DeadCodeFilters, results: &mut An
 fn apply_dead_code_graph_filters(filters: &DeadCodeFilters, results: &mut AnalysisResults) {
     if !filters.duplicate_exports {
         results.duplicate_exports.clear();
+    }
+    if !filters.duplicate_export_aliases {
+        results.duplicate_export_aliases.clear();
     }
     if !filters.circular_deps {
         results.circular_dependencies.clear();

@@ -44,6 +44,8 @@ updates:
       default-days: 7
     open-pull-requests-limit: 10
 
+  # The root tools install with pnpm. The npm ecosystem also updates
+  # pnpm-lock.yaml, with the pnpm version in `engines.pnpm`.
   - package-ecosystem: npm
     directory: /
     schedule:
@@ -51,6 +53,12 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      # The root `typescript` devDependency and the `pnpm-workspace.yaml`
+      # override must equal the `typescript` version of
+      # `tools/type-aware-sidecar`. A root-only bump fails the lockstep test
+      # of the sidecar. Bump all three together by hand.
+      - dependency-name: typescript
 
   - package-ecosystem: npm
     directory: /editors/vscode

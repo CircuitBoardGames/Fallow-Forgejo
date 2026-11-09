@@ -4,35 +4,42 @@ Thanks for contributing to fallow. This guide covers setup, development, and pul
 
 ## Getting started
 
-Repository tooling requires Node.js 22.12.0 or later. Published Node packages
+Repository tooling requires Node.js 22.13.0 or later, because pnpm 11 needs it. Published Node packages
 require Node.js 22 or later.
 
 ```bash
 git clone https://github.com/fallow-rs/fallow.git
 cd fallow
-mise install                           # Optional: install pinned tools, including hk
-hk install --mise                      # Enable hooks (without mise: hk install)
-npm install                            # Install repo tooling such as commitlint
-pnpm --dir editors/vscode install      # Tooling that verify:fast needs
-cargo build --workspace
-npm run verify:fast                   # Canonical local feedback loop
+mise install         # Optional: pinned Node.js, pnpm, hk, pkl and cargo tools
+pnpm bootstrap       # Install the git hooks and all dependencies
+pnpm verify:fast     # Canonical local feedback loop
 ```
 
-[hk](https://hk.jdx.dev) runs the git hooks. `hk.pkl` defines them. With
-[mise](https://mise.jdx.dev) installed, `mise install` gets the pinned versions
-of hk, pkl, Node.js and the cargo tools that the hooks call (`typos`,
-`cargo-shear` and others). Without mise, install `hk` and `pkl` at the versions
-in `mise.toml`. See
+[mise](https://mise.jdx.dev) is optional. `mise install` gets the versions in
+`mise.toml`: Node.js, pnpm, [hk](https://hk.jdx.dev), pkl and the cargo tools
+that the hooks call (`typos`, `cargo-fallow` and others). Without mise, install
+pnpm, hk and pkl at the versions in `mise.toml`. Rustup installs Rust from
+`rust-toolchain.toml`, so `mise.toml` does not pin Rust. See
 [quality gates](docs/development/quality-gates.md#pinned-tools-with-mise-optional).
-The hooks skip a check with a hint when its tool is missing.
 
-`hk install --mise` starts the hooks through `mise x`, so they find hk and the
-pinned tools also when your shell does not activate mise. To skip the hooks
+`pnpm bootstrap` runs `scripts/bootstrap.mjs`. You can run it again at any
+time. It does these steps:
+
+1. It checks for Node.js 22.13.0 or later, pnpm and hk. For each missing tool,
+   it prints one install hint and stops.
+2. It removes `core.hooksPath` from the repository config when its value is
+   `.githooks`, the hooks folder of old clones. It keeps any other value, and
+   any value from your global config, and prints a warning. With git 2.54 or
+   later, git then runs the hooks in that folder in addition to the hk hooks.
+   With older git, the hk hooks do not run while the setting exists.
+3. It installs the hooks that `hk.pkl` defines. With mise on `PATH`, it runs
+   `hk install --mise`, so the hooks find the pinned tools also when your
+   shell does not activate mise. Without mise, it runs `hk install`.
+4. It runs `pnpm install --frozen-lockfile` at the root and in
+   `editors/vscode`.
+
+The hooks skip a check with a hint when its tool is missing. To skip the hooks
 for one command, use `HK=0 git commit` or `HK=0 git push`.
-
-If you set `core.hooksPath` to `.githooks` in an earlier clone, remove it
-before `hk install`: `git config --unset core.hooksPath`. While it is set, git
-runs the old folder and hk does not take over.
 
 On Windows, enable symlink checkout support before cloning. If you already
 cloned the repo, enable it and check out the repo again:
@@ -63,8 +70,7 @@ npm run verify:full                   # Fast checks plus script/npm/Rust tests, 
 cargo test -p fallow-core             # Focused single-crate test run
 ```
 
-Run `npm install` at the repository root and `pnpm install` under
-`editors/vscode` before either verification command. Full verification also
+Run `pnpm bootstrap` before either verification command. Full verification also
 requires `npm ci` under `crates/napi` and a local platform compiler. It is the
 most comprehensive local gate and is recommended before pushing substantial
 changes.
@@ -75,25 +81,19 @@ release and publish jobs, and network or real-project smoke tests remain
 CI-only. Run `npm run verify:full -- --help` to review the exact local scope and
 exclusions.
 
-### Workspace visibility audit
+### Rust structure checks
 
-[Hawk](https://github.com/astral-sh/hawk) audits Rust workspace visibility and
-dead public declarations across crate boundaries. The scheduled workflow uses
-Hawk 0.1.9 with Rust 1.97.1 and keeps the workspace `fallow-api` facade, its
-re-exported contract crates, and the cross-repo `fallow-license` surface out of
-scope.
-
-Install the matching Hawk release, then run:
+[cargo-fallow](https://github.com/fallow-rs/cargo-fallow) checks the Rust
+workspace: unused dependencies and files, visibility, crate boundaries,
+complexity and duplication. The required `Rust Structure` CI job and the
+pre-push hook run it. Install the version in `mise.toml`, then run:
 
 ```bash
-./scripts/check-hawk.sh dead-public  # Report dead public declarations
-./scripts/check-hawk.sh all          # Include visibility reduction suggestions
+cargo fallow check --baseline cargo-fallow-baseline.json --fail-on-issues
+cargo fallow fix --dry-run   # Show the safe edits
 ```
 
-Hawk is experimental, so its findings are review input rather than an automatic
-fix list. Before deleting a declaration or narrowing its visibility, confirm it
-is unused by every relevant feature profile and release target. The scheduled
-workflow stores its complete output as an artifact for review.
+See [Rust structure](docs/development/quality-gates.md#rust-structure).
 
 ### Fuzzing
 
@@ -186,6 +186,7 @@ The workspace follows the ownership boundaries in
 | `editors/nvim/` | Neovim integration documentation. |
 | `npm/fallow/` | npm wrapper, launchers, generated types, and bundled agent skill. |
 | `npm/<platform>/` | Platform-specific native binary packages consumed by the npm wrapper. |
+| `packaging/crates-io/fallow/` | Thin binary crate `fallow` outside the workspace, so that `cargo install fallow` installs the command of `fallow-cli`. The release publishes it after `fallow-cli` with the same version. |
 
 Dependency direction is deliberate. Foundation and analysis crates do not
 depend on protocol adapters. `fallow-core` remains an internal detector backend
@@ -368,7 +369,7 @@ git rebase --signoff origin/main
 git push --force-with-lease
 ```
 
-The `Commit messages` check fails a pull request that has a commit without a sign-off. Pull requests from bots are exempt. After `hk install`, the `commit-msg` hook runs the same check on each commit, so a missing sign-off stops the commit before the push.
+The `Commit messages` check fails a pull request that has a commit without a sign-off. Pull requests from bots are exempt. After `pnpm bootstrap`, the `commit-msg` hook runs the same check on each commit, so a missing sign-off stops the commit before the push.
 
 ## Code style
 
@@ -389,7 +390,28 @@ The `Commit messages` check fails a pull request that has a commit without a sig
    release collects the fragments into it.
 6. Open a pull request against `main`
 
-When the description leaves work for later ("Not in this change", "a separate change", "out of scope"), link an issue that describes each deferred task. For an intentional non-goal, write "No follow-up planned." instead. CI verifies that references to this repository identify existing issues; pull request references do not qualify. CI accepts a reference to another repository on its syntax. Reviewers check that each linked issue covers the deferred work.
+Sort each item that the change leaves open into one of three groups:
+
+- **Needed work:** a defect that the change finds or leaves, or a part of the task that is not done. Open an issue for each item and link it under a heading such as "Not in this change". The same rule applies to an inline phrase such as "a separate change" or "out of scope". CI verifies that each reference to this repository identifies an existing issue. A pull request reference does not qualify. CI accepts a reference to another repository on its syntax.
+- **Possible follow-ups:** an improvement idea with no known need, for example a small gain for a large refactor. Put it under a "Possible follow-ups" heading, with the reason in a few words. It needs no issue. The maintainer lists these ideas with `node scripts/list-possible-follow-ups.mjs` and opens an issue for each idea that is worth the work.
+- **Known limits:** intended behavior, or a limit that only a change of the design can remove. Put it under a "Known limits" heading. It needs no issue, but CI still checks its text for the deferral phrases above, so describe the limit without them.
+
+Reviewers check that each linked issue covers the deferred work, and that no needed work is under "Possible follow-ups" or "Known limits".
+
+## Contributions made with coding agents
+
+You can use any tool to write a change, including a coding agent. Reviewers judge the change, not the tool. You do not have to say which tool you used.
+
+These rules apply to every pull request:
+
+- You know what the change does and why. You know its impact on users and on other parts of fallow, and the trade-offs that you made. You can explain them in review without the tool. You do not have to know each line.
+- You are responsible for the change. Your `Signed-off-by` line is your own statement under the [DCO](#developer-certificate-of-origin). Add it only when you can stand behind the change.
+- Run the checks in [Submitting changes](#submitting-changes) yourself. Write in the pull request what you did not verify, for example a platform that you did not test.
+- Keep the description short. Remove generated filler before you post it.
+
+A maintainer can close a pull request when the author cannot explain it. A maintainer can also finish a useful pull request in its branch and merge it.
+
+Issues that an agent helped to write are welcome. Read the issue before you post it, and keep the exact command and output. When an agent used fallow and misread the output, the flags or the docs, tell us in the issue form. These reports show where the CLI, JSON or MCP contract is unclear. Maintainers mark them with the `type:agent-ux` label.
 
 ## Reporting issues
 

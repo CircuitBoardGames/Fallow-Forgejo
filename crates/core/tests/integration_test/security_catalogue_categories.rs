@@ -163,18 +163,18 @@ fn code_injection_literal_does_not_fire() {
     );
 }
 
-// ── dynamic-regex (CWE-1333), ungated non-literal pattern construction ──────
+// ── dynamic-regex (CWE-1333), source-backed pattern construction ────────────
 
 #[test]
-fn dynamic_regex_call_non_literal_fires() {
+fn dynamic_regex_source_free_patterns_do_not_fire() {
+    // A library builds regexes from its own options; without request input in
+    // the pattern argument, `RegExp(x)` and `new RegExp(x)` are not candidates.
     let results = analyze_with_security_sink("security-dynamic-regex");
-    assert_candidate(&results, "src/call.ts", "dynamic-regex", 1333);
-}
-
-#[test]
-fn dynamic_regex_new_expression_non_literal_fires() {
-    let results = analyze_with_security_sink("security-dynamic-regex");
-    assert_candidate(&results, "src/constructor.ts", "dynamic-regex", 1333);
+    assert!(!anchored_on(&results, "src/call.ts"), "RegExp(pattern)");
+    assert!(
+        !anchored_on(&results, "src/constructor.ts"),
+        "new RegExp(pattern)"
+    );
 }
 
 #[test]
@@ -283,25 +283,41 @@ fn dynamic_regex_object_binding_source_backed_candidate_is_marked() {
 }
 
 #[test]
-fn dynamic_regex_shadowed_helper_name_keeps_candidate_unbacked() {
+fn dynamic_regex_env_secret_alone_does_not_fire() {
     let results = analyze_with_security_sink("security-dynamic-regex");
-    let finding = finding_on(&results, "src/source-helper-shadowed.ts");
-
-    assert_eq!(finding.category.as_deref(), Some("dynamic-regex"));
     assert!(
-        !finding.source_backed,
+        !anchored_on(&results, "src/env-only.ts"),
+        "an environment value is not attacker input"
+    );
+}
+
+#[test]
+fn dynamic_regex_request_input_next_to_env_secret_is_source_backed() {
+    let results = analyze_with_security_sink("security-dynamic-regex");
+    let finding = finding_on(&results, "src/env-and-request.ts");
+
+    assert!(finding.source_backed);
+    assert_eq!(
+        finding.candidate.source_kind.as_deref(),
+        Some("http-request-input"),
+        "the secret must not hide the request input in the same argument"
+    );
+}
+
+#[test]
+fn dynamic_regex_shadowed_helper_name_does_not_fire() {
+    let results = analyze_with_security_sink("security-dynamic-regex");
+    assert!(
+        !anchored_on(&results, "src/source-helper-shadowed.ts"),
         "a local parameter must shadow the same-named module helper"
     );
 }
 
 #[test]
-fn dynamic_regex_second_hop_helper_keeps_candidate_unbacked() {
+fn dynamic_regex_second_hop_helper_does_not_fire() {
     let results = analyze_with_security_sink("security-dynamic-regex");
-    let finding = finding_on(&results, "src/source-helper-multihop.ts");
-
-    assert_eq!(finding.category.as_deref(), Some("dynamic-regex"));
     assert!(
-        !finding.source_backed,
+        !anchored_on(&results, "src/source-helper-multihop.ts"),
         "helper chains beyond one call are out of scope"
     );
 }
@@ -688,6 +704,54 @@ fn path_traversal_dynamic_later_segment_fires() {
 }
 
 #[test]
+fn path_traversal_join_without_request_input_does_not_fire() {
+    let results = analyze_with_security_sink("security-path-traversal");
+    assert!(
+        !anchored_on(&results, "src/build-output.ts"),
+        "build code that only reads options and the environment must not be flagged"
+    );
+}
+
+#[test]
+fn path_traversal_join_in_a_helper_of_a_request_handler_fires() {
+    // A handler passes `req.url` to a helper in another file. The helper does
+    // not read request input itself, but its direct importer does.
+    let results = analyze_with_security_sink("security-path-traversal");
+    assert_candidate(&results, "src/imported-by-handler.ts", "path-traversal", 22);
+}
+
+#[test]
+fn path_traversal_join_two_imports_from_a_request_handler_does_not_fire() {
+    // Only a direct importer arms the gate. A dev server that imports a build
+    // pipeline must not arm every path join in that pipeline.
+    let results = analyze_with_security_sink("security-path-traversal");
+    assert!(
+        !anchored_on(&results, "src/pipeline-output.ts"),
+        "build code two imports away from request input must not be flagged"
+    );
+}
+
+#[test]
+fn path_traversal_join_also_imported_by_build_code_does_not_fire() {
+    // A module that build code also imports is not armed by the request
+    // handler that imports it: a dev server imports its config this way.
+    let results = analyze_with_security_sink("security-path-traversal");
+    assert!(
+        !anchored_on(&results, "src/shared-join.ts"),
+        "a module with an importer that reads no request input must not be flagged"
+    );
+}
+
+#[test]
+fn path_traversal_join_reached_only_from_a_test_file_does_not_fire() {
+    let results = analyze_with_security_sink("security-path-traversal");
+    assert!(
+        !anchored_on(&results, "src/test-helper.ts"),
+        "a request read in a test file must not make the helper reachable"
+    );
+}
+
+#[test]
 fn path_traversal_reports_one_candidate_per_call() {
     let results = analyze_with_security_sink("security-path-traversal");
     assert_eq!(
@@ -854,17 +918,30 @@ fn prototype_pollution_static_proto_assign_fires() {
 
 #[test]
 fn prototype_pollution_safe_forms_do_not_fire() {
-    // Two negatives in src/safe.ts must both stay silent: an inline object-literal
-    // merge source (the `object` arg shape, excluded), and a TypeScript-cast
-    // `(obj as {...}).__proto__ = x` assign, which is a documented flattening blind
-    // spot (the cast object is not a bare identifier, so the callee path does not
-    // resolve to `*.__proto__`). The second is a conservative false-negative, not a
-    // safe pattern; this assertion flips if a future flattening change starts
-    // matching the cast form.
+    // An inline object-literal merge source (the `object` arg shape) is
+    // excluded, so src/safe.ts stays silent.
     let results = analyze_with_security_sink("security-prototype-pollution");
     assert!(
         !anchored_on(&results, "src/safe.ts"),
-        "neither an inline-object merge nor a cast-form __proto__ assign may be flagged"
+        "an inline-object merge may not be flagged"
+    );
+}
+
+#[test]
+fn prototype_pollution_cast_proto_assign_fires() {
+    // `(obj as {...}).__proto__ = x` flattens through the TypeScript cast to
+    // `obj.__proto__`, so it matches the `*.__proto__` row.
+    let results = analyze_with_security_sink("security-prototype-pollution");
+    assert!(
+        results.security_findings.iter().any(|f| {
+            f.path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with("src/cast.ts")
+                && f.category.as_deref() == Some("prototype-pollution")
+                && f.line == 4
+        }),
+        "a cast-form `__proto__` assign must produce a prototype-pollution candidate at line 4"
     );
 }
 
@@ -967,6 +1044,7 @@ fn issue_882_catalogue_sinks_fire() {
         if !line.trim_start().starts_with("res.") {
             continue;
         }
+        let expected = usize::from(line.contains("// candidate"));
         let candidates = results
             .security_findings
             .iter()
@@ -981,10 +1059,46 @@ fn issue_882_catalogue_sinks_fire() {
             })
             .count();
         assert_eq!(
-            candidates, 1,
-            "each dynamic header call must retain exactly one candidate: {line}"
+            candidates, expected,
+            "each request-sourced header call must retain exactly one candidate, \
+             and a source-free call none: {line}"
         );
     }
+}
+
+/// A raw SQL method on a query-builder call chain (`db("t").whereRaw(x)`),
+/// on a call result (`getPrisma().$queryRawUnsafe(x)`) or on a `this` field
+/// (`this.prisma.$queryRawUnsafe(x)`) gives a candidate. A literal argument
+/// and a non-raw method on the same chain give none.
+#[test]
+fn issue_4225_raw_sql_on_call_chain_receiver_fires() {
+    const FILE: &str = "src/raw-sql-call-chain.ts";
+    let results = analyze_with_security_sink("security-catalogue-sinks-882");
+    let source = std::fs::read_to_string(fixture_path("security-catalogue-sinks-882").join(FILE))
+        .expect("raw SQL fixture should be readable");
+    for (index, line) in source.lines().enumerate() {
+        let expected = if line.ends_with("// candidate") {
+            1
+        } else if line.ends_with("// none") {
+            0
+        } else {
+            continue;
+        };
+        let candidates = results
+            .security_findings
+            .iter()
+            .filter(|finding| {
+                finding
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with(FILE)
+                    && finding.line == u32::try_from(index + 1).expect("fixture line fits u32")
+            })
+            .count();
+        assert_eq!(candidates, expected, "unexpected candidate count: {line}");
+    }
+    assert_eq!(anchored_count(&results, FILE), 6);
 }
 
 #[test]
@@ -1283,4 +1397,111 @@ fn llm_call_injection_langchain_invoke_does_not_fire() {
         !anchored_on(&results, "src/langchain.ts"),
         "the excluded LangChain .invoke callee must not be flagged"
     );
+}
+
+// ── catalogue gaps: callee variants of existing categories ───────────────────
+
+const CATALOGUE_GAP_SINKS: [(&str, &str, u32); 28] = [
+    ("src/esm-default-exec.ts", "command-injection", 78),
+    ("src/esm-namespace-exec.ts", "command-injection", 78),
+    ("src/esm-default-vm.ts", "code-injection", 94),
+    ("src/fs-promises-member.ts", "path-traversal", 22),
+    ("src/cjs-fs-rename-destination.ts", "path-traversal", 22),
+    ("src/cjs-fs-promises-temp.ts", "insecure-temp-file", 377),
+    (
+        "src/cjs-fs-promises-chmod.ts",
+        "world-writable-permission",
+        732,
+    ),
+    ("src/cjs-destructured-exec.ts", "command-injection", 78),
+    ("src/cjs-module-exec.ts", "command-injection", 78),
+    ("src/cjs-destructured-fs.ts", "path-traversal", 22),
+    ("src/fs-aliased-import.ts", "path-traversal", 22),
+    (
+        "src/cjs-destructured-chmod.ts",
+        "world-writable-permission",
+        732,
+    ),
+    ("src/exec-file.ts", "command-injection", 78),
+    ("src/shelljs.ts", "command-injection", 78),
+    ("src/ssti-handlebars.ts", "ssti", 1336),
+    ("src/ssti-lodash.ts", "ssti", 1336),
+    ("src/ssti-pug-render.ts", "ssti", 1336),
+    ("src/ssrf-axios-put.ts", "ssrf", 918),
+    ("src/ssrf-axios-call.ts", "ssrf", 918),
+    ("src/ssrf-got-get.ts", "ssrf", 918),
+    ("src/ssrf-https-get.ts", "ssrf", 918),
+    ("src/yaml-load-all.ts", "unsafe-deserialization", 502),
+    ("src/xxe-libxmljs.ts", "xxe", 611),
+    ("src/jquery-parse-html.ts", "jquery-html", 79),
+    ("src/send-download.ts", "route-send-file", 22),
+    ("src/fs-named-import.ts", "path-traversal", 22),
+    ("src/fs-promises-named.ts", "path-traversal", 22),
+    ("src/fs-write-sync.ts", "path-traversal", 22),
+];
+
+#[test]
+fn catalogue_gap_sinks_fire_once() {
+    let results = analyze_with_security_sink("security-sink-catalogue-gaps");
+    for (suffix, category, cwe) in CATALOGUE_GAP_SINKS {
+        assert_candidate(&results, suffix, category, cwe);
+        assert_eq!(
+            anchored_count(&results, suffix),
+            1,
+            "{suffix} should produce exactly one candidate"
+        );
+    }
+}
+
+#[test]
+fn catalogue_gap_lookalikes_do_not_fire() {
+    let results = analyze_with_security_sink("security-sink-catalogue-gaps");
+    for (suffix, reason) in [
+        (
+            "src/fs-local-helper.ts",
+            "a local readFile helper is not the node:fs binding",
+        ),
+        (
+            "src/axios-config-object.ts",
+            "an axios() config object is not a URL argument",
+        ),
+        (
+            "src/http-client-local.ts",
+            "http.get without the node:http import is not a Node request",
+        ),
+        (
+            "src/shell-local.ts",
+            "shell.exec without the shelljs import is not a shell call",
+        ),
+        (
+            "src/fs-literal.ts",
+            "a literal file path is not a candidate",
+        ),
+        (
+            "src/axios-config-variable.ts",
+            "an axios() config variable is not a URL argument",
+        ),
+        (
+            "src/download-client.ts",
+            "a storage client download is not a route file send",
+        ),
+        (
+            "src/exec-file-tooling.ts",
+            "execFile of a computed binary without untrusted input is not a candidate",
+        ),
+        (
+            "src/exec-local-shadow.ts",
+            "a parameter that hides the exec import is not a shell call",
+        ),
+        (
+            "src/exec-namespace-shadow.ts",
+            "a parameter that hides the namespace import is not a shell call",
+        ),
+        (
+            "src/fs-build-path.ts",
+            "a computed path without untrusted input is not a candidate",
+        ),
+    ] {
+        assert!(!anchored_on(&results, suffix), "{suffix}: {reason}");
+    }
 }

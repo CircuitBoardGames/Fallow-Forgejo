@@ -189,6 +189,31 @@ fn cache_roundtrip_preserves_computed_enum_key_facts() {
 }
 
 #[test]
+fn cache_roundtrip_preserves_member_name_probe_facts() {
+    let module = parse_from_content(
+        FileId(0),
+        Path::new("src/probe.ts"),
+        "export const probe = (x: object) => 'detail' in x || Reflect.has(x, 'hint');",
+    );
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    let encoded = bitcode::encode(&cached);
+    let decoded: CachedModule = bitcode::decode(&encoded).expect("decode cached module");
+    let restored = cached_to_module(&decoded, FileId(0));
+
+    let names: Vec<&str> = restored
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| match fact {
+            fallow_types::extract::SemanticFact::MemberNameProbe(probe) => {
+                Some(probe.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["detail", "hint"]);
+}
+
+#[test]
 fn cache_roundtrip_preserves_unresolved_callee_diagnostics() {
     let mut module = parse_from_content(
         FileId(7),
@@ -625,6 +650,7 @@ fn module_to_cached_roundtrip_dynamic_imports() {
             source: "fs".to_string(),
             span: Span::new(15, 25),
             destructured_names: Vec::new(),
+            destructured_locals: Vec::new(),
             local_name: None,
             source_span: oxc_span::Span::default(),
             is_type_only: false,
@@ -713,6 +739,7 @@ fn module_to_cached_roundtrip_dynamic_imports() {
             instance_bindings: Vec::new(),
             super_class_type_args: vec!["TClient".to_string()],
             generic_instance_bindings: Vec::new(),
+            binding_super_class: None,
         }],
         ..ModuleInfo::empty(FileId(0))
     };
@@ -1375,6 +1402,7 @@ fn module_to_cached_roundtrip_require_with_destructured() {
             source: "fs".to_string(),
             span: Span::new(0, 30),
             destructured_names: vec!["readFile".to_string(), "writeFile".to_string()],
+            destructured_locals: Vec::new(),
             local_name: None,
             source_span: oxc_span::Span::default(),
             is_type_only: false,

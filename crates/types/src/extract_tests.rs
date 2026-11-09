@@ -386,6 +386,7 @@ fn release_resolution_payload_drops_copied_vectors_only() {
             span: span(),
             source_span: span(),
             destructured_names: Vec::new(),
+            destructured_locals: Vec::new(),
             local_name: Some("required".to_string()),
             is_type_only: false,
         }],
@@ -447,6 +448,7 @@ fn release_resolution_payload_drops_copied_vectors_only() {
             instance_bindings: Vec::new(),
             super_class_type_args: Vec::new(),
             generic_instance_bindings: Vec::new(),
+            binding_super_class: None,
         }],
         exported_factory_returns: std::sync::Arc::from([FactoryReturnExport {
             export_name: "useApi".to_string(),
@@ -495,6 +497,7 @@ fn release_resolution_payload_drops_copied_vectors_only() {
         sanitized_sink_args: Vec::new(),
         security_control_sites: Vec::new(),
         callee_uses: Vec::new(),
+        command_invocations: Vec::new(),
         imported_call_sites: Arc::default(),
         import_binding_references: Arc::default(),
         misplaced_directives: Vec::new(),

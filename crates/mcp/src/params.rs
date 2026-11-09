@@ -5,10 +5,10 @@
 use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Privacy mode for author emails emitted by `--ownership`.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EmailModeParam {
     Raw,
@@ -30,7 +30,7 @@ impl EmailModeParam {
 
 /// How a health baseline matches findings, mirroring the CLI's
 /// `--baseline-mode` flag.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BaselineModeParam {
     Count,
@@ -46,7 +46,7 @@ impl BaselineModeParam {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TypeAwareRequireParam {
     BestEffort,
@@ -62,7 +62,7 @@ impl TypeAwareRequireParam {
     }
 }
 
-#[derive(Default, Deserialize, JsonSchema)]
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
 pub struct AnalyzeParams {
     /// Project root; defaults to the working directory.
     pub root: Option<String>,
@@ -275,7 +275,7 @@ pub struct CombinedParams {
     pub coverage_root: Option<String>,
 }
 
-#[derive(Default, Deserialize, JsonSchema)]
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
 pub struct ArchitectureParams {
     /// Project root; defaults to the working directory.
     pub root: Option<String>,
@@ -532,73 +532,7 @@ pub struct InspectSimilarCodeParams {
     pub max_output_bytes: Option<usize>,
 }
 
-/// Parameters for the static mutation plan. The plan runs no project code.
-#[derive(Default, Deserialize, JsonSchema)]
-pub struct MutationPlanParams {
-    /// Project root; defaults to the working directory.
-    pub root: Option<String>,
-
-    /// Path to a fallow config file.
-    pub config: Option<String>,
-
-    /// Allow trusted HTTPS config `extends` for this request. Defaults to false
-    /// and never grants process-global trust.
-    pub allow_remote_extends: Option<bool>,
-
-    /// Base ref for the default changed-code scope. Omitted: the base is
-    /// detected as for `audit`.
-    pub changed_since: Option<String>,
-
-    /// Plan every source file instead of the changed code.
-    pub all: Option<bool>,
-
-    /// Plan only these files or directories, relative to the root.
-    pub paths: Option<Vec<String>>,
-
-    /// Maximum number of mutants to plan; the rest are `pending`. A run fills
-    /// the limit with covered mutants, so it can also run a `pending` one.
-    pub max_mutants: Option<usize>,
-
-    /// Kebab-case operator names, for example `relational-operator`.
-    /// Omitted: the `mutation.operators` config key, else every operator.
-    pub operators: Option<Vec<String>>,
-
-    /// Disable the incremental parse cache.
-    pub no_cache: Option<bool>,
-
-    /// Parser thread count; defaults to CPU cores.
-    pub threads: Option<usize>,
-}
-
-/// Parameters for one mutant of a saved mutation report.
-#[derive(Deserialize, JsonSchema)]
-pub struct MutationInspectParams {
-    /// The `mutant_id` from a mutation plan or report.
-    #[schemars(length(min = 1))]
-    pub mutant_id: String,
-
-    /// Path to a saved `fallow mutation` report or `mutation_plan` output.
-    /// A relative path resolves against `root`. Without `root`, it resolves
-    /// against the working directory of the MCP server. Omitted: the report
-    /// that the last `fallow mutation` run saved in the Fallow cache of the
-    /// project.
-    #[schemars(length(min = 1))]
-    pub report: Option<String>,
-
-    /// Project root; defaults to the working directory.
-    pub root: Option<String>,
-
-    /// Path to a fallow config file. Used only without `report`, to find the
-    /// cache directory that holds the report of the last run.
-    pub config: Option<String>,
-
-    /// Allow trusted HTTPS config `extends` for this request. Used only
-    /// without `report`, as for `config`. Defaults to false and never grants
-    /// process-global trust.
-    pub allow_remote_extends: Option<bool>,
-}
-
-#[derive(Default, Deserialize, JsonSchema)]
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
 pub struct FindDupesParams {
     /// Project root; defaults to the working directory.
     pub root: Option<String>,
@@ -1371,6 +1305,10 @@ pub struct TraceCloneParams {
 #[path = "params_health.rs"]
 mod health_params;
 pub use health_params::*;
+
+#[path = "params_mutation.rs"]
+mod mutation_params;
+pub use mutation_params::*;
 
 /// Parameters for `check_runtime_coverage`, the focused runtime-coverage
 /// entry point. A thin wrapper around `fallow health --runtime-coverage

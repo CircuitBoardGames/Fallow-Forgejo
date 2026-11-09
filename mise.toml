@@ -7,13 +7,19 @@
 # Keep each version in lockstep with CI. Where CI pins a version, this file
 # uses the same version. `scripts/workflow-policy.test.mjs` fails when the CI
 # node version or a `tool: name@version` pin changes and this file does not
-# follow. The typos and cargo-deny actions fix their tool version in the action
-# commit. The test does not check those two, so that a Dependabot action bump
-# does not fail. Update them here by hand when you see the action bump.
+# follow. The typos, cargo-deny and cargo-fallow actions fix their tool version
+# in the action commit. The test does not check those three, so that a
+# Dependabot action bump does not fail. Update them here by hand when you see
+# the action bump.
 
 [tools]
 # Same major version as each `actions/setup-node` step in `ci.yml`.
-node = "22"
+node = "26"
+
+# The lower bound of `engines.pnpm` in the root `package.json`, the same as the
+# `packageManager` of `editors/vscode`, and the `pnpm/action-setup` steps in
+# `ci.yml`, `commitlint.yml` and `contributors.yml`.
+pnpm = "11.25.0"
 
 # Same version as the typos action that the CI `typos` job pins:
 # crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53
@@ -23,8 +29,11 @@ node = "22"
 # EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 
+# Same version as the cargo-fallow action that the CI "Rust Structure" job pins:
+# fallow-rs/cargo-fallow@fdcf25ad021dd919c52c5c7ee5d285431e2865b3
+"github:fallow-rs/cargo-fallow" = "0.3.0"
+
 # CI installs these tools without a version, so this file pins a release.
-"github:Boshen/cargo-shear" = "1.14.0"
 # The aqua registry gives the x86_64 binary on Apple Silicon, and macOS
 # without Rosetta cannot run it ("Bad CPU type"). The github backend selects
 # the aarch64 release asset.
@@ -35,7 +44,7 @@ node = "22"
 # Same version as the `insta` crate in `Cargo.lock`.
 "aqua:mitsuhiko/insta" = "1.48.0"
 
-# Git hook runner. `hk.pkl` defines the hooks. Run `hk install` once per clone.
+# Git hook runner. `hk.pkl` defines the hooks. `pnpm bootstrap` installs the hooks.
 hk = "2.4.0"
 # hk evaluates `hk.pkl` with the pkl CLI.
 pkl = "0.32.1"

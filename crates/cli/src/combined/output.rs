@@ -1,3 +1,4 @@
+use crate::exit_codes::INVALID_INPUT;
 use crate::report::sink::outln;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -15,7 +16,7 @@ use fallow_output::{
 
 use crate::check::CheckResult;
 use crate::dupes::DupesResult;
-use crate::error::emit_error;
+use crate::error::emit_input_error;
 use crate::health::HealthResult;
 use crate::regression;
 use crate::report;
@@ -338,7 +339,7 @@ fn combined_status_note(
     .map_err(|error| {
         crate::emit_known_failure(
             &error,
-            2,
+            INVALID_INPUT,
             output,
             crate::telemetry::FailureReason::Validation,
         )
@@ -653,6 +654,7 @@ fn print_combined_review(
             message: status_note.as_deref(),
             config_patterns: check_result
                 .map_or(&[], |check| check.workspace_diagnostics.as_slice()),
+            audit_gate: None,
         },
     );
     combined_machine_success(code)
@@ -950,7 +952,7 @@ fn enforce_human_section_rules(gates: &mut fallow_output::GateOutcomes) {
         GateName::HealthCoverageGaps,
         GateName::DuplicationThreshold,
     ] {
-        if let Some(outcome) = gates.get(name).cloned() {
+        if let Some(outcome) = gates.get(&name).cloned() {
             gates.insert(
                 name,
                 fallow_output::GateOutcome {
@@ -1321,9 +1323,8 @@ fn emit_combined_json_output(
             outln!("{json}");
             ExitCode::SUCCESS
         }
-        Err(e) => emit_error(
+        Err(e) => emit_input_error(
             &format!("JSON serialization error: {e}"),
-            2,
             OutputFormat::Json,
         ),
     }
@@ -1502,9 +1503,8 @@ fn check_json_extras_for_combined(result: &CheckResult) -> fallow_api::CheckJson
 }
 
 fn json_output_error(error: &serde_json::Error) -> ExitCode {
-    emit_error(
+    emit_input_error(
         &format!("JSON serialization error: {error}"),
-        2,
         OutputFormat::Json,
     )
 }
@@ -1566,9 +1566,8 @@ fn print_combined_sarif(
             outln!("{json}");
             ExitCode::SUCCESS
         }
-        Err(e) => emit_error(
+        Err(e) => emit_input_error(
             &format!("SARIF serialization error: {e}"),
-            2,
             OutputFormat::Sarif,
         ),
     }
@@ -1586,9 +1585,8 @@ fn print_combined_codeclimate(
             outln!("{json}");
             ExitCode::SUCCESS
         }
-        Err(e) => emit_error(
+        Err(e) => emit_input_error(
             &format!("CodeClimate serialization error: {e}"),
-            2,
             OutputFormat::CodeClimate,
         ),
     }
@@ -1656,6 +1654,7 @@ mod tests {
         combined_machine_success, emit_combined_json_output, exit_code_to_u8,
         print_combined_codeclimate, print_combined_sarif,
     };
+    use crate::exit_codes::{exit_gate_failed, exit_invalid_input};
     use fallow_output::{PrDecisionConclusion, PrDecisionGate};
 
     #[test]
@@ -1665,7 +1664,7 @@ mod tests {
 
     #[test]
     fn combined_machine_success_preserves_output_error() {
-        let code = ExitCode::from(2);
+        let code = exit_invalid_input();
 
         assert_eq!(combined_machine_success(code), Err(code));
     }
@@ -1673,8 +1672,8 @@ mod tests {
     #[test]
     fn exit_code_to_u8_collapses_non_success_codes() {
         assert_eq!(exit_code_to_u8(ExitCode::SUCCESS), 0);
-        assert_eq!(exit_code_to_u8(ExitCode::from(1)), 1);
-        assert_eq!(exit_code_to_u8(ExitCode::from(2)), 1);
+        assert_eq!(exit_code_to_u8(exit_gate_failed()), 1);
+        assert_eq!(exit_code_to_u8(exit_invalid_input()), 1);
     }
 
     #[test]
@@ -1803,7 +1802,7 @@ mod tests {
                 exit_reason: false,
             },
         );
-        assert_eq!(section_code, ExitCode::from(1));
+        assert_eq!(section_code, exit_gate_failed());
 
         assert!(super::combined_type_aware_gate_failed(None, Some(&health)));
         let gates = super::combined_gate_outcomes(
@@ -1817,7 +1816,7 @@ mod tests {
         );
         let entry = gates
             .as_ref()
-            .and_then(|gates| gates.get(fallow_output::GateName::TypeAwareRequire))
+            .and_then(|gates| gates.get(&fallow_output::GateName::TypeAwareRequire))
             .expect("the run publishes the type-aware gate entry");
         assert_eq!(entry.status, fallow_output::GateStatus::Fail);
         let line =

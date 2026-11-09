@@ -39,6 +39,11 @@ pub const TOOL_GUIDE_NOTE: &str = "This guide explains parameters and output for
 
 const CHECK_HEALTH_SECTIONS: &[ToolGuideSection] = &[
     ToolGuideSection {
+        topic: "group_by",
+        summary: "What each group recomputes.",
+        detail: r#"Each group gets its own `vital_signs`, `health_score`, `findings`, `file_scores`, `hotspots`, `large_functions`, and `targets`, recomputed against the files of the group. The top-level metrics stay project-wide. Use it to answer per-team or per-package quality questions, such as "which workspace has the worst maintainability?", without one fallow run per package."#,
+    },
+    ToolGuideSection {
         topic: "css",
         summary: "What `css_analytics` contains and why it is opt-in.",
         detail: r"Set css=true to add a `css_analytics` section. It reports specificity hotspots, `!important` density, over-complex selectors, deep nesting, and design-token sprawl through distinct color, font-size, and z-index counts. It also reports unreferenced custom-property and `@keyframes` cleanup candidates.
@@ -169,6 +174,11 @@ A short window can make rarely exercised code appear never called. Do not treat 
         topic: "runtime_coverage.warnings",
         summary: "The codes that explain a thin or surprising answer.",
         detail: r"`no_runtime_data` means the cloud holds no observations for the selection at all, which is a configuration answer (wrong repository, wrong environment, no beacon reporting) and not evidence that the code is cold. `cloud_functions_unmatched` counts functions the cloud reported that the checkout no longer has, and is the signal that the two sides are on different revisions. Codes prefixed `cloud_warning_` are passed through from the cloud unchanged. Read these before acting on an empty or near-empty `findings` array.",
+    },
+    ToolGuideSection {
+        topic: "cloud_context",
+        summary: "The production signals that the cloud sends next to each row.",
+        detail: r"Each finding and hot path carries `cloud_context`: the fields of its cloud row that the CLI does not read itself, as the cloud sent them. Examples are `errors`, `performance.cpu`, `performance.browser`, `branches`, `covered_by_test` and `test_hit_count`. A cloud blast-radius row carries `production_callers`, `caller_sites` and the caller counts the same way. `runtime_coverage.cloud_context` holds the top-level fields, such as `capabilities` and `page`. A `null` count or an `untracked` state means not measured, never zero. These signals are context only: they never change a verdict, a confidence or an action. A called function below the hot-path threshold has no row, so its signals are not in the output. Set `min_invocations_hot` to 1 to get a hot path, with its signals, for each called function.",
     },
 ];
 

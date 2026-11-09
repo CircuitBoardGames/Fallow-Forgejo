@@ -64,6 +64,7 @@ fn with_empty_ctx<F: FnOnce(&ResolveContext)>(f: F) {
         has_deno_import_maps: false,
         condition_names: &condition_names,
         path_aliases: &[],
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -150,6 +151,7 @@ fn make_require(
         source: source.to_string(),
         span: dummy_span(),
         destructured_names: destructured.into_iter().map(String::from).collect(),
+        destructured_locals: Vec::new(),
         local_name: local_name.map(String::from),
         source_span: oxc_span::Span::default(),
         is_type_only: false,
@@ -243,6 +245,7 @@ fn vitest_mock_operations_resolve_canonical_targets_and_abstain_on_missing() {
         has_deno_import_maps: false,
         condition_names: &condition_names,
         path_aliases: &[],
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -346,6 +349,7 @@ fn cross_tsconfig_bare_alias_upgrades_replacement_target() {
         has_deno_import_maps: false,
         condition_names: &condition_names,
         path_aliases: &[],
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -1652,6 +1656,7 @@ fn require_destructured_empty_names_uses_namespace() {
             source: "path".into(),
             span: dummy_span(),
             destructured_names: vec![],
+            destructured_locals: Vec::new(),
             local_name: None,
             source_span: oxc_span::Span::default(),
             is_type_only: false,
@@ -1975,6 +1980,7 @@ fn pnpm_package_source_alias_preserves_declared_import_name() {
         has_deno_import_maps: false,
         condition_names: &condition_names,
         path_aliases: &[],
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -2040,6 +2046,7 @@ fn pnpm_jsr_package_source_alias_preserves_declared_import_name() {
         has_deno_import_maps: false,
         condition_names: &condition_names,
         path_aliases: &[],
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -2178,6 +2185,7 @@ fn specifier_plugin_alias_match_returns_unresolvable() {
         has_deno_import_maps: false,
         condition_names: &condition_names,
         path_aliases: &aliases,
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -2711,6 +2719,7 @@ fn bare_at_alias_does_not_swallow_scoped_npm_packages() {
         has_deno_import_maps: false,
         condition_names: &condition_names,
         path_aliases: &aliases,
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -2811,6 +2820,7 @@ fn deno_import_maps_follow_nearest_package_scope_and_declaring_base() {
         workspaces: &workspaces,
         active_plugins: &[],
         path_aliases: &[],
+        scoped_path_aliases: &[],
         auto_imports: &[],
         jsx_import_sources: &[],
         scss_include_paths: &[],
@@ -2864,6 +2874,7 @@ fn deno_import_maps_follow_nearest_package_scope_and_declaring_base() {
             .any(|manifest| !manifest.deno_import_map.is_empty()),
         condition_names: &condition_names,
         path_aliases: &[],
+        scoped_path_aliases: &[],
         scss_include_paths: &[],
         static_dir_mappings: &[],
         framework_static_dir_mappings: &[],
@@ -2908,4 +2919,84 @@ fn deno_import_maps_follow_nearest_package_scope_and_declaring_base() {
         specifier::resolve_specifier(&ctx, &member_importer, "chalk", false),
         ResolveResult::NpmPackage(ref name) if name == "chalk"
     ));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn platform_variant_import_of_its_base_resolves_to_the_base_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = &dunce::canonicalize(temp.path()).unwrap();
+    let base = root.join("Badge.tsx");
+    let ios = root.join("Badge.ios.tsx");
+    let android_only = root.join("Chip.android.tsx");
+    let index = root.join("index.ts");
+    for path in [&base, &ios, &android_only, &index] {
+        std::fs::write(path, "export const value = 1;").unwrap();
+    }
+
+    let plugins = vec!["react-native".to_string()];
+    let resolver = specifier::create_resolver(root, &plugins, &[]);
+    let script_resolver = specifier::create_script_resolver(&resolver);
+    let style_resolver = specifier::create_resolver(root, &plugins, &["style".to_string()]);
+    let extensions = react_native::build_extensions(&plugins);
+    let path_to_id: FxHashMap<&Path, FileId> = [
+        (base.as_path(), FileId(1)),
+        (ios.as_path(), FileId(2)),
+        (android_only.as_path(), FileId(3)),
+        (index.as_path(), FileId(4)),
+    ]
+    .into_iter()
+    .collect();
+    let raw_path_to_id = FxHashMap::default();
+    let workspace_roots = FxHashMap::default();
+    let condition_names = react_native::build_condition_names(&plugins, &[]);
+    let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
+    let tsconfig_cache = TsconfigCache::default();
+    let canonicalize_cache = CanonicalizeCache::default();
+    let ctx = ResolveContext {
+        resolver: &resolver,
+        script_resolver: &script_resolver,
+        style_resolver: &style_resolver,
+        extensions: &extensions,
+        path_to_id: &path_to_id,
+        raw_path_to_id: &raw_path_to_id,
+        workspace_roots: &workspace_roots,
+        package_manifests: &[],
+        has_deno_import_maps: false,
+        condition_names: &condition_names,
+        path_aliases: &[],
+        scoped_path_aliases: &[],
+        scss_include_paths: &[],
+        static_dir_mappings: &[],
+        framework_static_dir_mappings: &[],
+        root,
+        canonical_fallback: None,
+        tsconfig_warned: &tsconfig_warned,
+        tsconfig_cache: &tsconfig_cache,
+        canonicalize_cache: &canonicalize_cache,
+    };
+
+    let resolve = |from: &Path, spec: &str| {
+        specifier::resolve_specifier(&ctx, from, spec, false).internal_file_id()
+    };
+    assert_eq!(
+        resolve(&ios, "./Badge"),
+        Some(FileId(1)),
+        "a platform variant that imports its own base specifier must reach the base file"
+    );
+    assert_eq!(
+        resolve(&index, "./Badge"),
+        Some(FileId(2)),
+        "other importers keep the Metro platform-extension resolution"
+    );
+    assert_eq!(
+        resolve(&ios, "./Badge.ios"),
+        Some(FileId(2)),
+        "a specifier that names the platform variant keeps its explicit target"
+    );
+    assert_eq!(
+        resolve(&android_only, "./Chip"),
+        Some(FileId(3)),
+        "without a base file the original resolution stays"
+    );
 }

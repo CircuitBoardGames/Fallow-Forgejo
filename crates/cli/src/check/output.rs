@@ -7,7 +7,8 @@ use fallow_types::discover::DiscoveredFile;
 use rustc_hash::FxHashSet;
 
 use super::TraceOptions;
-use crate::{error::emit_error, report};
+use crate::exit_codes::exit_gate_failed;
+use crate::{error::emit_input_error, report};
 
 /// What the plugin run knows beyond the graph, which a file or dependency trace
 /// adds to its output.
@@ -72,9 +73,8 @@ pub(super) fn handle_type_aware_trace_output(
         .collect::<Vec<_>>();
     if let Some(trace_spec) = trace_opts.trace_export.as_ref() {
         let Some((file_path, export_name)) = parse_trace_spec(trace_spec) else {
-            return Some(emit_error(
+            return Some(emit_input_error(
                 "--trace requires FILE:EXPORT_NAME format (e.g., src/utils.ts:foo)",
-                2,
                 config.output,
             ));
         };
@@ -88,9 +88,8 @@ pub(super) fn handle_type_aware_trace_output(
                 file_path,
                 export_name,
             ) else {
-                return Some(emit_error(
+                return Some(emit_input_error(
                     &format!("could not resolve semantic identity for '{trace_spec}'"),
-                    2,
                     config.output,
                 ));
             };
@@ -109,9 +108,8 @@ pub(super) fn handle_type_aware_trace_output(
                     return Some(exit);
                 }
                 Err(error) => {
-                    return Some(emit_error(
+                    return Some(emit_input_error(
                         &format!("Type-aware trace failed: {error}"),
-                        2,
                         config.output,
                     ));
                 }
@@ -126,9 +124,8 @@ pub(super) fn handle_type_aware_trace_output(
                 file_path,
                 export_name,
             ) else {
-                return Some(emit_error(
+                return Some(emit_input_error(
                     &format!("could not resolve semantic identity for '{trace_spec}'"),
-                    2,
                     config.output,
                 ));
             };
@@ -152,25 +149,22 @@ pub(super) fn handle_type_aware_trace_output(
                     return Some(exit);
                 }
                 Err(error) => {
-                    return Some(emit_error(
+                    return Some(emit_input_error(
                         &format!("Type-aware trace failed: {error}"),
-                        2,
                         config.output,
                     ));
                 }
             }
         }
-        return Some(emit_error(
+        return Some(emit_input_error(
             &format!("export or member '{export_name}' not found in '{file_path}'"),
-            2,
             config.output,
         ));
     }
     let impact_spec = trace_opts.symbol_impact.as_ref()?;
     let Some((file_path, target_name)) = parse_trace_spec(impact_spec) else {
-        return Some(emit_error(
+        return Some(emit_input_error(
             "--symbol-impact requires FILE:EXPORT_NAME or FILE:CLASS.METHOD format",
-            2,
             config.output,
         ));
     };
@@ -191,19 +185,17 @@ pub(super) fn handle_type_aware_trace_output(
         ) {
             Ok(symbol) => symbol,
             Err(reason) => {
-                return Some(emit_error(
+                return Some(emit_input_error(
                     &format!(
                         "class method '{target_name}' is unavailable for exact impact analysis: {reason}"
                     ),
-                    2,
                     config.output,
                 ));
             }
         }
     } else {
-        return Some(emit_error(
+        return Some(emit_input_error(
             &format!("export or class method '{target_name}' not found in '{file_path}'"),
-            2,
             config.output,
         ));
     };
@@ -213,9 +205,8 @@ pub(super) fn handle_type_aware_trace_output(
             report::print_symbol_impact(&impact, config.output, explain, json_style);
             Some(exit)
         }
-        Err(error) => Some(emit_error(
+        Err(error) => Some(emit_input_error(
             &format!("Type-aware symbol impact failed: {error}"),
-            2,
             config.output,
         )),
     }
@@ -228,7 +219,7 @@ fn semantic_completeness_exit(
     if require == fallow_config::TypeAwareRequire::Complete
         && status != fallow_types::semantic::SemanticCompleteness::Complete
     {
-        ExitCode::from(1)
+        exit_gate_failed()
     } else {
         ExitCode::SUCCESS
     }
@@ -247,9 +238,8 @@ fn handle_trace_export(
     } = *request;
     let trace_spec = trace_opts.trace_export.as_ref()?;
     let Some((file_path, export_name)) = parse_trace_spec(trace_spec) else {
-        return Some(emit_error(
+        return Some(emit_input_error(
             "--trace requires FILE:EXPORT_NAME format (e.g., src/utils.ts:foo)",
-            2,
             output,
         ));
     };
@@ -268,9 +258,8 @@ fn handle_trace_export(
         report::print_class_member_trace(&trace, output, json_style);
         return Some(ExitCode::SUCCESS);
     }
-    Some(emit_error(
+    Some(emit_input_error(
         &format!("export or member '{export_name}' not found in '{file_path}'"),
-        2,
         output,
     ))
 }
@@ -293,12 +282,12 @@ fn handle_trace_file(
         Some(mut trace) => {
             trace.sources = trace_provenance.file_sources(&trace.file);
             trace.apply_plugin_credits(trace_provenance);
+            trace.apply_entry_script(trace_provenance);
             report::print_file_trace(&trace, request.output, request.json_style);
             Some(ExitCode::SUCCESS)
         }
-        None => Some(emit_error(
+        None => Some(emit_input_error(
             &format!("file '{file_path}' not found in module graph"),
-            2,
             request.output,
         )),
     }
@@ -340,9 +329,8 @@ fn handle_impact_closure_trace(
             report::print_impact_closure_trace(&trace, output, json_style);
             Some(ExitCode::SUCCESS)
         }
-        None => Some(emit_error(
+        None => Some(emit_input_error(
             &format!("file '{file_path}' not found in module graph"),
-            2,
             output,
         )),
     }
@@ -600,6 +588,8 @@ mod tests {
             legacy_glob_groups: Vec::new(),
             root: std::path::PathBuf::from("/project"),
             entry_patterns: vec![],
+            support_entry_patterns: vec![],
+            workspace_settings: fallow_config::ResolvedWorkspaceSettings::default(),
             entry_pattern_effect: fallow_config::EntryEffectRecord::default(),
             ignore_patterns: fallow_config::IgnorePatternSet::empty(),
             user_ignore_pattern_count: 0,
@@ -609,6 +599,7 @@ mod tests {
             threads: 1,
             no_cache: true,
             ignore_dependencies: fallow_config::IgnoreDependencyMatcher::default(),
+            ignore_binaries: fallow_config::IgnoreDependencyMatcher::default(),
             ignore_command_entries: vec![],
             ignore_unresolved_imports: vec![],
             ignore_export_rules: vec![],
@@ -620,6 +611,7 @@ mod tests {
             ignore_decorators: vec![],
             unused_component_props_ignore: None,
             circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
+            effect: fallow_config::EffectConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
             similar_code: fallow_config::SimilarCodeConfig::default(),
             mutation: fallow_config::MutationConfig::default(),

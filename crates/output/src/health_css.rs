@@ -641,6 +641,11 @@ pub struct StylingFindingInternal {
     /// Selector list of the rule that owns the finding, when the finding
     /// family has one. The audit key uses it to tell equal values apart.
     pub rule_selector: Option<String>,
+    /// Sorted distinct file paths of the occurrences of a duplicate block
+    /// group. Empty for other findings. The finding
+    /// reports one occurrence, and which one depends on the changed-file
+    /// scope. The audit key uses the whole group instead.
+    pub group_paths: Vec<String>,
     /// Audit-mode result of the comparison with the base snapshot. The audit
     /// sets it, and the audit JSON writes it as `introduced`.
     pub introduced: Option<bool>,
@@ -1113,6 +1118,13 @@ pub struct CssAnalyticsSummary {
     /// undefined direction). Located in `undefined_keyframes`; usually a typo or
     /// a removed animation.
     pub keyframes_undefined: u32,
+    /// `@keyframes` with no literal reference that a Sass or Less source
+    /// defines and that the unreferenced check skips. A Sass or Less
+    /// animation value with a variable or an interpolation that fallow cannot
+    /// resolve can name any such block. These are not in
+    /// `keyframes_unreferenced`. A `@keyframes` block in plain CSS is always
+    /// checked.
+    pub keyframes_unchecked: u32,
     /// Total Vue `<style scoped>` classes used nowhere else in their component
     /// (cleanup candidates), across all SFCs.
     pub scoped_unused_classes: u32,
@@ -1181,7 +1193,7 @@ pub struct CssAnalyticsSummary {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     reason = "tests use unwrap to keep serialization assertions concise"
 )]

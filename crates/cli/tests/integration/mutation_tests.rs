@@ -59,6 +59,107 @@ fn plan_json_lists_unreached_mutants_and_runs_no_code() {
 }
 
 #[test]
+fn mutants_per_line_leaves_the_other_mutants_of_a_line_pending_in_the_plan() {
+    let project = untested_project();
+    let root = project.path();
+    fs::write(
+        root.join("src/math.ts"),
+        "export const inRange = (n: number): boolean => n > 0 && n + 1 < 10;\n",
+    )
+    .expect("math.ts");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"mutation-fixture","private":true,"type":"module","main":"src/math.ts","devDependencies":{"vitest":"^5.0.0"}}"#,
+    )
+    .expect("package.json");
+    fs::write(
+        root.join("src/math.test.ts"),
+        "import { expect, test } from \"vitest\";\nimport { inRange } from \"./math\";\n\ntest(\"in range\", () => {\n  expect(inRange(3)).toBe(true);\n});\n",
+    )
+    .expect("math.test.ts");
+    commit_all(root, "add a test");
+
+    let (full_output, full) = json_mutation(root, &["--plan", "--all"]);
+    assert_eq!(full_output.code, 0, "{}", full_output.stderr);
+    let planned = full["counts"]["planned"].as_u64().unwrap();
+    assert!(planned > 1, "the line has several mutants: {full}");
+
+    let (output, sampled) = json_mutation(root, &["--plan", "--all", "--mutants-per-line", "1"]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let counts = &sampled["counts"];
+    assert_eq!(counts["planned"], 1, "{sampled}");
+    assert_eq!(counts["sampled_out"].as_u64().unwrap(), planned - 1);
+    assert_eq!(counts["pending"], counts["sampled_out"]);
+    let pending: Vec<&serde_json::Value> = sampled["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mutant| mutant["disposition"] == "pending")
+        .collect();
+    assert_eq!(pending.len() as u64, planned - 1);
+    assert!(
+        pending
+            .iter()
+            .all(|mutant| mutant["pending_reason"] == "sampled-out"),
+        "{sampled}"
+    );
+
+    let zero = mutation(root, &["--plan", "--all", "--mutants-per-line", "0"]);
+    assert_eq!(zero.code, 2, "{}", zero.stderr);
+}
+
+#[test]
+fn a_test_only_change_warns_about_its_skipped_tests_and_starts_no_runner() {
+    let project = untested_project();
+    let root = project.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"mutation-fixture","private":true,"type":"module","main":"src/math.ts","devDependencies":{"vitest":"^5.0.0"}}"#,
+    )
+    .expect("package.json");
+    fs::write(
+        root.join("src/math.test.ts"),
+        "import { expect, it } from \"vitest\";\nimport { add } from \"./math\";\n\nit(\"adds\", () => expect(add(1, 2)).toBe(3));\nit.skip(\"adds negatives\", () => {});\n",
+    )
+    .expect("math.test.ts");
+    commit_all(root, "add a test");
+    let diff_dir = tempfile::tempdir().expect("temp dir");
+    let diff = diff_dir.path().join("change.diff");
+    fs::write(
+        &diff,
+        "diff --git a/src/math.test.ts b/src/math.test.ts\n--- a/src/math.test.ts\n+++ b/src/math.test.ts\n@@ -4,0 +5,1 @@\n+it.skip(\"adds negatives\", () => {});\n",
+    )
+    .expect("diff");
+
+    let (output, report) = json_mutation(root, &["--diff-file", diff.to_str().expect("utf-8")]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let errors = report["errors"].as_array().expect("errors");
+    let warning = errors
+        .iter()
+        .find(|error| error["code"] == "skipped-tests")
+        .unwrap_or_else(|| panic!("a skipped-tests warning: {report}"));
+    assert_eq!(
+        warning["message"],
+        "1 test is skipped or todo: src/math.test.ts:5 (adds negatives). A skipped test checks nothing, so it cannot kill a mutant. Run each test or remove it."
+    );
+    assert!(
+        report["runner"].is_null(),
+        "the scan starts no runner: {report}"
+    );
+    assert_eq!(report["completion"]["status"], "complete");
+
+    let (_, full) = json_mutation(root, &["--all"]);
+    assert!(
+        full["errors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|error| error["code"] != "skipped-tests"),
+        "a full run gives no per-test warning"
+    );
+}
+
+#[test]
 fn plan_mutates_the_script_blocks_of_vue_svelte_and_astro_components() {
     let project = untested_project();
     let root = project.path();
@@ -610,6 +711,141 @@ fn inspect_shows_the_mutated_line_when_fresh_and_a_stale_status_after_an_edit() 
 }
 
 #[test]
+fn tasks_list_the_open_mutants_of_the_last_run_in_json_text_and_markdown() {
+    let project = untested_project();
+    let (_, report) = json_mutation(project.path(), &["--all"]);
+    let open = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mutant| mutant["status"] == "no_coverage" || mutant["status"] == "survived")
+        .count();
+    assert!(open > 0, "the untested project has open mutants");
+
+    let (output, batch) = json_mutation(project.path(), &["tasks"]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert_eq!(batch["kind"], "mutation-tasks");
+    assert_eq!(batch["schema_version"], "1");
+    assert_eq!(batch["summary"]["tasks"], open);
+    let add = batch["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["operator"] == "arithmetic-operator" && task["function"] == "add")
+        .expect("an arithmetic task in add");
+    assert_eq!(add["status"], "no_coverage");
+    assert_eq!(add["original_lines"], "  return a + b;");
+    assert_eq!(add["mutated_lines"], "  return a - b;");
+
+    let text = mutation(project.path(), &["tasks"]);
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    assert!(
+        text.stdout.starts_with("Mutation tasks: "),
+        "{}",
+        text.stdout
+    );
+    assert!(
+        text.stdout.contains("   changed: return a - b;"),
+        "{}",
+        text.stdout
+    );
+
+    let markdown = mutation(project.path(), &["tasks", "--format", "markdown"]);
+    assert_eq!(markdown.code, 0, "{}", markdown.stderr);
+    assert!(
+        markdown.stdout.starts_with("## Mutation tasks"),
+        "{}",
+        markdown.stdout
+    );
+
+    let plan = project.path().join("plan.json");
+    let (_, plan_value) = json_mutation(project.path(), &["--all", "--plan"]);
+    fs::write(&plan, serde_json::to_string(&plan_value).unwrap()).expect("plan");
+    let (refused, error) = json_mutation(
+        project.path(),
+        &["tasks", "--report", plan.to_str().unwrap()],
+    );
+    assert_eq!(refused.code, 2);
+    assert_eq!(error["code"], "FALLOW_MUTATION_REPORT_INVALID");
+}
+
+#[test]
+fn recheck_reruns_the_open_tasks_and_refuses_a_changed_source() {
+    let project = untested_project();
+    let (_, report) = json_mutation(project.path(), &["--all"]);
+    let open: Vec<String> = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mutant| mutant["status"] == "no_coverage")
+        .map(|mutant| mutant["mutant_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(open.len() > 1, "the untested project has open mutants");
+
+    let (output, recheck) = json_mutation(project.path(), &["--recheck"]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert_eq!(recheck["kind"], "mutation");
+    assert_eq!(recheck["recheck"]["no_coverage"], open.len());
+    assert_eq!(
+        recheck["recheck"]["mutants"].as_array().unwrap().len(),
+        open.len()
+    );
+    assert_eq!(
+        recheck["recheck"]["mutants"][0]["previous_status"],
+        "no_coverage"
+    );
+    assert_eq!(recheck["recheck"]["mutants"][0]["outcome"], "no_coverage");
+
+    let one = open[0].as_str();
+    let (output, single) = json_mutation(project.path(), &["--recheck", "--mutant", one]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert_eq!(single["recheck"]["mutants"].as_array().unwrap().len(), 1);
+    assert_eq!(single["recheck"]["mutants"][0]["mutant_id"], one);
+    let not_selected = single["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mutant| mutant["prune_reason"] == "not-selected")
+        .count();
+    assert_eq!(not_selected, open.len() - 1);
+    let (_, tasks) = json_mutation(project.path(), &["tasks"]);
+    assert_eq!(
+        tasks["summary"]["tasks"],
+        open.len(),
+        "a recheck of named mutants keeps the other open tasks in the saved report"
+    );
+
+    let gated = mutation(project.path(), &["--recheck", "--min-score", "50"]);
+    assert_eq!(gated.code, 2, "{}", gated.stderr);
+
+    fs::write(
+        project.path().join("src/other.ts"),
+        "export const other = 1;\n",
+    )
+    .expect("other");
+    let (dirty, error) = json_mutation(project.path(), &["--recheck"]);
+    assert_eq!(dirty.code, 2);
+    assert_eq!(error["code"], "FALLOW_MUTATION_NON_TEST_CHANGE", "{error}");
+    fs::remove_file(project.path().join("src/other.ts")).expect("remove other");
+
+    let (unknown, error) = json_mutation(
+        project.path(),
+        &["--recheck", "--mutant", "0000000000000000"],
+    );
+    assert_eq!(unknown.code, 2);
+    assert_eq!(error["code"], "FALLOW_MUTATION_UNKNOWN_MUTANT");
+
+    fs::write(
+        project.path().join("src/math.ts"),
+        MATH.replace("a + b", "b + a"),
+    )
+    .expect("edit");
+    let (changed, error) = json_mutation(project.path(), &["--recheck"]);
+    assert_eq!(changed.code, 2);
+    assert_eq!(error["code"], "FALLOW_MUTATION_SOURCE_CHANGED", "{error}");
+}
+
+#[test]
 fn typecheck_without_a_companion_exits_2_before_the_tests_run() {
     let project = untested_project();
     let missing = project.path().join("no-such-companion");
@@ -985,6 +1221,132 @@ mod end_to_end {
             "{checked}"
         );
         assert_eq!(checked["completion"]["status"], "complete", "{checked}");
+    }
+
+    /// A hinted survivor stays `survived`: no `equivalent` mutant, the same
+    /// survivors as the plain run (less the compile errors), and the score
+    /// is detected over executed.
+    fn assert_hint_leaves_the_score(checked: &serde_json::Value, plain: &serde_json::Value) {
+        let counts = &checked["summary"]["counts"];
+        assert_eq!(counts["equivalent"], 0, "{checked}");
+        assert_eq!(
+            counts["survived"].as_u64().expect("survived")
+                + counts["compile_error"].as_u64().expect("compile errors"),
+            plain["summary"]["counts"]["survived"]
+                .as_u64()
+                .expect("survived"),
+            "{checked}"
+        );
+        let detected = counts["killed"].as_f64().expect("killed")
+            + counts["timeout"].as_f64().expect("timeout");
+        let executed = detected + counts["survived"].as_f64().expect("survived");
+        assert_eq!(
+            checked["summary"]["score"].as_f64(),
+            Some(detected / executed),
+            "{checked}"
+        );
+        assert_eq!(checked["completion"]["status"], "complete", "{checked}");
+    }
+
+    /// `readB` reads `a?.b` where `a` is a plain object type. No test can
+    /// tell `a?.b` from `a.b`, so the mutant survives the tests. With
+    /// `strictNullChecks` and `noUncheckedIndexedAccess`, the type check adds
+    /// the advisory `equivalence_hint` to the survivor. The hint never changes
+    /// the status or the score. Without `--typecheck` the survivor has no
+    /// hint.
+    #[test]
+    fn a_typecheck_run_hints_an_optional_link_on_a_non_nullable_receiver_without_changing_the_score()
+     {
+        let Some(package) = companion_package() else {
+            return;
+        };
+        if !type_aware_companion_installed() {
+            return;
+        }
+        let (_project, root) = vitest_project(
+            &package,
+            "\nexport function readB(a: { b: number }): number | undefined {\n  return a?.b;\n}\n",
+        );
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true,"noUncheckedIndexedAccess":true,"noEmit":true},"include":["src"]}"#,
+        )
+        .expect("tsconfig");
+        fs::write(
+            root.join("test/chain.test.ts"),
+            "import { expect, test } from \"vitest\";\nimport { readB } from \"../src/math\";\n\ntest(\"reads b\", () => {\n  expect(readB({ b: 4 })).toBe(4);\n});\n",
+        )
+        .expect("chain test");
+        commit_all(&root, "chain");
+
+        let args = ["src/math.ts", "--concurrency", "1"];
+        let (plain_output, plain) = json_mutation(&root, &args);
+        assert_eq!(plain_output.code, 0, "{}", plain_output.stderr);
+        let link = |report: &serde_json::Value| -> serde_json::Value {
+            report["mutants"]
+                .as_array()
+                .expect("mutants")
+                .iter()
+                .find(|mutant| {
+                    mutant["function"] == "readB" && mutant["operator"] == "optional-chaining"
+                })
+                .cloned()
+                .expect("an optional-chaining mutant of readB")
+        };
+        assert_eq!(link(&plain)["status"], "survived", "{plain}");
+        assert!(link(&plain).get("equivalence_hint").is_none(), "{plain}");
+
+        let typecheck_run = |extra: &[&str]| -> serde_json::Value {
+            let mut command = std::process::Command::new(crate::common::fallow_bin());
+            command
+                .env("RUST_LOG", "")
+                .env("NO_COLOR", "1")
+                .args(["mutation", "--root"])
+                .arg(&root)
+                .args(args)
+                .args(extra)
+                .args(["--typecheck", "--format", "json", "--quiet"]);
+            crate::common::configure_type_aware_sidecar(&mut command);
+            let output = command.output().expect("fallow runs");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json")
+        };
+        let checked = typecheck_run(&[]);
+        let mutant = link(&checked);
+        assert_eq!(mutant["status"], "survived", "{checked}");
+        assert_eq!(mutant["equivalence_hint"], "type-non-nullish", "{checked}");
+        assert_eq!(checked["typecheck"]["completed"], true, "{checked}");
+        assert_eq!(checked["typecheck"]["hinted"], 1, "{checked}");
+        assert_hint_leaves_the_score(&checked, &plain);
+
+        // A verdict for the hinted survivor makes it `equivalent` and
+        // removes the hint, so the report does not show both.
+        let verdict_path = root.join("verdicts.json");
+        fs::write(
+            &verdict_path,
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": "1",
+                "verdicts": [{ "review_key": mutant["mutant_id"], "verdict": "equivalent" }],
+            }))
+            .expect("verdict json"),
+        )
+        .expect("verdicts");
+        commit_all(&root, "verdicts");
+        let judged = typecheck_run(&["--verdicts", verdict_path.to_str().expect("path")]);
+        let mutant = link(&judged);
+        assert_eq!(mutant["status"], "equivalent", "{judged}");
+        assert!(mutant.get("equivalence_hint").is_none(), "{judged}");
+        assert!(judged["typecheck"].get("hinted").is_none(), "{judged}");
+        assert_eq!(
+            judged["typecheck"]["checked"],
+            checked["typecheck"]["checked"]
+        );
+        assert_eq!(judged["summary"]["counts"]["equivalent"], 1, "{judged}");
     }
 
     /// A component compiler in the shape of the Vue plugin: its `transform`
@@ -1529,10 +1891,12 @@ mod interrupt {
         let project = slow_project();
         let root = project.path();
         let journal = root.join(".fallow/mutation/journal.jsonl");
+        let temp = tempfile::tempdir().expect("temp dir");
 
         let mut command = Command::new(fallow_bin());
         scrub_analysis_env(&mut command);
         command
+            .env("TMPDIR", temp.path())
             .args(["mutation", "--root"])
             .arg(root)
             .args([
@@ -1563,6 +1927,13 @@ mod interrupt {
         assert!(interrupted.success());
         let status = child.wait().expect("wait");
         assert_eq!(status.code(), Some(130), "{status:?}");
+        // A signal ends Fallow without its normal cleanup, so the signal
+        // handler deletes the temp directory of each companion.
+        let left: Vec<_> = fs::read_dir(temp.path())
+            .expect("temp dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(left, Vec::<std::ffi::OsString>::new());
         let kept = journal_results(&journal);
         assert!(kept >= 2, "the interrupted run keeps its results: {kept}");
 
@@ -1595,5 +1966,195 @@ mod interrupt {
             "{}",
             missing.stdout
         );
+    }
+
+    /// The one test writes the marker file of `DRY_RUN_MARKER`, then waits
+    /// long enough for an interrupt during the dry run.
+    const SLOW_DRY_RUN_TESTS: &str = "import assert from \"node:assert/strict\";\nimport { writeFileSync } from \"node:fs\";\nimport { test } from \"node:test\";\nimport { inc } from \"../src/math.js\";\ntest(\"inc\", async () => { writeFileSync(process.env.DRY_RUN_MARKER, \"\"); await new Promise((resolve) => setTimeout(resolve, 20000)); assert.equal(inc(1), 2); });\n";
+
+    /// Issue #4302: a SIGINT during the dry run ends the run with exit code
+    /// 130 and no error report. The signal kills the companion, and the run
+    /// must not report that exit as a runner failure.
+    #[test]
+    fn an_interrupt_during_the_dry_run_prints_no_runner_error() {
+        if !has_node() {
+            return;
+        }
+        let project = slow_project();
+        let root = project.path();
+        fs::write(root.join("test/math.test.js"), SLOW_DRY_RUN_TESTS).expect("test file");
+        commit_all(root, "slow dry run");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("dry-run-started");
+
+        let mut command = Command::new(fallow_bin());
+        scrub_analysis_env(&mut command);
+        command
+            .env("DRY_RUN_MARKER", &marker)
+            .args(["mutation", "--root"])
+            .arg(root)
+            .args(["--all", "--no-cache", "--format", "json", "--quiet"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn fallow mutation");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        // The marker proves that the dry run runs the test.
+        while !marker.exists() {
+            if child.try_wait().expect("poll").is_some() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("wait");
+                panic!(
+                    "the dry run did not start: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let interrupted = Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(interrupted.success());
+        let output = child.wait_with_output().expect("wait");
+        assert_eq!(output.status.code(), Some(130), "{:?}", output.status);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("Error:"), "{stderr}");
+    }
+}
+
+/// Issue #4168: `--compare` lists each mutant that a weaker test no longer
+/// detects. The `node:test` runner needs only `node`.
+mod compare {
+    use std::fs;
+    use std::process::Command;
+
+    use super::{commit_all, git, json_mutation, mutation};
+
+    const SOURCE: &str = "export const inc = (x) => x + 1;\nexport const dec = (x) => x - 1;\n";
+    const STRONG: &str = "import assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport { inc, dec } from \"../src/math.js\";\ntest(\"inc\", () => { assert.equal(inc(1), 2); });\ntest(\"dec\", () => { assert.equal(dec(1), 0); });\n";
+    /// The `inc` test calls `inc` but asserts nothing, so it kills no mutant.
+    const WEAK: &str = "import assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport { inc, dec } from \"../src/math.js\";\ntest(\"inc\", () => { inc(1); });\ntest(\"dec\", () => { assert.equal(dec(1), 0); });\n";
+
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skipped end-to-end test says why it did not run"
+    )]
+    fn has_node() -> bool {
+        let found = Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !found {
+            eprintln!("skipped: the compare test needs `node` on PATH");
+        }
+        found
+    }
+
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"compare-fixture","private":true,"type":"module","scripts":{"test":"node --test"}}"#,
+        )
+        .expect("package.json");
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::create_dir_all(root.join("test")).expect("test");
+        fs::write(root.join("src/math.js"), SOURCE).expect("math.js");
+        fs::write(root.join("test/math.test.js"), STRONG).expect("math.test.js");
+        fs::write(root.join(".gitignore"), ".fallow\n").expect(".gitignore");
+        git(root, &["init", "-q"]);
+        commit_all(root, "init");
+        dir
+    }
+
+    #[test]
+    fn compare_lists_the_mutants_that_a_weaker_test_no_longer_kills() {
+        if !has_node() {
+            return;
+        }
+        let project = project();
+        let root = project.path();
+        let saved_dir = tempfile::tempdir().expect("saved dir");
+        let saved = saved_dir.path().join("before.json");
+
+        let (output, before) = json_mutation(root, &["--all", "--no-cache"]);
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert_eq!(before["completion"]["status"], "complete", "{before}");
+        let killed_in_inc = before["mutants"]
+            .as_array()
+            .expect("mutants")
+            .iter()
+            .filter(|mutant| mutant["status"] == "killed" && mutant["line"] == 1)
+            .count();
+        assert!(
+            killed_in_inc > 0,
+            "the strong test kills a mutant: {before}"
+        );
+        fs::write(&saved, &output.stdout).expect("save");
+
+        fs::write(root.join("test/math.test.js"), WEAK).expect("weaken");
+        commit_all(root, "weaken");
+        let saved_arg = saved.to_str().expect("utf-8 path");
+        let (output, after) = json_mutation(root, &["--all", "--no-cache", "--compare", saved_arg]);
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        let compare = &after["compare"];
+        assert_eq!(compare["regressed"], killed_in_inc, "{after}");
+        assert_eq!(compare["added"], 0, "{after}");
+        assert_eq!(compare["removed"], 0, "{after}");
+        let first = &compare["mutants"][0];
+        assert_eq!(first["change"], "regressed", "{after}");
+        assert_eq!(first["previous_status"], "killed", "{after}");
+        assert_eq!(first["status"], "survived", "{after}");
+        let killer = first["previous_killing_tests"][0].as_str().expect("killer");
+        assert!(killer.contains("inc"), "{after}");
+
+        let human = mutation(
+            root,
+            &["--all", "--no-cache", "--quiet", "--compare", saved_arg],
+        );
+        assert_eq!(human.code, 0, "{}", human.stderr);
+        assert!(
+            human.stdout.contains("Compare with the saved report"),
+            "{}",
+            human.stdout
+        );
+        assert!(
+            human.stdout.contains(&format!("killed before by {killer}")),
+            "{}",
+            human.stdout
+        );
+
+        let (output, partial_run) = json_mutation(
+            root,
+            &[
+                "--all",
+                "--no-cache",
+                "--max-mutants",
+                "1",
+                "--compare",
+                saved_arg,
+            ],
+        );
+        assert_eq!(output.code, 2, "{}", output.stderr);
+        assert_eq!(
+            partial_run["code"], "FALLOW_MUTATION_COMPARE_INCOMPLETE",
+            "{partial_run}"
+        );
+
+        let mut partial: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&saved).expect("read")).expect("json");
+        partial["completion"]["status"] = "partial".into();
+        fs::write(&saved, partial.to_string()).expect("partial");
+        let (output, error) = json_mutation(root, &["--all", "--no-cache", "--compare", saved_arg]);
+        assert_eq!(output.code, 2, "{}", output.stderr);
+        assert_eq!(
+            error["code"], "FALLOW_MUTATION_COMPARE_INCOMPLETE",
+            "{error}"
+        );
+
+        let conflict = mutation(root, &["--plan", "--compare", saved_arg]);
+        assert_eq!(conflict.code, 2, "{}", conflict.stderr);
     }
 }

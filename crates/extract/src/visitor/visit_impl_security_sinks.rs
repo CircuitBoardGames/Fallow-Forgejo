@@ -1,19 +1,22 @@
-#[allow(clippy::wildcard_imports, reason = "many sink helper AST types used")]
 use oxc_ast::ast::*;
 use oxc_span::{GetSpan, Span};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 
 use fallow_types::extract::{
     SecurityControlSite, SinkArgKind, SinkLiteralValue, SinkShape, SinkSite,
     SkippedSecurityCalleeExpressionKind, SkippedSecurityCalleeReason, SkippedSecurityCalleeSite,
 };
+use fallow_types::security_sinks::{JSX_SPREAD_SINK_PROPS, node_binding_module};
 
 use super::super::ModuleInfoExtractor;
 use super::visit_security_controls::security_control_kind_for_callee;
+use super::visit_source_paths::join_member_path;
 use super::{
-    classify_arg_kind, classify_url_shape, flatten_callee_path, flatten_member_path,
-    is_non_literal_arg, is_static_write_head_headers, is_token_like_security_name,
-    object_key_metadata, object_literal_properties, should_capture_hardcoded_secret_literal,
-    sink_literal_value, static_string_literal_value, unwrap_parens, unwrap_static_expr,
+    classify_arg_kind, classify_url_shape, flatten_member_path, is_non_literal_arg,
+    is_static_write_head_headers, is_token_like_security_name, object_key_metadata,
+    object_literal_properties, should_capture_hardcoded_secret_literal, sink_literal_value,
+    static_string_literal_value, unwrap_parens, unwrap_static_expr,
 };
 use crate::js_text::JsText;
 
@@ -41,6 +44,170 @@ struct PushSinkArgInput<'site, 'ast> {
     arg_expr: &'site Expression<'ast>,
     url_arg_literal: Option<String>,
     span: Span,
+}
+
+/// What a local binding holds, when that value changes the meaning of a sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SinkBinding {
+    /// A code-executing global (`const e = eval`), valued by the global name.
+    CodeExec(String),
+    /// A Node.js built-in module (`const vm = require("vm")`), valued by the
+    /// `node:` path that the catalogue matches (`node:vm`).
+    NodeModule(String),
+    /// A member of a Node.js built-in module (`import { runInNewContext }
+    /// from "vm"`), valued by the `node:` member path
+    /// (`node:vm.runInNewContext`).
+    NodeModuleMember(String),
+    /// A `<script>` element (`document.createElement("script")`).
+    ScriptElement,
+}
+
+/// Properties of a `<script>` element whose value the browser loads or runs
+/// as code.
+const SCRIPT_ELEMENT_CODE_PROPERTIES: &[&str] = &["src", "text", "textContent", "innerText"];
+
+/// Callee root that names a proven `<script>` element in a sink path.
+const SCRIPT_ELEMENT_ROOT: &str = "HTMLScriptElement";
+
+/// Methods that parse their argument as markup. A call of one of these
+/// methods on an object that the static path cannot flatten
+/// (`document.createRange().createContextualFragment(x)`) still resolves
+/// through [`ModuleInfoExtractor::sink_object_path`].
+const OBJECT_ROOTED_HTML_METHODS: &[&str] = &["createContextualFragment", "insertAdjacentHTML"];
+
+/// Raw SQL methods of a query builder or a database client. A knex builder
+/// chain starts with a call (`db("t").whereRaw(x)`), and a Prisma client often
+/// comes from a call (`getPrisma()`) or a class field (`this.prisma`). A call
+/// of one of these methods also resolves through
+/// [`ModuleInfoExtractor::sink_object_path`], and the matching `*.` rows of
+/// the `sql-injection` matcher then match the path.
+const OBJECT_ROOTED_RAW_SQL_METHODS: &[&str] = &[
+    "whereRaw",
+    "havingRaw",
+    "orderByRaw",
+    "$queryRawUnsafe",
+    "$executeRawUnsafe",
+];
+
+/// Per-module local bindings that re-expose a sink under another name.
+#[derive(Default)]
+pub(in crate::visitor) struct SinkAliasState {
+    /// Module-scope bindings that change the meaning of a sink, keyed by the
+    /// local name.
+    bindings: FxHashMap<String, SinkBinding>,
+    /// Per `nested_declaration_stack` frame: the sink bindings that the frame
+    /// declares. A name that a nearer frame declares without such a value
+    /// hides an outer binding.
+    scoped_bindings: Vec<FxHashMap<String, SinkBinding>>,
+    /// Names that an enclosing `catch` clause binds. The visitor does not
+    /// record a catch parameter in `nested_declaration_stack`, so these names
+    /// hide every alias.
+    catch_param_names: Vec<FxHashSet<String>>,
+    /// JSX sink props of locals bound to an object literal, keyed by the local
+    /// name. A JSX spread of the local (`<div {...props} />`) emits them.
+    jsx_spread_object_sinks: FxHashMap<String, Vec<SinkSite>>,
+}
+
+/// Flatten an `Identifier` or `StaticMemberExpression` callee to a dotted path.
+///
+/// Deliberately narrower than `static_member_object_name`: it accepts ONLY bare
+/// identifiers and static member chains (no call/new forms), so the catalogue
+/// matcher sees a clean dotted callee path. Returns `None` for dynamic dispatch,
+/// computed members, or aliased call forms (those count as blind spots).
+pub(in crate::visitor) fn flatten_callee_path(mut expr: &Expression<'_>) -> Option<String> {
+    let mut properties = Vec::new();
+    let root = loop {
+        crate::cost::walk_step();
+        match unwrap_parens(expr) {
+            Expression::Identifier(ident) => break ident.name.as_str(),
+            Expression::StaticMemberExpression(member) => {
+                properties.push(member.property.name.as_str());
+                expr = &member.object;
+            }
+            _ => return None,
+        }
+    };
+    Some(join_member_path(root, &properties))
+}
+
+/// Global objects whose member access reaches the global binding itself.
+const GLOBAL_OBJECT_ROOTS: &[&str] = &["globalThis", "window", "self", "global"];
+
+/// Code-executing globals that keep their meaning behind a global-object
+/// prefix (`window.eval`) or a local alias (`const e = eval`).
+const CODE_EXEC_GLOBALS: &[&str] = &["eval", "Function", "setTimeout", "setInterval"];
+
+/// Map `globalThis.eval`, `window.Function` and `self.setTimeout` to the bare
+/// global, so the catalogue `call` rows see the same callee as the direct form.
+/// Only the code-executing globals are mapped: other globals keep their member
+/// path, so existing `*.member` rows and fingerprints do not move.
+fn normalize_global_code_exec_path(path: String) -> String {
+    if let Some((root, rest)) = path.split_once('.')
+        && GLOBAL_OBJECT_ROOTS.contains(&root)
+        && CODE_EXEC_GLOBALS.contains(&rest)
+    {
+        return rest.to_string();
+    }
+    path
+}
+
+fn set_sink_binding(
+    bindings: &mut FxHashMap<String, SinkBinding>,
+    name: &str,
+    binding: Option<SinkBinding>,
+) {
+    match binding {
+        Some(binding) => {
+            bindings.insert(name.to_string(), binding);
+        }
+        None => {
+            bindings.remove(name);
+        }
+    }
+}
+
+/// Whether `expr` is `<object>.createElement("script")`.
+fn is_create_script_element_call(expr: &Expression<'_>) -> bool {
+    let Expression::CallExpression(call) = unwrap_static_expr(expr) else {
+        return false;
+    };
+    let Expression::StaticMemberExpression(member) = unwrap_parens(&call.callee) else {
+        return false;
+    };
+    member.property.name == "createElement"
+        && call
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .and_then(static_string_literal_value)
+            .is_some_and(|tag| tag.eq_ignore_ascii_case("script"))
+}
+
+/// Whether an unresolved computed assignment key builds a property name from
+/// string parts (`el["inner" + suffix]`, `` el[`${kind}HTML`] ``). These keys
+/// are the evasion shape, so they become blind spots. A `+` chain must hold a
+/// string operand: index arithmetic (`data[i + 1] = v`) and a bare identifier
+/// key (`cache[key] = v`) are data writes and stay out of the blind-spot
+/// report.
+fn is_string_building_key(expr: &Expression<'_>) -> bool {
+    match unwrap_static_expr(expr) {
+        Expression::BinaryExpression(bin) => {
+            bin.operator == BinaryOperator::Addition
+                && (has_string_operand(&bin.left) || has_string_operand(&bin.right))
+        }
+        Expression::TemplateLiteral(tpl) => !tpl.expressions.is_empty(),
+        _ => false,
+    }
+}
+
+fn has_string_operand(expr: &Expression<'_>) -> bool {
+    match unwrap_static_expr(expr) {
+        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => true,
+        Expression::BinaryExpression(bin) if bin.operator == BinaryOperator::Addition => {
+            has_string_operand(&bin.left) || has_string_operand(&bin.right)
+        }
+        _ => false,
+    }
 }
 
 fn contains_computed_member(expr: &Expression<'_>) -> bool {
@@ -202,7 +369,7 @@ fn is_string_code_callee(callee_path: &str) -> bool {
 fn is_chmod_literal_callee(callee_path: &str) -> bool {
     matches!(
         callee_path,
-        "fs.chmod" | "fs.chmodSync" | "fs.promises.chmod" | "chmod" | "chmodSync"
+        "fs.chmod" | "fs.chmodSync" | "fs.promises.chmod" | "node:fs.chmod" | "node:fs.chmodSync"
     )
 }
 
@@ -216,11 +383,11 @@ fn is_temp_file_literal_callee(callee_path: &str) -> bool {
             | "fs.createWriteStream"
             | "fs.promises.writeFile"
             | "fs.promises.appendFile"
-            | "writeFile"
-            | "writeFileSync"
-            | "appendFile"
-            | "appendFileSync"
-            | "createWriteStream"
+            | "node:fs.writeFile"
+            | "node:fs.writeFileSync"
+            | "node:fs.appendFile"
+            | "node:fs.appendFileSync"
+            | "node:fs.createWriteStream"
     )
 }
 
@@ -519,8 +686,20 @@ fn collect_call_idents(call: &CallExpression<'_>, out: &mut Vec<String>) {
 
 fn collect_object_idents(obj: &ObjectExpression<'_>, out: &mut Vec<String>) {
     for prop in &obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(prop) = prop {
-            collect_idents_into(&prop.value, out);
+        match prop {
+            ObjectPropertyKind::ObjectProperty(prop) => {
+                // A computed key carries data too: `{ [name]: value }` writes a
+                // header or field whose name comes from `name`.
+                if prop.computed
+                    && let Some(key) = prop.key.as_expression()
+                {
+                    collect_idents_into(key, out);
+                }
+                collect_idents_into(&prop.value, out);
+            }
+            ObjectPropertyKind::SpreadProperty(spread) => {
+                collect_idents_into(&spread.argument, out);
+            }
         }
     }
 }
@@ -708,7 +887,7 @@ impl ModuleInfoExtractor {
     }
 
     fn capture_call_sink(&mut self, expr: &CallExpression<'_>) {
-        let Some(callee_path) = flatten_callee_path(&expr.callee) else {
+        let Some(callee_path) = self.call_sink_callee_path(&expr.callee) else {
             self.record_unresolved_call_sink(expr);
             return;
         };
@@ -719,6 +898,13 @@ impl ModuleInfoExtractor {
             SinkShape::Call
         };
         self.capture_call_sink_args(expr, &callee_path, sink_shape);
+        self.capture_function_body_after_spread(
+            &callee_path,
+            sink_shape,
+            &expr.arguments,
+            expr.span,
+        );
+        self.capture_set_attribute_sink(expr, &callee_path);
         if should_capture_missing_jwt_verify_options(&callee_path, sink_shape, expr.arguments.len())
         {
             self.security_sinks.push(SinkSite {
@@ -791,7 +977,13 @@ impl ModuleInfoExtractor {
     /// call capture because oxc represents `new Function("...")` as a
     /// `NewExpression`, not a `CallExpression`.
     pub(super) fn capture_new_expression_sink(&mut self, expr: &NewExpression<'_>) {
-        let Some(callee_path) = flatten_callee_path(&expr.callee) else {
+        let Some(callee_path) = self.security_callee_path(&expr.callee) else {
+            if contains_computed_member(&expr.callee) {
+                self.record_skipped_security_callee(
+                    &expr.callee,
+                    SkippedSecurityCalleeReason::ComputedMember,
+                );
+            }
             return;
         };
         for (index, arg) in expr.arguments.iter().enumerate() {
@@ -810,6 +1002,47 @@ impl ModuleInfoExtractor {
                 span: expr.span,
             });
         }
+        self.capture_function_body_after_spread(
+            &callee_path,
+            SinkShape::NewExpression,
+            &expr.arguments,
+            expr.span,
+        );
+    }
+
+    /// The Function constructor takes its code as the last argument. When a
+    /// spread fills the parameter list (`new Function(...names, body)`), the
+    /// body has no fixed index, so it is captured as argument 0. A spread body
+    /// is captured through its argument.
+    fn capture_function_body_after_spread(
+        &mut self,
+        callee_path: &str,
+        sink_shape: SinkShape,
+        arguments: &[Argument<'_>],
+        span: Span,
+    ) {
+        if callee_path != "Function" {
+            return;
+        }
+        let (Some(Argument::SpreadElement(_)), Some(body)) = (arguments.first(), arguments.last())
+        else {
+            return;
+        };
+        let arg_expr = match body {
+            Argument::SpreadElement(spread) => &spread.argument,
+            body => match body.as_expression() {
+                Some(expr) => expr,
+                None => return,
+            },
+        };
+        self.push_security_sink_arg(PushSinkArgInput {
+            callee_path,
+            sink_shape,
+            arg_index: 0,
+            arg_expr,
+            url_arg_literal: None,
+            span,
+        });
     }
 
     pub(super) fn capture_math_random_context_sink(
@@ -881,10 +1114,18 @@ impl ModuleInfoExtractor {
     /// security signal. A target whose object cannot be flattened increments
     /// the blind-spot counter.
     pub(super) fn capture_member_assign_sink(&mut self, expr: &AssignmentExpression<'_>) {
-        let AssignmentTarget::StaticMemberExpression(member) = &expr.left else {
-            return;
+        let callee_path = match &expr.left {
+            AssignmentTarget::StaticMemberExpression(member) => self
+                .script_element_assign_path(&member.object, member.property.name.as_str())
+                .or_else(|| {
+                    self.member_assign_callee_path(&member.object, member.property.name.as_str())
+                }),
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                self.computed_member_assign_callee_path(member, &expr.right)
+            }
+            _ => None,
         };
-        let Some(callee_path) = self.member_assign_callee_path(member) else {
+        let Some(callee_path) = callee_path else {
             return;
         };
         let arg_literal = self.static_sink_literal_value(&expr.right);
@@ -899,15 +1140,516 @@ impl ModuleInfoExtractor {
         self.record_member_assign_sink(expr, callee_path, arg_literal, arg_is_non_literal);
     }
 
-    fn member_assign_callee_path(&mut self, member: &StaticMemberExpression<'_>) -> Option<String> {
-        let Some(object_path) = flatten_callee_path(&member.object) else {
+    /// `HTMLScriptElement.<property>` when `object` is a local bound to a new
+    /// `<script>` element and the property loads or holds its code. Other
+    /// elements keep their member path, so `span.textContent = x` and
+    /// `img.src = x` match no row.
+    fn script_element_assign_path(
+        &self,
+        object: &Expression<'_>,
+        property: &str,
+    ) -> Option<String> {
+        if !SCRIPT_ELEMENT_CODE_PROPERTIES.contains(&property) {
+            return None;
+        }
+        let Expression::Identifier(ident) = unwrap_static_expr(object) else {
+            return None;
+        };
+        matches!(
+            self.sink_binding(ident.name.as_str()),
+            Some(SinkBinding::ScriptElement)
+        )
+        .then(|| format!("{SCRIPT_ELEMENT_ROOT}.{property}"))
+    }
+
+    fn member_assign_callee_path(
+        &mut self,
+        object: &Expression<'_>,
+        property: &str,
+    ) -> Option<String> {
+        let object_path = self
+            .static_callee_path(object)
+            .or_else(|| self.sink_object_path(object));
+        let Some(object_path) = object_path else {
             self.record_skipped_security_callee(
-                &member.object,
+                object,
                 SkippedSecurityCalleeReason::UnsupportedAssignmentObject,
             );
             return None;
         };
-        Some(format!("{}.{}", object_path, member.property.name))
+        // `this.__proto__ = new.target.prototype` is the `setPrototypeOf`
+        // fallback of an `Error` subclass. It sets the prototype of the new
+        // instance and cannot reach a shared prototype.
+        if object_path == "this" && property == "__proto__" {
+            return None;
+        }
+        Some(format!("{object_path}.{property}"))
+    }
+
+    /// Resolve `el["innerHTML"] = x` and `el["inner" + "HTML"] = x` to the
+    /// static member path. A key built from parts that do not fold to a
+    /// constant (`el[prefix + "HTML"] = x`) is a blind spot when the value is
+    /// non-literal, never a silent miss.
+    fn computed_member_assign_callee_path(
+        &mut self,
+        member: &ComputedMemberExpression<'_>,
+        value: &Expression<'_>,
+    ) -> Option<String> {
+        if let Some(key) = self.static_property_key(&member.expression) {
+            return self.member_assign_callee_path(&member.object, &key);
+        }
+        if is_string_building_key(&member.expression) && is_non_literal_arg(value) {
+            self.security_sinks_skipped += 1;
+            self.security_unresolved_callee_sites
+                .push(SkippedSecurityCalleeSite {
+                    reason: SkippedSecurityCalleeReason::ComputedMember,
+                    expression_kind: SkippedSecurityCalleeExpressionKind::ComputedMemberExpression,
+                    span_start: member.span.start,
+                    span_end: member.span.end,
+                });
+        }
+        None
+    }
+
+    /// Resolve a callee to the dotted path the catalogue matches.
+    ///
+    /// On top of [`Self::static_callee_path`], this maps a global-object prefix
+    /// on a code-executing global (`window.eval`) and a local alias of one
+    /// (`const e = eval; e(code)`) to the bare global. A binding of a Node.js
+    /// built-in module in
+    /// [`NODE_BINDING_MODULES`](fallow_types::security_sinks::NODE_BINDING_MODULES)
+    /// resolves to its `node:` path (`runInNewContext(code)` after
+    /// `import { runInNewContext } from "vm"` becomes
+    /// `node:vm.runInNewContext`). A further path on a module or member
+    /// binding joins the `node:` path (`fsp.readFile` after
+    /// `import { promises as fsp } from "node:fs"`). `node:fs.promises.<member>`
+    /// becomes `node:fs.<member>`, the path of an `fs/promises` import.
+    fn security_callee_path(&self, expr: &Expression<'_>) -> Option<String> {
+        let path = normalize_global_code_exec_path(self.static_callee_path(expr)?);
+        let (root, rest) = match path.split_once('.') {
+            Some((root, rest)) => (root, Some(rest)),
+            None => (path.as_str(), None),
+        };
+        let resolved = match (self.sink_binding(root), rest) {
+            (Some(SinkBinding::CodeExec(target) | SinkBinding::NodeModuleMember(target)), None) => {
+                Some(target.clone())
+            }
+            (
+                Some(SinkBinding::NodeModule(base) | SinkBinding::NodeModuleMember(base)),
+                Some(rest),
+            ) => {
+                let joined = format!("{base}.{rest}");
+                Some(match joined.strip_prefix("node:fs.promises.") {
+                    Some(member) => format!("node:fs.{member}"),
+                    None => joined,
+                })
+            }
+            _ => None,
+        };
+        Some(resolved.unwrap_or(path))
+    }
+
+    /// The sink binding that the innermost binding of `name` holds. A
+    /// parameter, a catch parameter or a nested declaration of the same name
+    /// without such a value hides an outer binding.
+    fn sink_binding(&self, name: &str) -> Option<&SinkBinding> {
+        if self.is_catch_param_name(name) {
+            return None;
+        }
+        let bindings = match self
+            .nested_declaration_stack
+            .iter()
+            .rposition(|scope| scope.contains(name))
+        {
+            Some(index) => self.sink_aliases.scoped_bindings.get(index)?,
+            None => &self.sink_aliases.bindings,
+        };
+        bindings.get(name)
+    }
+
+    /// Open the alias frames that match a new `nested_declaration_stack`
+    /// frame: the `require` aliases and the code-exec aliases.
+    pub(super) fn push_scoped_alias_frames(&mut self) {
+        self.scoped_require_aliases.push(FxHashSet::default());
+        self.sink_aliases.scoped_bindings.push(FxHashMap::default());
+    }
+
+    pub(super) fn pop_scoped_alias_frames(&mut self) {
+        self.scoped_require_aliases.pop();
+        self.sink_aliases.scoped_bindings.pop();
+    }
+
+    /// Open the scope of a `catch` clause that binds `names`.
+    pub(super) fn push_catch_clause_scope(&mut self, names: FxHashSet<String>) {
+        self.sink_aliases.catch_param_names.push(names.clone());
+        self.push_direct_object_binding_scope(names);
+    }
+
+    /// Whether an enclosing catch clause binds `name`.
+    pub(in crate::visitor) fn is_catch_param_name(&self, name: &str) -> bool {
+        self.sink_aliases
+            .catch_param_names
+            .iter()
+            .any(|names| names.contains(name))
+    }
+
+    pub(super) fn pop_catch_clause_scope(&mut self) {
+        self.pop_direct_object_binding_scope();
+        self.sink_aliases.catch_param_names.pop();
+    }
+
+    /// Flatten a callee or assignment object to a dotted path.
+    ///
+    /// Accepts identifiers, static members, computed members whose key folds to
+    /// a constant string (`win["ev" + "al"]`), and the indirect-call sequence
+    /// `(0, eval)` whose leading expressions are literals. Anything else is
+    /// `None`, and the caller records a blind spot.
+    fn static_callee_path(&self, expr: &Expression<'_>) -> Option<String> {
+        let mut properties: Vec<Cow<'_, str>> = Vec::new();
+        let mut expr = expr;
+        let root = loop {
+            crate::cost::walk_step();
+            match unwrap_parens(expr) {
+                Expression::Identifier(ident) => break ident.name.as_str(),
+                Expression::StaticMemberExpression(member) => {
+                    properties.push(Cow::Borrowed(member.property.name.as_str()));
+                    expr = &member.object;
+                }
+                Expression::ComputedMemberExpression(member) => {
+                    properties.push(Cow::Owned(self.static_property_key(&member.expression)?));
+                    expr = &member.object;
+                }
+                Expression::SequenceExpression(seq) if properties.is_empty() => {
+                    let (last, leading) = seq.expressions.split_last()?;
+                    if !leading
+                        .iter()
+                        .all(|item| sink_literal_value(item).is_some())
+                    {
+                        return None;
+                    }
+                    expr = last;
+                }
+                _ => return None,
+            }
+        };
+        Some(join_member_path(root, &properties))
+    }
+
+    /// Flatten the object of a member sink to a dotted path when
+    /// [`Self::static_callee_path`] cannot: a `this` root, TypeScript
+    /// wrappers (`el!`, `el as T`), optional chains (`a?.b`) and calls, which
+    /// keep a `()` suffix (`document.createRange()`). Only member-assign
+    /// objects, [`OBJECT_ROOTED_HTML_METHODS`] and
+    /// [`OBJECT_ROOTED_RAW_SQL_METHODS`] use this path, so call rows with
+    /// broad patterns do not see these roots.
+    fn sink_object_path(&self, expr: &Expression<'_>) -> Option<String> {
+        let mut segments: Vec<String> = Vec::new();
+        let mut calls = 0_usize;
+        let mut expr = expr;
+        loop {
+            crate::cost::walk_step();
+            let (segment, next): (Cow<'_, str>, Option<&Expression<'_>>) =
+                match unwrap_static_expr(expr) {
+                    Expression::Identifier(ident) => (Cow::Borrowed(ident.name.as_str()), None),
+                    Expression::ThisExpression(_) => (Cow::Borrowed("this"), None),
+                    Expression::StaticMemberExpression(member) => (
+                        Cow::Borrowed(member.property.name.as_str()),
+                        Some(&member.object),
+                    ),
+                    Expression::ComputedMemberExpression(member) => (
+                        Cow::Owned(self.static_property_key(&member.expression)?),
+                        Some(&member.object),
+                    ),
+                    Expression::CallExpression(call) => {
+                        calls += 1;
+                        expr = &call.callee;
+                        continue;
+                    }
+                    Expression::ChainExpression(chain) => match &chain.expression {
+                        ChainElement::StaticMemberExpression(member) => (
+                            Cow::Borrowed(member.property.name.as_str()),
+                            Some(&member.object),
+                        ),
+                        ChainElement::ComputedMemberExpression(member) => (
+                            Cow::Owned(self.static_property_key(&member.expression)?),
+                            Some(&member.object),
+                        ),
+                        ChainElement::CallExpression(call) => {
+                            calls += 1;
+                            expr = &call.callee;
+                            continue;
+                        }
+                        ChainElement::TSNonNullExpression(non_null) => {
+                            expr = &non_null.expression;
+                            continue;
+                        }
+                        ChainElement::PrivateFieldExpression(_) => return None,
+                    },
+                    _ => return None,
+                };
+            let mut segment = segment.into_owned();
+            for _ in 0..calls {
+                segment.push_str("()");
+            }
+            calls = 0;
+            segments.push(segment);
+            match next {
+                Some(object) => expr = object,
+                None => break,
+            }
+        }
+        segments.reverse();
+        Some(segments.join("."))
+    }
+
+    /// The callee path of a call sink. A method in
+    /// [`OBJECT_ROOTED_HTML_METHODS`] or [`OBJECT_ROOTED_RAW_SQL_METHODS`]
+    /// also resolves on an object that only [`Self::sink_object_path`] can
+    /// flatten.
+    fn call_sink_callee_path(&self, callee: &Expression<'_>) -> Option<String> {
+        self.security_callee_path(callee).or_else(|| {
+            let method = super::visit_helpers::terminal_static_member_name(callee)?;
+            if !OBJECT_ROOTED_HTML_METHODS.contains(&method)
+                && !OBJECT_ROOTED_RAW_SQL_METHODS.contains(&method)
+            {
+                return None;
+            }
+            self.sink_object_path(callee)
+        })
+    }
+
+    /// A computed property key that folds to a constant identifier-like string.
+    /// Keys with a `.` are rejected, because they would split into two path
+    /// segments.
+    fn static_property_key(&self, expr: &Expression<'_>) -> Option<String> {
+        let key = self.static_string_value(expr)?;
+        (!key.is_empty() && !key.contains('.')).then_some(key)
+    }
+
+    /// Fold string literals, substitution-free templates, module constants and
+    /// `+` concatenations of those to one string.
+    fn static_string_value(&self, expr: &Expression<'_>) -> Option<String> {
+        crate::cost::walk_step();
+        if let Some(value) = static_string_literal_value(expr) {
+            return Some(value);
+        }
+        if let Expression::BinaryExpression(bin) = unwrap_static_expr(expr) {
+            if bin.operator != BinaryOperator::Addition {
+                return None;
+            }
+            let mut value = self.static_string_value(&bin.left)?;
+            value.push_str(&self.static_string_value(&bin.right)?);
+            return Some(value);
+        }
+        match self.static_sink_literal_value(expr)? {
+            SinkLiteralValue::String(value) => Some(value),
+            SinkLiteralValue::Integer(_)
+            | SinkLiteralValue::Boolean(_)
+            | SinkLiteralValue::Null => None,
+        }
+    }
+
+    pub(super) fn record_sink_alias_bindings(&mut self, name: &str, init: &Expression<'_>) {
+        let binding = self.sink_binding_of_value(name, init);
+        if let Some(bindings) = self.declaration_sink_bindings(name) {
+            set_sink_binding(bindings, name, binding);
+        }
+        self.record_jsx_spread_object(name, init);
+    }
+
+    /// Record the members of a Node.js built-in module that an object pattern
+    /// takes from it (`const { runInThisContext: run } = require("vm")`).
+    pub(super) fn record_sink_pattern_bindings(
+        &mut self,
+        pattern: &ObjectPattern<'_>,
+        init: &Expression<'_>,
+    ) {
+        let module = self.node_binding_module_of_require(init);
+        for property in &pattern.properties {
+            let BindingPattern::BindingIdentifier(local) = &property.value else {
+                continue;
+            };
+            let name = local.name.as_str();
+            let binding = module.as_ref().and_then(|module| {
+                property
+                    .key
+                    .static_name()
+                    .map(|key| SinkBinding::NodeModuleMember(format!("{module}.{}", key.text())))
+            });
+            if let Some(bindings) = self.declaration_sink_bindings(name) {
+                set_sink_binding(bindings, name, binding);
+            }
+        }
+    }
+
+    /// Record a named ES import of a Node.js built-in module
+    /// (`import { runInContext as run } from "node:vm"`).
+    pub(super) fn record_import_sink_binding(&mut self, source: &str, imported: &str, local: &str) {
+        if let Some(module) = node_binding_module(source) {
+            self.sink_aliases.bindings.insert(
+                local.to_string(),
+                SinkBinding::NodeModuleMember(format!("{module}.{imported}")),
+            );
+        }
+    }
+
+    /// Record the DOMPurify and Node module sink bindings of a default or
+    /// namespace ES import (`import cp from "node:child_process"`,
+    /// `import * as vm from "vm"`). A Node module local then binds the
+    /// module, as `const cp = require(...)` does.
+    ///
+    /// A default or namespace import of `fs` keeps its written path
+    /// (`fs.readFile`). The ungated `fs.*` catalogue rows match that path,
+    /// and the gated `node:fs.*` rows lose an advisory file hit of the
+    /// security corpus.
+    pub(super) fn record_whole_module_import_bindings(
+        &mut self,
+        source: &str,
+        local: &str,
+        is_type_only: bool,
+    ) {
+        self.record_dompurify_import_binding(source, local, is_type_only);
+        if is_type_only {
+            return;
+        }
+        let Some(module) = node_binding_module(source) else {
+            return;
+        };
+        if module == "node:fs" {
+            return;
+        }
+        self.sink_aliases
+            .bindings
+            .insert(local.to_string(), SinkBinding::NodeModule(module));
+    }
+
+    /// Update the sink binding of `name` after a plain assignment
+    /// (`script = document.createElement("script")`). The binding lives in the
+    /// frame that declares the name, or at module scope for an undeclared
+    /// name.
+    pub(super) fn record_sink_assignment_binding(&mut self, name: &str, value: &Expression<'_>) {
+        if self.namespace_depth > 0 {
+            return;
+        }
+        let binding = self.sink_binding_of_value(name, value);
+        let frame = self
+            .nested_declaration_stack
+            .iter()
+            .rposition(|scope| scope.contains(name));
+        let bindings = match frame {
+            Some(index) => match self.sink_aliases.scoped_bindings.get_mut(index) {
+                Some(bindings) => bindings,
+                None => return,
+            },
+            None => &mut self.sink_aliases.bindings,
+        };
+        set_sink_binding(bindings, name, binding);
+    }
+
+    /// The binding map of the frame that declares `name`. Inside a namespace
+    /// the visitor keeps no frames, so no binding is recorded there.
+    fn declaration_sink_bindings(
+        &mut self,
+        name: &str,
+    ) -> Option<&mut FxHashMap<String, SinkBinding>> {
+        if self.namespace_depth > 0 {
+            return None;
+        }
+        let frame = if self.is_module_scope() {
+            None
+        } else {
+            self.nested_declaration_stack
+                .iter()
+                .rposition(|scope| scope.contains(name))
+                .or_else(|| self.nested_declaration_stack.len().checked_sub(1))
+        };
+        match frame {
+            Some(index) => self.sink_aliases.scoped_bindings.get_mut(index),
+            None => Some(&mut self.sink_aliases.bindings),
+        }
+    }
+
+    /// The sink binding that a value gives to `name`: an alias of a
+    /// code-executing global or of a Node.js module binding, a `require()` of
+    /// a module in [`NODE_BINDING_MODULES`](fallow_types::security_sinks::NODE_BINDING_MODULES), or a new `<script>` element.
+    fn sink_binding_of_value(&self, name: &str, value: &Expression<'_>) -> Option<SinkBinding> {
+        if is_create_script_element_call(value) {
+            return Some(SinkBinding::ScriptElement);
+        }
+        if let Some(module) = self.node_binding_module_of_require(value) {
+            return Some(SinkBinding::NodeModule(module));
+        }
+        let target = match unwrap_parens(value) {
+            Expression::Identifier(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+            | Expression::SequenceExpression(_) => self.security_callee_path(value)?,
+            _ => return None,
+        };
+        if target == name {
+            return None;
+        }
+        if CODE_EXEC_GLOBALS.contains(&target.as_str()) {
+            return Some(SinkBinding::CodeExec(target));
+        }
+        if target.starts_with("node:") {
+            return Some(if target.contains('.') {
+                SinkBinding::NodeModuleMember(target)
+            } else {
+                SinkBinding::NodeModule(target)
+            });
+        }
+        None
+    }
+
+    /// The `node:` path of `require("<module>")` for a module in
+    /// [`NODE_BINDING_MODULES`](fallow_types::security_sinks::NODE_BINDING_MODULES).
+    fn node_binding_module_of_require(&self, value: &Expression<'_>) -> Option<String> {
+        let (_, source) = self.try_extract_require(unwrap_static_expr(value))?;
+        node_binding_module(&source)
+    }
+
+    /// `el.setAttribute("srcdoc", html)` sets the same document as
+    /// `el.srcdoc = html`, so it is captured as that member-assign shape.
+    /// `script.setAttribute("src", url)` on a local bound to a new `<script>`
+    /// element becomes `HTMLScriptElement.src`. The `src` of another element
+    /// (`img.setAttribute("src", url)`) is not captured.
+    fn capture_set_attribute_sink(&mut self, expr: &CallExpression<'_>, callee_path: &str) {
+        let Some(object_path) = callee_path.strip_suffix(".setAttribute") else {
+            return;
+        };
+        let [name_arg, value_arg, ..] = expr.arguments.as_slice() else {
+            return;
+        };
+        let (Some(name_expr), Some(value_expr)) =
+            (name_arg.as_expression(), value_arg.as_expression())
+        else {
+            return;
+        };
+        let Some(name) = self.static_string_value(name_expr) else {
+            return;
+        };
+        let sink_path = if name.eq_ignore_ascii_case("srcdoc") {
+            format!("{object_path}.srcdoc")
+        } else if name.eq_ignore_ascii_case("src") {
+            let Expression::StaticMemberExpression(member) = unwrap_parens(&expr.callee) else {
+                return;
+            };
+            let Some(path) = self.script_element_assign_path(&member.object, "src") else {
+                return;
+            };
+            path
+        } else {
+            return;
+        };
+        self.push_security_sink_arg(PushSinkArgInput {
+            callee_path: &sink_path,
+            sink_shape: SinkShape::MemberAssign,
+            arg_index: 0,
+            arg_expr: value_expr,
+            url_arg_literal: None,
+            span: expr.span,
+        });
     }
 
     fn record_member_assign_sink(
@@ -1008,14 +1750,87 @@ impl ModuleInfoExtractor {
         let Some(value_expr) = container.expression.as_expression() else {
             return;
         };
-        if !is_non_literal_arg(value_expr) {
-            return;
+        if let Some(site) = self.jsx_prop_sink_site(name.name.as_str(), value_expr, attr.span) {
+            self.security_sinks.push(site);
         }
-        self.record_sanitized_sink_arg(attr.span.start, 0, value_expr);
+    }
+
+    /// Capture JSX props passed through a spread: an inline object literal
+    /// (`<div {...{ dangerouslySetInnerHTML: x }} />`) or a local bound to one
+    /// (`<div {...props} />`). The spread is the same as writing the props.
+    pub(super) fn capture_jsx_spread_sink(&mut self, spread: &JSXSpreadAttribute<'_>) {
+        match unwrap_parens(&spread.argument) {
+            Expression::ObjectExpression(obj) => {
+                for prop in &obj.properties {
+                    let ObjectPropertyKind::ObjectProperty(prop) = prop else {
+                        continue;
+                    };
+                    let Some(key) = prop.key.static_name().and_then(|name| name.into_cow_str())
+                    else {
+                        continue;
+                    };
+                    if let Some(site) = self.jsx_prop_sink_site(&key, &prop.value, prop.span) {
+                        self.security_sinks.push(site);
+                    }
+                }
+            }
+            Expression::Identifier(ident) => {
+                if let Some(sites) = self
+                    .sink_aliases
+                    .jsx_spread_object_sinks
+                    .remove(ident.name.as_str())
+                {
+                    self.security_sinks.extend(sites);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Remember the JSX sink props of a local bound to an object literal, so a
+    /// later spread of the local can emit them. Only props in
+    /// [`JSX_SPREAD_SINK_PROPS`] are kept; the site anchors on the property.
+    fn record_jsx_spread_object(&mut self, name: &str, init: &Expression<'_>) {
+        self.sink_aliases.jsx_spread_object_sinks.remove(name);
+        let Expression::ObjectExpression(obj) = unwrap_static_expr(init) else {
+            return;
+        };
+        let mut sites = Vec::new();
+        for prop in &obj.properties {
+            let ObjectPropertyKind::ObjectProperty(prop) = prop else {
+                continue;
+            };
+            let Some(key) = prop.key.static_name().and_then(|name| name.into_cow_str()) else {
+                continue;
+            };
+            if !JSX_SPREAD_SINK_PROPS.contains(&key.as_ref()) {
+                continue;
+            }
+            if let Some(site) = self.jsx_prop_sink_site(&key, &prop.value, prop.span) {
+                sites.push(site);
+            }
+        }
+        if !sites.is_empty() {
+            self.sink_aliases
+                .jsx_spread_object_sinks
+                .insert(name.to_string(), sites);
+        }
+    }
+
+    fn jsx_prop_sink_site(
+        &mut self,
+        name: &str,
+        value_expr: &Expression<'_>,
+        span: Span,
+    ) -> Option<SinkSite> {
+        if !is_non_literal_arg(value_expr) {
+            return None;
+        }
+        self.record_sanitized_sink_arg(span.start, 0, value_expr);
         let object_keys = object_key_metadata(value_expr);
-        self.security_sinks.push(SinkSite {
+        Some(SinkSite {
             sink_shape: SinkShape::JsxAttr,
-            callee_path: name.name.to_string(),
+            callee_path: name.to_string(),
             arg_index: 0,
             arg_is_non_literal: true,
             arg_kind: classify_arg_kind(value_expr),
@@ -1026,10 +1841,10 @@ impl ModuleInfoExtractor {
             arg_idents: collect_arg_idents(value_expr),
             arg_source_paths: collect_arg_source_paths(value_expr),
             regex_pattern: None,
-            span_start: attr.span.start,
-            span_end: attr.span.end,
+            span_start: span.start,
+            span_end: span.end,
             url_arg_literal: None,
             url_shape: None,
-        });
+        })
     }
 }

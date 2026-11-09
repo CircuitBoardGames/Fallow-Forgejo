@@ -74,6 +74,11 @@ impl Matcher {
             return true;
         };
         let leading_ident = callee_path.split('.').next().unwrap_or(callee_path);
+        // A `node:` root is not an identifier. The extractor writes it only
+        // for a binding that it traced to that module import.
+        if leading_ident.starts_with("node:") {
+            return import_source_matches(leading_ident, spec);
+        }
         let binding_trace = self.requires_binding_trace();
         let by_import = module.imports.iter().any(|import| {
             import_source_matches(&import.source, spec)
@@ -131,7 +136,7 @@ fn strip_node_prefix(value: &str) -> &str {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::expect_used,
     reason = "the tests look up catalogue rows that the catalogue must contain"
 )]
@@ -175,6 +180,7 @@ mod tests {
             span: Span::default(),
             source_span: Span::default(),
             destructured_names: destructured.iter().map(|&name| name.to_owned()).collect(),
+            destructured_locals: Vec::new(),
             local_name: local.map(str::to_owned),
             is_type_only: false,
         }
@@ -220,6 +226,27 @@ mod tests {
         assert!(tls.provenance_satisfied(&named, "get", ProvenanceBindings::Imports));
         let other = module(vec![import("https", "request")], Vec::new());
         assert!(!tls.provenance_satisfied(&other, "get", ProvenanceBindings::Imports));
+    }
+
+    #[test]
+    fn a_node_root_proves_only_its_own_module() {
+        let vm = row(
+            "code-injection",
+            SinkShape::MemberCall,
+            "node:vm.runInNewContext",
+        );
+        let bare = module(Vec::new(), Vec::new());
+        assert!(vm.provenance_satisfied(
+            &bare,
+            "node:vm.runInNewContext",
+            ProvenanceBindings::Imports
+        ));
+        assert!(!vm.provenance_satisfied(&bare, "vm.runInNewContext", ProvenanceBindings::Imports));
+        assert!(!vm.provenance_satisfied(
+            &bare,
+            "node:fs.runInNewContext",
+            ProvenanceBindings::Imports
+        ));
     }
 
     #[test]

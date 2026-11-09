@@ -13,6 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 #[path = "ci_references.rs"]
 mod references;
 
+use super::ci_action_inputs::StepActionInputs;
 use super::shell_helpers::HelperBase;
 use super::{
     IgnoredCommandEntries, ScriptCatalog, analyze_commands_with_context, could_be_file_path,
@@ -512,7 +513,7 @@ pub(super) fn extract_ci_steps(content: &str) -> Vec<CiCommand> {
             continue;
         }
 
-        scope.observe(line, trimmed, &mut commands);
+        scope.observe(line, line_index, trimmed, &mut commands);
         let default_dir = scope.default_dir();
 
         if let Some(rest) = yaml_run_value(trimmed) {
@@ -558,6 +559,7 @@ struct OpenStep {
     /// Step `env` variables whose whole value is a workspace anchor
     /// (`NAME: ${{ github.action_path }}`), with that anchor.
     anchor_aliases: Vec<(String, String)>,
+    action_inputs: StepActionInputs,
 }
 
 struct PendingDefaults {
@@ -570,7 +572,13 @@ impl WorkingDirectoryScope {
         self.defaults.last().map(|(_, dir)| dir.clone())
     }
 
-    fn observe(&mut self, line: &str, trimmed: &str, commands: &mut [CiCommand]) {
+    fn observe(
+        &mut self,
+        line: &str,
+        line_index: usize,
+        trimmed: &str,
+        commands: &mut Vec<CiCommand>,
+    ) {
         let indent = line.len() - line.trim_start().len();
         let column = run_key_column(line, trimmed);
         let item = trimmed.strip_prefix("- ").map(str::trim_start);
@@ -599,12 +607,15 @@ impl WorkingDirectoryScope {
                 working_directory: None,
                 env_column: None,
                 anchor_aliases: Vec::new(),
+                action_inputs: StepActionInputs::default(),
             });
         }
 
         let key = item.unwrap_or(trimmed);
         if let Some(step) = &mut self.step {
             step.observe_env(column, indent, key);
+            step.action_inputs
+                .observe(step.column, column, indent, key, line_index);
         }
         if let Some(value) = strip_yaml_key(key, "working-directory") {
             self.set_working_directory(column, indent, value.trim());
@@ -650,10 +661,11 @@ impl WorkingDirectoryScope {
         }
     }
 
-    fn close_step(&mut self, commands: &mut [CiCommand]) {
+    fn close_step(&mut self, commands: &mut Vec<CiCommand>) {
         let Some(step) = self.step.take() else {
             return;
         };
+        let action_commands = step.action_inputs.into_commands();
         for command in commands.iter_mut().skip(step.first_command) {
             if let Some(dir) = &step.working_directory {
                 command.working_directory = Some(dir.clone());
@@ -664,6 +676,7 @@ impl WorkingDirectoryScope {
                 }
             }
         }
+        commands.extend(action_commands);
     }
 }
 
@@ -696,7 +709,7 @@ impl OpenStep {
 }
 
 /// `text` without a trailing ` # comment`.
-fn strip_yaml_comment(text: &str) -> &str {
+pub(super) fn strip_yaml_comment(text: &str) -> &str {
     text.split_once(" #")
         .map_or(text, |(value, _)| value)
         .trim_end()
@@ -764,7 +777,7 @@ impl MultilineRunState {
 }
 
 /// Column of the `run` key itself, past any leading `- ` list indicator.
-pub(super) fn run_key_column(line: &str, trimmed: &str) -> usize {
+fn run_key_column(line: &str, trimmed: &str) -> usize {
     let base = line.len() - line.trim_start().len();
     match trimmed.strip_prefix("- ") {
         Some(rest) => base + 2 + (rest.len() - rest.trim_start().len()),
@@ -772,7 +785,7 @@ pub(super) fn run_key_column(line: &str, trimmed: &str) -> usize {
     }
 }
 
-pub(super) fn should_skip_ci_line(trimmed: &str) -> bool {
+fn should_skip_ci_line(trimmed: &str) -> bool {
     trimmed.is_empty() || trimmed.starts_with('#')
 }
 
@@ -825,7 +838,7 @@ fn yaml_run_value(trimmed: &str) -> Option<&str> {
 /// chomping indicator (`-`, `+`) and an explicit indentation indicator (`1`-`9`),
 /// in either order, matching the YAML block header grammar. A header carrying a
 /// trailing comment is still not recognized.
-pub(super) fn is_multiline_run_marker(value: &str) -> bool {
+fn is_multiline_run_marker(value: &str) -> bool {
     let mut chars = value.chars();
     if !matches!(chars.next(), Some('|' | '>')) {
         return false;
@@ -868,14 +881,14 @@ fn push_yaml_list_command(
 
 /// Strip a YAML key prefix from a line, returning the value part.
 /// Handles `key: value` and `key:` (empty value).
-pub(super) fn strip_yaml_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+fn strip_yaml_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let rest = line.strip_prefix(key)?;
     let rest = rest.strip_prefix(':')?;
     Some(rest)
 }
 
 /// Check if a string looks like a YAML mapping (key: value) rather than a shell command.
-pub(super) fn is_yaml_mapping(s: &str) -> bool {
+fn is_yaml_mapping(s: &str) -> bool {
     if let Some(first_word) = s.split_whitespace().next()
         && first_word.ends_with(':')
         && !first_word.starts_with("http")

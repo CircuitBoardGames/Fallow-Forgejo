@@ -19,7 +19,6 @@ use crate::cli_impact::{ImpactCrossRepoOpts, dispatch_impact};
 use crate::cli_production::{ProductionModes, resolve_production_modes};
 use crate::cli_startup::cli_global_baseline_flag;
 use crate::dupes::{DupesOptions, DupesOverrides};
-use crate::error::emit_error;
 use crate::health::HealthOptions;
 use crate::list::ListOptions;
 use crate::runtime_support::{AnalysisKind, LoadConfigArgs, load_config};
@@ -31,11 +30,23 @@ use crate::{
     report, resolve_audit_baseline_path, rule_pack, security, setup_hooks, similar_code_cli,
     suppressions, telemetry, trace_chain, trace_dependency, trace_error, trace_path, viz, watch,
 };
+use crate::{error::emit_input_error, exit_codes::exit_invalid_input};
 
 #[path = "dispatch_inspect.rs"]
 mod inspect_dispatch;
+#[path = "dispatch_type_aware_check.rs"]
+mod type_aware_check;
 #[path = "dispatch_type_aware.rs"]
 mod type_aware_status;
+
+use type_aware_check::validate_type_aware_check_options;
+#[path = "dispatch_baselines.rs"]
+mod baselines_dispatch;
+use baselines_dispatch::dispatch_baselines_command;
+
+#[path = "dispatch_audit_inputs.rs"]
+mod audit_inputs;
+use audit_inputs::resolve_audit_inputs;
 
 fn dispatch_mutation_command(
     dispatch: &DispatchContext<'_>,
@@ -51,11 +62,10 @@ fn dispatch_mutation_command(
         None
     };
     if let Some(flag) = workspace_flag {
-        return error::emit_error_with_style(
+        return error::emit_input_error_with_style(
             &format!(
                 "{flag} does not narrow `fallow mutation` yet; pass the workspace directory as a path, for example `fallow mutation packages/app`"
             ),
-            2,
             dispatch.output,
             dispatch.json_style,
         );
@@ -75,9 +85,8 @@ fn dispatch_mutation_command(
         ) {
             Ok(project) => project.config.mutation,
             Err(error) => {
-                return error::emit_error_with_style(
+                return error::emit_input_error_with_style(
                     &format!("failed to load config: {error}"),
-                    2,
                     dispatch.output,
                     dispatch.json_style,
                 );
@@ -103,7 +112,7 @@ fn dispatch_mutation_command(
     })
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "the command router is intentionally an exhaustive top-level dispatch table"
 )]
@@ -332,15 +341,13 @@ fn dispatch_type_aware_command(
                                 crate::report::sink::outln!("{json}");
                                 ExitCode::SUCCESS
                             }
-                            Err(error) => emit_error(
+                            Err(error) => emit_input_error(
                                 &format!("failed to serialize type-aware status: {error}"),
-                                2,
                                 dispatch.output,
                             ),
                         },
-                        Err(error) => emit_error(
+                        Err(error) => emit_input_error(
                             &format!("failed to build type-aware status: {error}"),
-                            2,
                             dispatch.output,
                         ),
                     }
@@ -374,9 +381,8 @@ fn dispatch_type_aware_command(
                     }
                     ExitCode::SUCCESS
                 }
-                _ => emit_error(
+                _ => emit_input_error(
                     "type-aware status supports human and json output",
-                    2,
                     dispatch.output,
                 ),
             }
@@ -450,7 +456,9 @@ fn dispatch_check_command(command: Command, dispatch: &DispatchContext<'_>) -> E
 
     let finding_ids = match fallow_engine::dead_code::FindingIdFilter::parse(&finding_id) {
         Ok(filter) => filter,
-        Err(message) => return emit_error(&format!("--finding-id: {message}"), 2, dispatch.output),
+        Err(message) => {
+            return emit_input_error(&format!("--finding-id: {message}"), dispatch.output);
+        }
     };
 
     let scope = match crate::scope_path::resolve_command_scope(dispatch.root, dispatch.output, path)
@@ -502,7 +510,9 @@ fn dispatch_architecture_command(command: Command, dispatch: &DispatchContext<'_
 
     let finding_ids = match fallow_engine::dead_code::FindingIdFilter::parse(&finding_id) {
         Ok(filter) => filter,
-        Err(message) => return emit_error(&format!("--finding-id: {message}"), 2, dispatch.output),
+        Err(message) => {
+            return emit_input_error(&format!("--finding-id: {message}"), dispatch.output);
+        }
     };
 
     let scope = match crate::scope_path::resolve_command_scope(dispatch.root, dispatch.output, path)
@@ -531,7 +541,7 @@ fn dispatch_architecture_command(command: Command, dispatch: &DispatchContext<'_
             file,
             scope,
             finding_ids,
-            surface: check::CheckSurface::Architecture,
+            surface: check::CheckSurface::architecture(cycles, boundaries, policy),
         },
     )
 }
@@ -576,6 +586,7 @@ fn check_issue_filters_core(command: &Command) -> IssueFilters {
         unresolved_imports,
         unlisted_deps,
         duplicate_exports,
+        duplicate_export_aliases,
         circular_deps,
         re_export_cycles,
         package_cycles,
@@ -601,6 +612,7 @@ fn check_issue_filters_core(command: &Command) -> IssueFilters {
         ("--unresolved-imports", *unresolved_imports),
         ("--unlisted-deps", *unlisted_deps),
         ("--duplicate-exports", *duplicate_exports),
+        ("--duplicate-export-aliases", *duplicate_export_aliases),
         ("--circular-deps", *circular_deps),
         ("--re-export-cycles", *re_export_cycles),
         ("--package-cycles", *package_cycles),
@@ -617,6 +629,7 @@ fn check_issue_filters_core(command: &Command) -> IssueFilters {
 /// catalog, and dependency-override flags, layered onto the core `base`.
 fn check_issue_filters_framework(command: &Command, base: &IssueFilters) -> IssueFilters {
     let Command::Check {
+        unused_namespace_members,
         unused_store_members,
         unprovided_injects,
         unrendered_components,
@@ -631,6 +644,7 @@ fn check_issue_filters_framework(command: &Command, base: &IssueFilters) -> Issu
         unproduced_catch_tags,
         unused_server_actions,
         unused_load_data_keys,
+        unlisted_binaries,
         unused_catalog_entries,
         empty_catalog_groups,
         unresolved_catalog_references,
@@ -644,6 +658,7 @@ fn check_issue_filters_framework(command: &Command, base: &IssueFilters) -> Issu
 
     let mut filters = base.clone();
     for (flag, active) in [
+        ("--unused-namespace-members", *unused_namespace_members),
         ("--unused-store-members", *unused_store_members),
         ("--unprovided-injects", *unprovided_injects),
         ("--unrendered-components", *unrendered_components),
@@ -658,6 +673,7 @@ fn check_issue_filters_framework(command: &Command, base: &IssueFilters) -> Issu
         ("--unproduced-catch-tags", *unproduced_catch_tags),
         ("--unused-server-actions", *unused_server_actions),
         ("--unused-load-data-keys", *unused_load_data_keys),
+        ("--unlisted-binaries", *unlisted_binaries),
         ("--unused-catalog-entries", *unused_catalog_entries),
         ("--empty-catalog-groups", *empty_catalog_groups),
         (
@@ -747,9 +763,8 @@ fn dispatch_trace_command(
         });
     }
     let Some(symbol) = symbol else {
-        return emit_error(
+        return emit_input_error(
             "trace requires a FILE:SYMBOL target or --path <FROM> <TO>",
-            2,
             dispatch.output,
         );
     };
@@ -967,9 +982,8 @@ fn validate_security_survivors_flags(flags: &SecurityDerivedFlagState<'_>) -> Op
     } else {
         None
     }?;
-    Some(emit_error(
+    Some(emit_input_error(
         &format!("{flag} is not valid with `fallow security survivors`."),
-        2,
         flags.output,
     ))
 }
@@ -996,9 +1010,8 @@ fn validate_security_blind_spots_flags(flags: &SecurityDerivedFlagState<'_>) -> 
     } else {
         None
     }?;
-    Some(emit_error(
+    Some(emit_input_error(
         &format!("{flag} is not valid with `fallow security blind-spots`."),
-        2,
         flags.output,
     ))
 }
@@ -1412,9 +1425,8 @@ fn dispatch_audit_cache_command(
     match subcommand {
         AuditCacheCli::Remove { dry_run, yes } => {
             if !*dry_run && !*yes && !std::io::stdin().is_terminal() {
-                return emit_error(
+                return emit_input_error(
                     "audit-cache remove requires --yes (or --force) in non-interactive environments. Use --dry-run to preview removal first, then pass --yes to confirm.",
-                    2,
                     dispatch.output,
                 );
             }
@@ -1457,15 +1469,14 @@ fn dispatch_audit_cache_command(
                     if report.skipped == 0 {
                         ExitCode::SUCCESS
                     } else {
-                        ExitCode::from(2)
+                        exit_invalid_input()
                     }
                 }
-                Err(error) => emit_error(
+                Err(error) => emit_input_error(
                     &format!(
                         "failed to remove audit caches for {}: {error}",
                         dispatch.root.display()
                     ),
-                    2,
                     dispatch.output,
                 ),
             }
@@ -1484,101 +1495,6 @@ fn dispatch_audit_cache_command(
             quiet: dispatch.quiet,
         }),
     }
-}
-
-fn dispatch_baselines_command(
-    dispatch: &DispatchContext<'_>,
-    subcommand: &BaselinesCli,
-) -> ExitCode {
-    let BaselinesCli::Prune {
-        check,
-        dead_code_baseline,
-        health_baseline,
-        dupes_baseline,
-        coverage,
-        coverage_root,
-    } = subcommand;
-    let cli = dispatch.cli;
-    let root = dispatch.root;
-    let output = dispatch.output;
-    if let Some(flag) = baselines::narrowing_flag(cli) {
-        return emit_error(
-            &format!(
-                "`fallow baselines prune` runs one analysis over the whole project, in production mode with --production or config, so it does not accept `{flag}`. A narrowed run would remove valid entries."
-            ),
-            2,
-            output,
-        );
-    }
-    if let Some(flag) = cli_global_baseline_flag(cli) {
-        return emit_error(
-            &format!(
-                "`fallow baselines prune` does not accept `{flag}`. Name the files with --dead-code-baseline, --health-baseline and --dupes-baseline, or with `audit.*Baseline` in the config."
-            ),
-            2,
-            output,
-        );
-    }
-    let config = match load_config(
-        root,
-        &cli.config,
-        LoadConfigArgs {
-            output,
-            no_cache: cli.no_cache,
-            threads: dispatch.threads,
-            production: false,
-            quiet: dispatch.quiet,
-            allow_remote_extends: cli.allow_remote_extends,
-        },
-    ) {
-        Ok(config) => config,
-        Err(code) => return code,
-    };
-    let targets = baselines::prune_targets(
-        root,
-        &config.audit,
-        [dead_code_baseline, health_baseline, dupes_baseline],
-    );
-    if targets.dead_code.is_none() && targets.health.is_none() && targets.dupes.is_none() {
-        return emit_error(
-            "no baseline to prune. Set `audit.deadCodeBaseline`, `audit.healthBaseline` or `audit.dupesBaseline` in the config, or pass --dead-code-baseline, --health-baseline or --dupes-baseline",
-            2,
-            output,
-        );
-    }
-    let production = match resolve_production_modes(cli, root, output, false, false, false) {
-        Ok(production) => production,
-        Err(code) => return code,
-    };
-    let coverage_inputs = match resolve_coverage_inputs(
-        coverage.as_deref(),
-        coverage_root.as_deref(),
-        output,
-        || Ok(config.health),
-    ) {
-        Ok(inputs) => inputs,
-        Err(code) => return code,
-    };
-    baselines::run_baselines_prune(&baselines::BaselinesPruneOptions {
-        root,
-        config_path: &cli.config,
-        output,
-        json_style: dispatch.json_style,
-        no_cache: cli.no_cache,
-        threads: dispatch.threads,
-        quiet: dispatch.quiet,
-        allow_remote_extends: cli.allow_remote_extends,
-        check: *check,
-        targets,
-        production,
-        mode_flags: fallow_output::BaselineMode {
-            production: cli.production,
-            include_entry_exports: cli.include_entry_exports,
-        },
-        coverage: coverage_inputs.coverage.as_deref(),
-        coverage_root: coverage_inputs.coverage_root.as_deref(),
-        regression_opts: dispatch.regression_opts(true),
-    })
 }
 
 fn dispatch_flags_command(
@@ -2141,9 +2057,8 @@ fn dispatch_list(dispatch: &DispatchContext<'_>, args: &ListDispatchArgs) -> Exi
         let tolerance = match regression::Tolerance::parse(&cli.tolerance) {
             Ok(tolerance) => tolerance,
             Err(message) => {
-                return emit_error(
+                return emit_input_error(
                     &format!("invalid --tolerance: {message}"),
-                    2,
                     dispatch.output,
                 );
             }
@@ -2265,73 +2180,6 @@ fn dispatch_check_run(
         explain_skipped: cli.explain_skipped,
         surface: args.surface,
     })
-}
-
-fn validate_type_aware_check_options(
-    dispatch: &DispatchContext<'_>,
-    args: &CheckDispatchArgs,
-) -> Option<ExitCode> {
-    let output = dispatch.output;
-    if !args.type_aware_project.is_empty() && args.type_aware != Some(true) {
-        return Some(emit_error(
-            "--type-aware-project requires --type-aware",
-            2,
-            output,
-        ));
-    }
-    if args.type_aware_require.is_some() && args.type_aware != Some(true) {
-        return Some(emit_error(
-            "--type-aware-require requires --type-aware",
-            2,
-            output,
-        ));
-    }
-    if args.trace_opts.symbol_impact.is_some() && args.type_aware != Some(true) {
-        return Some(emit_error(
-            "--symbol-impact requires --type-aware",
-            2,
-            output,
-        ));
-    }
-    let focused_output = args.trace_opts.trace_export.is_some()
-        || args.trace_opts.trace_file.is_some()
-        || args.trace_opts.trace_dependency.is_some()
-        || args.trace_opts.impact_closure.is_some()
-        || args.trace_opts.symbol_impact.is_some();
-    if focused_output
-        && !matches!(
-            output,
-            fallow_config::OutputFormat::Human | fallow_config::OutputFormat::Json
-        )
-    {
-        return Some(emit_error(
-            "focused trace and impact queries support human and JSON output",
-            2,
-            output,
-        ));
-    }
-    if args.type_aware == Some(true)
-        && !matches!(
-            output,
-            fallow_config::OutputFormat::Human
-                | fallow_config::OutputFormat::Json
-                | fallow_config::OutputFormat::Sarif
-                | fallow_config::OutputFormat::Compact
-                | fallow_config::OutputFormat::Markdown
-                | fallow_config::OutputFormat::CodeClimate
-                | fallow_config::OutputFormat::PrCommentGithub
-                | fallow_config::OutputFormat::PrCommentGitlab
-                | fallow_config::OutputFormat::ReviewGithub
-                | fallow_config::OutputFormat::ReviewGitlab
-        )
-    {
-        return Some(emit_error(
-            "--type-aware supports human, JSON, SARIF, compact, markdown, CodeClimate, PR-comment, and review output; pair presentation formats with the JSON artifact to preserve semantic provenance",
-            2,
-            output,
-        ));
-    }
-    None
 }
 
 /// Resolve the three-state `ignoreImports` CLI override from the opt-in /
@@ -2480,9 +2328,8 @@ fn dispatch_audit(dispatch: &DispatchContext<'_>, args: &AuditDispatchArgs) -> E
     let output = dispatch.output;
 
     if cli.baseline.is_some() || cli.save_baseline.is_some() {
-        return emit_error(
+        return emit_input_error(
             "audit uses per-analysis baselines. Use --dead-code-baseline, --health-baseline, or --dupes-baseline (or save them with `fallow dead-code|health|dupes --save-baseline <file>`)",
-            2,
             output,
         );
     }
@@ -2531,100 +2378,6 @@ fn dispatch_audit(dispatch: &DispatchContext<'_>, args: &AuditDispatchArgs) -> E
 
 const fn audit_renders_brief(args: &AuditDispatchArgs) -> bool {
     args.brief || args.walkthrough_guide || args.walkthrough || args.walkthrough_file.is_some()
-}
-
-fn resolve_audit_inputs(
-    dispatch: &DispatchContext<'_>,
-    args: &AuditDispatchArgs,
-) -> Result<ResolvedAuditInputs, ExitCode> {
-    let cli = dispatch.cli;
-    let root = dispatch.root;
-    let output = dispatch.output;
-    let config = load_config(
-        root,
-        &cli.config,
-        LoadConfigArgs {
-            output,
-            no_cache: cli.no_cache,
-            threads: dispatch.threads,
-            production: cli.production,
-            quiet: dispatch.quiet,
-            allow_remote_extends: cli.allow_remote_extends,
-        },
-    )?;
-    let cache_dir = config.cache_dir.clone();
-    let audit_cfg = config.audit;
-    let file_lines_check = config.health.file_lines_check_enabled();
-    let production = resolve_production_modes(
-        cli,
-        root,
-        output,
-        args.production_dead_code,
-        args.production_health,
-        args.production_dupes,
-    )?;
-    let analyses = resolve_audit_analyses(&audit_cfg, args);
-    if !(analyses.dead_code || analyses.health || analyses.dupes) {
-        return Err(emit_error(
-            "this audit selects no sub-analysis: --skip and the audit.deadCode, audit.health and audit.dupes config keys leave nothing to run",
-            2,
-            output,
-        ));
-    }
-    // A skipped sub-analysis reads no baseline. An explicit flag for one is a
-    // mistake; a configured one is dropped so the baseline gates do not see it.
-    let baseline = |enabled: bool, flag: &str, cli_path: Option<&Path>, cfg_path: Option<&str>| {
-        if enabled {
-            return Ok(resolve_audit_baseline_path(root, cli_path, cfg_path));
-        }
-        if cli_path.is_some() {
-            return Err(emit_error(
-                &format!(
-                    "{flag} has no effect: this audit skips that sub-analysis (--only, --skip or the audit config)"
-                ),
-                2,
-                output,
-            ));
-        }
-        Ok(None)
-    };
-    let resolved_dead_code_baseline = baseline(
-        analyses.dead_code,
-        "--dead-code-baseline",
-        args.dead_code_baseline.as_deref(),
-        audit_cfg.dead_code_baseline.as_deref(),
-    )?;
-    let resolved_health_baseline = baseline(
-        analyses.health,
-        "--health-baseline",
-        args.health_baseline.as_deref(),
-        audit_cfg.health_baseline.as_deref(),
-    )?;
-    let resolved_dupes_baseline = baseline(
-        analyses.dupes,
-        "--dupes-baseline",
-        args.dupes_baseline.as_deref(),
-        audit_cfg.dupes_baseline.as_deref(),
-    )?;
-    let coverage_inputs = resolve_coverage_inputs(
-        args.coverage.as_deref(),
-        args.coverage_root.as_deref(),
-        output,
-        || Ok(config.health),
-    )?;
-
-    Ok(ResolvedAuditInputs {
-        audit_cfg,
-        analyses,
-        cache_dir,
-        production,
-        dead_code_baseline: resolved_dead_code_baseline,
-        health_baseline: resolved_health_baseline,
-        dupes_baseline: resolved_dupes_baseline,
-        coverage: coverage_inputs.coverage,
-        coverage_root: coverage_inputs.coverage_root,
-        file_lines_check,
-    })
 }
 
 /// Name the health-only flags that a skipped health sub-analysis leaves without
@@ -2901,7 +2654,7 @@ pub fn resolve_coverage_inputs(
     };
 
     fallow_api::resolve_coverage_inputs(explicit, env, config_health.as_ref())
-        .map_err(|err| emit_error(&err.to_string(), 2, output))
+        .map_err(|err| emit_input_error(&err.to_string(), output))
 }
 
 /// [`resolve_coverage_inputs`] for commands that load config lazily: the
@@ -2941,11 +2694,10 @@ fn validate_health_report_only_gate(
     output: fallow_config::OutputFormat,
 ) -> Result<(), ExitCode> {
     if report_only && (min_score.is_some() || min_severity.is_some()) {
-        return Err(emit_error(
+        return Err(emit_input_error(
             "--report-only cannot be combined with --min-score or --min-severity. \
              --report-only always exits 0; drop it to gate on score/severity, or \
              drop the gate flags to stay advisory.",
-            2,
             output,
         ));
     }

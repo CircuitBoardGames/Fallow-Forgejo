@@ -15,8 +15,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::manifest::RunnerRange;
 use super::protocol::{
-    Capabilities, DryRunResult, InitRequest, LinkFault, Ready, ReloadMethod, Request, Response,
-    RunRequest, RunResult, RunStatus, TestStatus,
+    Capabilities, DryRunResult, DryTest, InitRequest, LinkFault, Ready, ReloadMethod, Request,
+    Response, RunRequest, RunResult, RunStatus, TestStatus,
 };
 use super::transport::{CompanionLink, CompanionSpawner, SpawnFailure};
 use super::{MutationProgress, MutationProgressSink};
@@ -25,8 +25,16 @@ use retry_set::{confirmation_tests, fastest_first, retry_extra_ms, whole_files};
 
 mod classification;
 pub(super) mod control;
+mod dry_facts;
+mod issues;
 mod retry_set;
-use classification::{attempt_record, classify, kill_kind, matrix_evidence};
+pub mod targets;
+mod window;
+use classification::{attempt_record, classify, is_load_kill, kill_kind, matrix_evidence};
+use dry_facts::{DryRunFacts, covering_tests, read_dry_run, record_dry_run, reported_duplicates};
+use issues::{no_covering_test_message, static_map_miss_issue, undiscovered_issue};
+use targets::{config_targets, job_targets};
+use window::{loop_budget_ms, round_ms, scaled_ms, settles_loop_timeout, timeout_ms};
 mod stored;
 
 pub use stored::{CachedResult, OutcomeJournal, ResultLookup};
@@ -40,10 +48,6 @@ use control::{
 
 /// The extra wait of the watchdog after `timeout_ms` (section 8).
 const WATCHDOG_GRACE_MS: u64 = 2000;
-/// The fixed part of `timeout_ms` (section 8, the Stryker default).
-const TIMEOUT_BASE_MS: u64 = 5000;
-/// The factor on the covering-test duration (section 8, the Stryker default).
-const TIMEOUT_FACTOR: f64 = 1.5;
 /// The factor on the first dry-run time, for each worker, in the dry-run
 /// timeout of a respawned companion.
 const RESPAWN_DRY_RUN_FACTOR: u32 = 2;
@@ -71,6 +75,11 @@ pub struct SchedulePlan {
     /// covering test does not use the limit: the first covered pending
     /// mutants in rank order run in its place.
     pub pending: Vec<ScheduledMutant>,
+    /// The mutants that the `--mutants-per-line` limit left out. The
+    /// scheduler never runs them. A mutant that no passing dry-run test
+    /// covers gets `no_coverage`, so the coverage does not depend on the
+    /// limit.
+    pub sampled_out: Vec<ScheduledMutant>,
     /// Each mutant id of the plan. A hit outside this set stops the run.
     pub known_ids: FxHashSet<String>,
     /// The static test files of the plan.
@@ -90,6 +99,10 @@ pub struct ScheduleConfig {
     pub concurrency: usize,
     /// Collect exact test-to-mutant kill evidence without bail.
     pub kill_matrix: bool,
+    /// The `--kill-matrix-for` targets: test files or runner test ids. Empty
+    /// outside target mode. In target mode, a mutant runs its covering target
+    /// tests without bail, then its other covering tests with bail.
+    pub targets: Vec<String>,
     /// The timeout of `init` and the first `dry_run`. It is also the minimum
     /// dry-run timeout of a respawned companion.
     pub runner_timeout: Duration,
@@ -199,6 +212,9 @@ pub struct ScheduleOutcome {
     /// The pending mutants that took the place of an uncovered planned
     /// mutant inside the `--max-mutants` limit, in rank order.
     pub promoted: Vec<String>,
+    /// Each `--kill-matrix-for` target with the dry-run tests that it
+    /// selects, in the given order. Empty outside target mode.
+    pub targets: Vec<targets::ResolvedTarget>,
 }
 
 impl ScheduleOutcome {
@@ -217,6 +233,7 @@ impl ScheduleOutcome {
             workers: 0,
             cache_keys: FxHashMap::default(),
             promoted: Vec::new(),
+            targets: Vec::new(),
         }
     }
 }
@@ -242,6 +259,13 @@ pub enum ScheduleError {
     /// The control run of the self-check, with no active mutant, did not pass
     /// through the run path of a mutant run.
     RunPath { message: String, help: String },
+    /// A `--kill-matrix-for` target selects no test of the dry run.
+    UnmatchedTargets(Vec<String>),
+    /// The runner cannot run a subset of the tests of a file, so the target
+    /// tests cannot run apart from the other tests.
+    TargetsNeedTestFilter,
+    /// A `--kill-matrix-for` target selects a test with a duplicate test id.
+    DuplicateTargetTestIds(Vec<String>),
 }
 
 impl std::fmt::Display for ScheduleError {
@@ -260,6 +284,15 @@ impl std::fmt::Display for ScheduleError {
                 "the test suite fails with no active mutant: {}",
                 messages.join("; ")
             ),
+            Self::UnmatchedTargets(targets) => write!(
+                f,
+                "these --kill-matrix-for targets select no test of the dry run: {}; the dry run runs the test files that reach the planned code",
+                targets.join(", ")
+            ),
+            Self::TargetsNeedTestFilter => f.write_str(
+                "the runner cannot run single tests, so --kill-matrix-for cannot run the target tests apart from the other tests",
+            ),
+            Self::DuplicateTargetTestIds(ids) => f.write_str(&targets::duplicate_message(ids)),
         }
     }
 }
@@ -270,7 +303,14 @@ struct Job {
     id: String,
     /// The covering tests, fastest first.
     tests: Vec<String>,
+    /// The covering `--kill-matrix-for` target tests, fastest first. Empty
+    /// outside target mode.
+    targets: Vec<String>,
     timeout_ms: u64,
+    /// The test CPU time after which the companion ends a test that still
+    /// evaluates instrumented code: `1.5 *` the covering-test time plus
+    /// [`window::LOOP_BUDGET_BASE_MS`].
+    loop_budget_ms: u64,
     /// `1.5 *` the setup time of the covering test files, rounded up. Only
     /// the watchdog waits for it (section 8).
     setup_ms: u64,
@@ -316,6 +356,7 @@ impl Job {
     /// and a real infinite loop still times out.
     fn with_doubled_timeout(mut self) -> Self {
         self.timeout_ms = self.timeout_ms.saturating_mul(2);
+        self.loop_budget_ms = self.loop_budget_ms.saturating_mul(2);
         self.setup_ms = self.setup_ms.saturating_mul(2);
         self
     }
@@ -326,6 +367,7 @@ impl Job {
     fn for_confirmation(mut self) -> Self {
         if let Some((tests, timeout_ms)) = self.confirmation.take() {
             self.first_tests = std::mem::replace(&mut self.tests, tests);
+            self.loop_budget_ms = loop_budget_ms(timeout_ms);
             self.timeout_ms = timeout_ms;
         }
         self
@@ -355,8 +397,8 @@ struct Attempt {
     /// The covering tests that the companion left out, because they did not
     /// pass in its dry run or in a control run.
     dropped_tests: Vec<String>,
-    /// A failed control run decided the status, so a retry in a new
-    /// companion cannot change it.
+    /// A failed control run or a loop timeout of a short job decided the
+    /// status, so a retry in a new companion cannot change it.
     settled: bool,
 }
 
@@ -417,40 +459,6 @@ impl Attempt {
             settled: false,
         }
     }
-}
-
-/// `1.5 * duration`, rounded up. A duration that is not finite gives 0.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the duration sum is finite and non-negative"
-)]
-fn scaled_ms(duration_ms: f64) -> u64 {
-    let scaled = (duration_ms.max(0.0) * TIMEOUT_FACTOR).ceil();
-    if scaled.is_finite() { scaled as u64 } else { 0 }
-}
-
-/// `timeout_ms = 1.5 * covering-test duration + 5000`, rounded up.
-fn timeout_ms(total_duration_ms: f64) -> u64 {
-    scaled_ms(total_duration_ms) + TIMEOUT_BASE_MS
-}
-
-/// True for a kill with no executed test: an error outside each test is the
-/// only evidence. A mutant that throws at module load gives this result, and
-/// so does a run path that executes no test at all.
-fn is_load_kill(result: &RunResult, status: MutantStatus, killed_by: Option<&String>) -> bool {
-    status == MutantStatus::Killed && killed_by.is_none() && result.tests_executed == 0
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "durations are finite and non-negative milliseconds"
-)]
-fn round_ms(value: Option<f64>) -> Option<u64> {
-    value
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .map(|value| value.round() as u64)
 }
 
 /// A companion that has sent `ready` and a dry run.
@@ -586,8 +594,23 @@ impl<'a> Worker<'a> {
             .ok_or_else(|| EnsureError::Fault("the companion is gone".to_owned(), None))
     }
 
-    /// Runs `job` one time. `Err` stops the run.
+    /// Runs `job` one time. `Err` stops the run. A job with target tests
+    /// runs in two phases, see [`Self::attempt_targets`].
     fn attempt(&mut self, job: &Job, caps: Capabilities) -> Result<Attempt, ScheduleError> {
+        if job.targets.is_empty() {
+            return self.attempt_tests(job, caps, !self.config.kill_matrix);
+        }
+        self.attempt_targets(job, caps)
+    }
+
+    /// Runs the tests of `job` one time. Without `bail`, the attempt keeps
+    /// each killing test. `Err` stops the run.
+    fn attempt_tests(
+        &mut self,
+        job: &Job,
+        caps: Capabilities,
+        bail: bool,
+    ) -> Result<Attempt, ScheduleError> {
         let needs_reload = !caps.hot_switch || (job.static_mutant && !caps.fresh_modules_per_run);
         if needs_reload && self.link.is_some() {
             self.reload();
@@ -618,7 +641,8 @@ impl<'a> Worker<'a> {
             mutant_id: Some(job.id.clone()),
             test_ids: tests.clone(),
             timeout_ms: job.timeout_ms,
-            bail: !self.config.kill_matrix,
+            loop_budget_ms: Some(job.loop_budget_ms),
+            bail,
         });
         let watchdog = Duration::from_millis(job.watchdog_ms());
         let Some(link) = self.link.as_mut() else {
@@ -635,15 +659,18 @@ impl<'a> Worker<'a> {
                     load_kill = is_load_kill(&result, status, killed_by.as_ref());
                     let kind = kill_kind(&result, status, killed_by.as_deref());
                     let decided = Attempt::decided(status, killed_by, round_ms(result.duration_ms));
-                    let (killing_tests, kill_matrix_complete) = if self.config.kill_matrix {
-                        matrix_evidence(&tests, &result)
-                    } else {
+                    let (killing_tests, kill_matrix_complete) = if bail {
                         (Vec::new(), false)
+                    } else {
+                        matrix_evidence(&tests, &result)
                     };
                     Attempt {
                         killing_tests,
                         kill_matrix_complete: kill_matrix_complete && dropped_tests.is_empty(),
                         failure_kind: kind.or(decided.failure_kind),
+                        settled: status == MutantStatus::Timeout
+                            && result.loop_timeout
+                            && settles_loop_timeout(job.loop_budget_ms),
                         ..decided
                     }
                 }
@@ -905,6 +932,7 @@ impl<'a> Worker<'a> {
             mutant_id: None,
             test_ids: tests.clone(),
             timeout_ms,
+            loop_budget_ms: None,
             bail: false,
         });
         let watchdog = Duration::from_millis(timeout_ms + job.setup_ms + WATCHDOG_GRACE_MS);
@@ -997,182 +1025,58 @@ fn version_error(range: &RunnerRange, version: &str) -> ScheduleError {
     ))
 }
 
-/// The facts of the dry run that the scheduler uses.
-struct DryRunFacts {
-    /// Each passing test that is not in an excluded file, with its duration.
-    passing: BTreeMap<String, (String, f64)>,
-    covering: FxHashMap<String, BTreeSet<String>>,
-    static_ids: FxHashSet<String>,
-    baseline: Vec<BaselineFailure>,
-    /// The setup time of each test file outside its tests.
-    file_setup: BTreeMap<String, f64>,
-}
-
-impl DryRunFacts {
-    /// The setup time of the distinct test files of `tests`.
-    fn setup_of(&self, tests: &[String]) -> f64 {
-        let files: BTreeSet<&str> = tests
-            .iter()
-            .filter_map(|test| self.passing.get(test).map(|(file, _)| file.as_str()))
-            .collect();
-        files
-            .into_iter()
-            .filter_map(|file| self.file_setup.get(file))
-            .sum()
-    }
-}
-
-fn read_dry_run(
-    plan: &SchedulePlan,
-    caps: Capabilities,
-    result: &DryRunResult,
-) -> Result<DryRunFacts, ScheduleError> {
-    let reported = result
-        .hits
-        .values()
-        .flatten()
-        .chain(&result.static_hits)
-        .chain(
-            result
-                .file_hits
-                .iter()
-                .flat_map(|hits| hits.values().flatten()),
-        );
-    for id in reported {
-        if !plan.known_ids.contains(id) {
-            return Err(ScheduleError::UnknownHit(id.clone()));
-        }
-    }
-    let mut baseline = Vec::new();
-    let mut excluded_files = FxHashSet::default();
-    let mut global_errors = Vec::new();
-    for error in &result.unhandled_errors {
-        match &error.file {
-            Some(file) => {
-                excluded_files.insert(file.clone());
-                baseline.push(BaselineFailure {
-                    file: Some(file.clone()),
-                    test_id: None,
-                    message: Some(error.message.clone()),
-                    mutant_ids: Vec::new(),
-                });
-            }
-            None => global_errors.push(error.message.clone()),
-        }
-    }
-    if !global_errors.is_empty() {
-        return Err(ScheduleError::Baseline(global_errors));
-    }
-    let mut passing = BTreeMap::new();
-    for test in &result.tests {
-        match test.status {
-            TestStatus::Fail => baseline.push(BaselineFailure {
-                file: Some(test.file.clone()),
-                test_id: Some(test.test_id.clone()),
-                message: test.message.as_deref().and_then(bounded_test_error),
-                mutant_ids: Vec::new(),
-            }),
-            TestStatus::Pass if !excluded_files.contains(&test.file) => {
-                passing.insert(
-                    test.test_id.clone(),
-                    (test.file.clone(), test.duration_ms.unwrap_or(0.0)),
-                );
-            }
-            _ => {}
-        }
-    }
-    baseline.sort();
-    let mut covering: FxHashMap<String, BTreeSet<String>> = FxHashMap::default();
-    if caps.per_test_attribution {
-        for (test, ids) in &result.hits {
-            if !passing.contains_key(test) {
-                continue;
-            }
-            for id in ids {
-                covering.entry(id.clone()).or_default().insert(test.clone());
-            }
-        }
-    } else if let Some(file_hits) = &result.file_hits {
-        for (file, ids) in file_hits {
-            let tests: Vec<&String> = passing
-                .iter()
-                .filter(|(_, (test_file, _))| test_file == file)
-                .map(|(test, _)| test)
-                .collect();
-            for id in ids {
-                covering
-                    .entry(id.clone())
-                    .or_default()
-                    .extend(tests.iter().map(|test| (*test).clone()));
-            }
-        }
-    }
-    let static_ids = result.static_hits.iter().cloned().collect();
-    Ok(DryRunFacts {
-        passing,
-        covering,
-        static_ids,
-        baseline,
-        file_setup: result.file_setup_ms.clone(),
-    })
-}
-
-/// The covering tests of `mutant` from the dry run. A static mutant runs
-/// each passing test of the dry-run files that load its module, and also the
-/// tests that hit it at run time (for example through a dynamic `import()`).
-/// A static map miss has no static test file, so it runs each passing
-/// dry-run test.
-fn covering_tests(
-    plan: &SchedulePlan,
-    facts: &DryRunFacts,
-    dry_files: &[String],
-    mutant: &ScheduledMutant,
-    static_mutant: bool,
-    map_miss: bool,
-) -> BTreeSet<String> {
-    if !static_mutant {
-        return facts.covering.get(&mutant.id).cloned().unwrap_or_default();
-    }
-    let files: FxHashSet<&String> = plan
-        .file_test_files
-        .get(&mutant.file)
-        .into_iter()
-        .flatten()
-        .filter(|file| dry_files.contains(file))
-        .collect();
-    let mut tests: BTreeSet<String> = facts
-        .passing
-        .iter()
-        .filter(|(_, (file, _))| map_miss || files.contains(file))
-        .map(|(test, _)| test.clone())
-        .collect();
-    if let Some(runtime) = facts.covering.get(&mutant.id) {
-        tests.extend(runtime.iter().cloned());
-    }
-    tests
-}
-
 /// The facts of the first companion that the jobs read.
 struct JobContext<'a> {
     dry_files: &'a [String],
     kill_matrix: bool,
+    /// The dry-run test ids that the `--kill-matrix-for` targets select.
+    /// `None` outside target mode.
+    targets: Option<&'a FxHashSet<String>>,
     ready: &'a Ready,
     cache: Option<&'a dyn ResultLookup>,
     journal: Option<&'a dyn OutcomeJournal>,
+    /// True when a time budget is set.
+    budgeted: bool,
 }
 
-/// The issue of a mutant that the dry run hit, while the static map reaches
-/// no test of its file.
-fn static_map_miss_issue(mutant: &ScheduledMutant) -> ScheduleIssue {
-    ScheduleIssue {
-        code: "static-map-miss",
-        message: format!(
-            "the dry run hit this mutant in `{}`, but the static map reaches no test of that file; the module graph misses a test that loads it",
-            mutant.file
-        ),
-        mutant_id: Some(mutant.id.clone()),
-        stderr_tail: None,
+impl JobContext<'_> {
+    /// True when the run keeps the killing tests of each mutant.
+    const fn collects_evidence(&self) -> bool {
+        self.kill_matrix || self.targets.is_some()
     }
+}
+
+/// Records a mutant that gets no job and returns true for it: a mutant with
+/// no covering test is `no_coverage`. Target mode runs only the mutants that
+/// a target test covers, so each other mutant is `pruned`. Neither uses a
+/// place inside the limit.
+fn record_unrun(
+    context: &JobContext<'_>,
+    mutant: &ScheduledMutant,
+    tests: &BTreeSet<String>,
+    static_mutant: bool,
+    outcome: &mut ScheduleOutcome,
+) -> bool {
+    let result = if tests.is_empty() {
+        MutantOutcome {
+            static_mutant,
+            ..MutantOutcome::no_coverage()
+        }
+    } else if context
+        .targets
+        .is_some_and(|targets| !tests.iter().any(|test| targets.contains(test)))
+    {
+        MutantOutcome {
+            status: MutantStatus::Pruned,
+            covering_tests: tests.iter().cloned().collect(),
+            static_mutant,
+            ..MutantOutcome::no_coverage()
+        }
+    } else {
+        return false;
+    };
+    outcome.results.insert(mutant.id.clone(), result);
+    true
 }
 
 /// Where a mutant of [`build_jobs`] comes from.
@@ -1191,7 +1095,10 @@ enum JobSource {
 /// Builds the job of each covered mutant. A mutant with a cached result gets
 /// that result and no job. The `--max-mutants` limit counts the covered
 /// mutants only: an uncovered planned mutant leaves its place to the next
-/// covered pending mutant in rank order.
+/// covered pending mutant in rank order. Under a time budget the regular jobs
+/// run the cheapest first (the lowest dry-run time of their tests), so the
+/// budget settles the most mutants. The sort is stable, so equal costs keep
+/// the rank order. Static mutants stay last.
 fn build_jobs(
     plan: &SchedulePlan,
     facts: &DryRunFacts,
@@ -1232,14 +1139,7 @@ fn build_jobs(
         if !caps.test_filter {
             tests = whole_files(facts, &tests);
         }
-        if tests.is_empty() {
-            outcome.results.insert(
-                mutant.id.clone(),
-                MutantOutcome {
-                    static_mutant,
-                    ..MutantOutcome::no_coverage()
-                },
-            );
+        if record_unrun(context, mutant, &tests, static_mutant, outcome) {
             continue;
         }
         match source {
@@ -1253,7 +1153,7 @@ fn build_jobs(
         if map_miss {
             outcome.issues.push(static_map_miss_issue(mutant));
         }
-        let confirmation = (!context.kill_matrix && !static_mutant && caps.test_filter)
+        let confirmation = (!context.collects_evidence() && !static_mutant && caps.test_filter)
             .then(|| confirmation_tests(facts, &tests))
             .flatten();
         let (tests, total) = fastest_first(facts, tests);
@@ -1268,7 +1168,8 @@ fn build_jobs(
             .collect();
         test_files.sort_unstable();
         test_files.dedup();
-        let cache_key = job_key(context, mutant, &tests, &test_files);
+        let targets = job_targets(context, &tests);
+        let cache_key = job_key(context, mutant, (&tests, &targets), &test_files);
         if record_stored(
             context,
             cache_key.as_ref(),
@@ -1282,7 +1183,9 @@ fn build_jobs(
         let job = Job {
             id: mutant.id.clone(),
             tests,
+            targets,
             timeout_ms: timeout_ms(total),
+            loop_budget_ms: loop_budget_ms(timeout_ms(total)),
             setup_ms,
             static_mutant,
             test_files,
@@ -1294,11 +1197,15 @@ fn build_jobs(
         if static_mutant {
             statics.push(job);
         } else {
-            regular.push(job);
+            regular.push((total, job));
         }
     }
-    regular.extend(statics);
-    regular
+    if context.budgeted {
+        regular.sort_by(|left, right| left.0.total_cmp(&right.0));
+    }
+    let mut jobs: Vec<Job> = regular.into_iter().map(|(_, job)| job).collect();
+    jobs.extend(statics);
+    jobs
 }
 
 /// Shared state of the worker threads of one phase.
@@ -1608,55 +1515,6 @@ fn start_primary(
     })
 }
 
-/// The longest test name that [`no_covering_test_message`] shows.
-const MAX_TEST_NAME_CHARS: usize = 60;
-const ELLIPSIS: &str = "...";
-
-/// The `runtime_error` message for a mutant with no covering test left after
-/// the dry run of a respawned companion. It gives the count and the first
-/// test only: `baseline_failures` holds the full list. The message leaves out
-/// the mutant id because the issue carries it.
-fn no_covering_test_message(dropped: &[String]) -> String {
-    let first = dropped.first().map_or_else(String::new, |name| {
-        if name.chars().count() <= MAX_TEST_NAME_CHARS {
-            return name.clone();
-        }
-        let kept: String = name
-            .chars()
-            .take(MAX_TEST_NAME_CHARS - ELLIPSIS.len())
-            .collect();
-        format!("{kept}{ELLIPSIS}")
-    });
-    let tests = if dropped.len() == 1 {
-        format!("1 test: {first}")
-    } else {
-        format!("{} tests, first: {first}", dropped.len())
-    };
-    format!("no covering test passed in the dry run of the restarted companion ({tests})")
-}
-
-/// The issue for static test files that the runner does not list. Their
-/// tests never run, so a mutant that only they reach stays `no_coverage`.
-fn undiscovered_issue(files: &[String]) -> Option<ScheduleIssue> {
-    (!files.is_empty()).then(|| ScheduleIssue {
-        code: "test-files-not-discovered",
-        message: {
-            let (noun, pronoun) = if files.len() == 1 {
-                ("file", "it")
-            } else {
-                ("files", "they")
-            };
-            format!(
-                "the runner does not list {} static test {noun}, so {pronoun} did not run: {}",
-                files.len(),
-                files.join(", ")
-            )
-        },
-        mutant_id: None,
-        stderr_tail: None,
-    })
-}
-
 /// Gives `no_coverage` to each pending mutant that has no passing dry-run
 /// covering test. The test is the same as for a planned mutant, so a run
 /// that `--max-mutants` limits reports the coverage of the full run.
@@ -1666,7 +1524,7 @@ fn mark_unreached_pending(
     dry_files: &[String],
     outcome: &mut ScheduleOutcome,
 ) {
-    for mutant in &plan.pending {
+    for mutant in plan.pending.iter().chain(&plan.sampled_out) {
         let static_mutant = facts.static_ids.contains(&mutant.id);
         if covering_tests(plan, facts, dry_files, mutant, static_mutant, false).is_empty() {
             outcome.results.insert(
@@ -1711,7 +1569,7 @@ fn record_first_runs(
     for (job, attempt) in attempts {
         let suspect = match attempt.status {
             MutantStatus::Survived => Some(job.clone().for_confirmation()),
-            MutantStatus::Timeout => Some(job.clone().with_doubled_timeout()),
+            MutantStatus::Timeout if !attempt.settled => Some(job.clone().with_doubled_timeout()),
             _ => None,
         };
         if let Some(suspect) = suspect {
@@ -2051,18 +1909,18 @@ pub fn run_schedule_with_progress(
             return Err(error);
         }
     };
-    outcome.test_files = dry
-        .tests
-        .iter()
-        .map(|test| (test.test_id.clone(), test.file.clone()))
-        .collect();
+    record_dry_run(&mut outcome, &dry);
+    let target_ids =
+        config_targets(config, &dry, runner.caps, &mut outcome).inspect_err(|_| link.shutdown())?;
     outcome.unloaded_paths = dry.unloaded_paths;
     let context = JobContext {
         dry_files: &dry_files,
         kill_matrix: config.kill_matrix,
+        targets: target_ids.as_ref(),
         ready: &ready,
         cache: config.cache.as_deref(),
         journal: config.journal.as_deref(),
+        budgeted: config.deadline.is_some(),
     };
     let mutants_started = Instant::now();
     let (jobs, (link, known)) =

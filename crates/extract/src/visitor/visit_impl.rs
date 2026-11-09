@@ -1,13 +1,11 @@
 //! `Visit` trait implementation for `ModuleInfoExtractor`.
 
-#[allow(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
 use oxc_semantic::ScopeFlags;
 use oxc_span::{GetSpan, Span};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::path::PathBuf;
 
 use crate::{
     AngularComponentFieldArrayTypeFact, AngularThisSpreadFact, ComputedEnumKeyUseFact,
@@ -18,9 +16,8 @@ use crate::{
     js_text::{JsText, static_name_text},
 };
 use fallow_types::extract::{
-    AngularComponentSelector, CalleeUse, ClassHeritageInfo, DiFramework, DiKeySite, DiRole,
-    ImportLoadKind, ImportedCallSite, LocalTypeDeclaration, MisplacedDirectiveSite,
-    PublicSignatureTypeReference,
+    AngularComponentSelector, ClassHeritageInfo, DiFramework, DiKeySite, DiRole, ImportLoadKind,
+    ImportedCallSite, LocalTypeDeclaration, MisplacedDirectiveSite, PublicSignatureTypeReference,
 };
 
 use crate::asset_url::normalize_asset_url;
@@ -56,11 +53,15 @@ mod visit_constructor_alternatives;
 #[path = "visit_impl_di.rs"]
 mod visit_di;
 #[path = "visit_impl_dynamic_imports.rs"]
-mod visit_dynamic_imports;
+pub(super) mod visit_dynamic_imports;
 #[path = "visit_impl_factory_properties.rs"]
 mod visit_factory_properties;
 #[path = "visit_impl_factory_returns.rs"]
 mod visit_factory_returns;
+#[path = "visit_impl_for_of_bindings.rs"]
+mod visit_for_of_bindings;
+#[path = "visit_impl_function_returns.rs"]
+mod visit_function_returns;
 #[path = "visit_impl_helpers.rs"]
 mod visit_helpers;
 #[path = "visit_impl_jsx_runtime.rs"]
@@ -102,7 +103,7 @@ mod visit_security_sinks;
 #[path = "visit_impl_server_actions.rs"]
 mod visit_server_actions;
 #[path = "visit_impl_signature.rs"]
-mod visit_signature;
+pub(super) mod visit_signature;
 #[path = "visit_impl_source_paths.rs"]
 mod visit_source_paths;
 #[path = "visit_impl_spy_calls.rs"]
@@ -115,11 +116,13 @@ mod visit_svelte_events;
 mod visit_sveltekit_load;
 #[path = "visit_impl_taint_sources.rs"]
 mod visit_taint_sources;
+#[path = "visit_impl_this_assignments.rs"]
+mod visit_this_assignments;
 
 pub(super) use visit_chain_names::jsx_member_object_name;
 pub use visit_chain_names::push_member_tag_accesses;
-use visit_chain_names::{static_member_object_name, type_name_member_path};
-pub(super) use visit_dynamic_imports::ComponentLoaderImport;
+use visit_chain_names::{call_receiver_name, static_member_object_name, type_name_member_path};
+pub(super) use visit_dynamic_imports::{ComponentLoaderImport, NewUrlContext};
 pub(super) use visit_factory_returns::count_returns_in_statements;
 use visit_factory_returns::{
     FactoryReturnFunctionInput, classify_factory_assigned_value, collect_self_scope_assignments,
@@ -129,9 +132,15 @@ use visit_factory_returns::{
 use visit_helpers::*;
 use visit_object_helpers::*;
 use visit_package_resolution::*;
+use visit_scope_bindings::loop_head_declaration;
 use visit_security_classifiers::*;
 pub(super) use visit_security_routes::function_body_has_use_server;
 use visit_security_routes::*;
+pub(super) use visit_security_sinks::SinkAliasState;
+pub(super) use visit_security_sinks::flatten_callee_path;
+#[path = "visit_impl_taint_chain.rs"]
+mod taint_chain;
+use taint_chain::collect_chained_taint_idents;
 pub(super) use visit_source_paths::join_member_path;
 use visit_source_paths::{
     binding_source_path_candidates, flatten_member_path, push_unique_string, source_path_candidates,
@@ -663,8 +672,10 @@ impl ModuleInfoExtractor {
         let map_value_type = (method_name == "forEach")
             .then(|| self.map_value_type_for(&receiver_name))
             .flatten();
-        let Some(element_type) =
-            map_value_type.or_else(|| self.iterable_element_type_for(&receiver_name))
+        let Some(element_type) = map_value_type
+            .or_else(|| self.iterable_element_type_for(&receiver_name))
+            // `all().forEach((t) => ...)` with `function all(): Table[]` (issue #4313).
+            .or_else(|| self.local_call_array_element_type(receiver_expr))
         else {
             return;
         };
@@ -936,71 +947,6 @@ impl ModuleInfoExtractor {
         }
     }
 
-    /// Bind a `for (const util of utils)` loop variable to the element class of
-    /// `utils` so member accesses on the loop variable (`util.getter`) credit the
-    /// class. Bare-identifier loop bindings over an identifier receiver only;
-    /// destructured bindings and non-identifier receivers are out of scope.
-    fn bind_for_of_element(&mut self, stmt: &ForOfStatement<'_>) {
-        let Some(receiver_name) = static_member_object_name(&stmt.right) else {
-            return;
-        };
-        // Class-scope the `for (const x of this.<field>)` receiver so it matches
-        // the same class's qualified query-list key (issue #1821).
-        let receiver_name = self.qualify_this_scope(&receiver_name);
-        let Some(element_type) = self.iterable_element_type_for(&receiver_name) else {
-            return;
-        };
-        let ForStatementLeft::VariableDeclaration(decl) = &stmt.left else {
-            return;
-        };
-        if let Some(declarator) = decl.declarations.first()
-            && let BindingPattern::BindingIdentifier(id) = &declarator.id
-        {
-            self.record_binding_declaration(id.name.as_str(), id.span);
-            {
-                self.bind_iteration_class_proof(
-                    receiver_name
-                        .strip_suffix(".values()")
-                        .unwrap_or(&receiver_name),
-                    id.name.as_str(),
-                    iteration_source_reference(&stmt.right),
-                );
-            }
-            self.insert_class_binding_target(id.name.to_string(), element_type);
-        }
-    }
-
-    /// `Map.entries()` yields `[key, value]`; only the second binding has `V`.
-    fn bind_for_of_map_value(&mut self, stmt: &ForOfStatement<'_>) {
-        let Some(receiver_name) = static_member_object_name(&stmt.right) else {
-            return;
-        };
-        let Some(map_name) = receiver_name.strip_suffix(".entries()") else {
-            return;
-        };
-        let Some(value_type) = self.map_value_type_for(&self.qualify_this_scope(map_name)) else {
-            return;
-        };
-        let ForStatementLeft::VariableDeclaration(declaration) = &stmt.left else {
-            return;
-        };
-        let Some(declarator) = declaration.declarations.first() else {
-            return;
-        };
-        let BindingPattern::ArrayPattern(pattern) = &declarator.id else {
-            return;
-        };
-        if let Some(Some(BindingPattern::BindingIdentifier(value))) = pattern.elements.get(1) {
-            self.record_binding_declaration(value.name.as_str(), value.span);
-            self.bind_iteration_class_proof(
-                &self.qualify_this_scope(map_name),
-                value.name.as_str(),
-                iteration_source_reference(&stmt.right),
-            );
-            self.record_scoped_class_binding(value.name.as_str(), value_type);
-        }
-    }
-
     pub(super) fn is_named_import_from(
         &self,
         local_name: &str,
@@ -1056,10 +1002,11 @@ impl ModuleInfoExtractor {
     ) {
         if let BindingPattern::BindingIdentifier(id) = &declarator.id {
             if decl.kind == VariableDeclarationKind::Const && self.is_module_scope() {
-                self.record_static_package_values(id.name.as_str(), init);
+                self.record_module_const_values(id.name.as_str(), init);
             }
 
             self.record_static_sink_literal_binding(decl, declarator, init);
+            self.record_sink_alias_bindings(id.name.as_str(), init);
             let sources = self.node_module_register_sources_from_expression(init);
             if !sources.is_empty() {
                 self.record_node_module_register_url_binding(id.name.to_string(), sources);
@@ -1232,7 +1179,7 @@ impl ModuleInfoExtractor {
     /// Record a namespace-import local placed in an object literal bound to
     /// `root_name`, and exclude the placement itself from the bare-reference
     /// rule (issue #2377).
-    pub(super) fn record_object_literal_namespace_placement(
+    fn record_object_literal_namespace_placement(
         &mut self,
         root_name: &str,
         value: &IdentifierReference<'_>,
@@ -1445,7 +1392,7 @@ impl ModuleInfoExtractor {
                         self.is_named_import_from(local_name, source, imported_name)
                     },
                 );
-            let members = extract_class_members(class, is_angular);
+            let members = extract_class_members(class, is_angular, self.heritage_objects());
             self.record_factory_property_class(id);
             if self.capture_subclass_provenance {
                 self.record_binding_declaration(id.name.as_str(), id.span);
@@ -1921,6 +1868,9 @@ impl ModuleInfoExtractor {
         self.record_source_returning_helper_from_variable_declarator(decl, declarator, init);
         self.record_sanitizer_helper_from_variable_declarator(decl, declarator, init);
         self.record_initialized_declarator_bindings(decl, declarator, init);
+        if let BindingPattern::ObjectPattern(pattern) = &declarator.id {
+            self.record_sink_pattern_bindings(pattern, init);
+        }
         if let BindingPattern::BindingIdentifier(id) = &declarator.id {
             self.capture_math_random_context_sink(id.name.as_str(), init, declarator.span);
             self.capture_hardcoded_secret_literal_sink(id.name.as_str(), init, declarator.span);
@@ -2112,78 +2062,6 @@ impl<'a> ModuleInfoExtractor {
         }
     }
 
-    /// Pre-pass over top-level declarations recording each local function's
-    /// declared return element class (`Promise<T>` / `T`, non-builtin) keyed by
-    /// name, so `promise_all_map_element_type` resolves a map callback's callee
-    /// even when it is declared AFTER its consumer (declaration-order
-    /// independence: the repro's `createDb` follows `generate`). See issue #1793.
-    fn record_local_function_return_types(&mut self, program: &Program<'a>) {
-        for statement in &program.body {
-            match statement {
-                Statement::FunctionDeclaration(function) => {
-                    self.record_local_function_return_type(function);
-                }
-                Statement::VariableDeclaration(decl) => {
-                    for declarator in &decl.declarations {
-                        self.record_local_const_function_return_type(declarator);
-                    }
-                }
-                Statement::ExportDeclaration(export) => match &export.declaration {
-                    Declaration::FunctionDeclaration(function) => {
-                        self.record_local_function_return_type(function);
-                    }
-                    Declaration::VariableDeclaration(decl) => {
-                        for declarator in &decl.declarations {
-                            self.record_local_const_function_return_type(declarator);
-                        }
-                    }
-                    _ => {}
-                },
-                Statement::ExportDefaultDeclaration(export) => {
-                    if let ExportDefaultDeclarationKind::FunctionDeclaration(function) =
-                        &export.declaration
-                    {
-                        self.record_local_function_return_type(function);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn record_local_function_return_type(&mut self, function: &Function<'_>) {
-        let Some(id) = function.id.as_ref() else {
-            return;
-        };
-        let Some(return_type) = function.return_type.as_deref() else {
-            return;
-        };
-        if let Some(element) = return_type_element_name(&return_type.type_annotation) {
-            self.local_function_return_types
-                .entry(id.name.to_string())
-                .or_insert(element);
-        }
-    }
-
-    fn record_local_const_function_return_type(&mut self, declarator: &VariableDeclarator<'_>) {
-        let BindingPattern::BindingIdentifier(id) = &declarator.id else {
-            return;
-        };
-        let return_type = match declarator.init.as_ref() {
-            Some(Expression::ArrowFunctionExpression(arrow)) => arrow.return_type.as_deref(),
-            Some(Expression::FunctionExpression(function)) => function.return_type.as_deref(),
-            _ => None,
-        };
-        let Some(return_type) = return_type else {
-            return;
-        };
-        if let Some(element) = return_type_element_name(&return_type.type_annotation) {
-            self.local_function_return_types
-                .entry(id.name.to_string())
-                .or_insert(element);
-        }
-    }
-
     /// Infer the element class of `await Promise.all(<expr>.map(cb))` where `cb`
     /// returns a call to a same-module function whose declared return type is
     /// `Promise<T>` / `T` for a non-builtin class `T`. `Promise.allSettled` /
@@ -2257,6 +2135,9 @@ impl<'a> ModuleInfoExtractor {
             self.node_url_file_url_to_path_bindings
                 .insert(s.local.name.to_string());
         }
+        if !is_type_only && !s.import_kind.is_type() {
+            self.record_import_sink_binding(source, &s.imported.name(), s.local.name.as_str());
+        }
         if matches!(source, "vue" | "@vue/reactivity") {
             self.module_direct_object_binding_targets
                 .entry(s.local.name.to_string())
@@ -2276,7 +2157,7 @@ impl<'a> ModuleInfoExtractor {
     }
 
     /// Record a default import specifier (`import x from ...`), tracking the
-    /// DOMPurify and `node:path` provenance bindings.
+    /// DOMPurify, `node:path` and Node module sink bindings.
     fn handle_import_default_specifier(
         &mut self,
         s: &ImportDefaultSpecifier<'a>,
@@ -2285,7 +2166,7 @@ impl<'a> ModuleInfoExtractor {
         source_span: Span,
     ) {
         let local = s.local.name.to_string();
-        self.record_dompurify_import_binding(source, &local, is_type_only);
+        self.record_whole_module_import_bindings(source, &local, is_type_only);
         if self.is_module_scope() && is_node_path_source(source) {
             self.node_path_namespace_bindings.insert(local.clone());
         }
@@ -2306,7 +2187,7 @@ impl<'a> ModuleInfoExtractor {
 
     /// Record a namespace import specifier (`import * as ns from ...`), tracking
     /// the DOMPurify, `child_process`, `node:path`, and `node:url` provenance
-    /// bindings plus the namespace binding name.
+    /// bindings, the Node module sink binding, and the namespace binding name.
     fn handle_import_namespace_specifier(
         &mut self,
         s: &ImportNamespaceSpecifier<'a>,
@@ -2315,7 +2196,7 @@ impl<'a> ModuleInfoExtractor {
         source_span: Span,
     ) {
         let local = s.local.name.to_string();
-        self.record_dompurify_import_binding(source, &local, is_type_only);
+        self.record_whole_module_import_bindings(source, &local, is_type_only);
         if self.is_module_scope() && is_child_process_source(source) {
             self.child_process_namespace_bindings.insert(local.clone());
         }
@@ -2383,11 +2264,15 @@ impl<'a> ModuleInfoExtractor {
     /// Record `<object_name>.<member>` for a static member read whose receiver
     /// is a name path (`a`, `a.b`, `this`).
     fn record_named_member_access(&mut self, object_name: &str, member: &str) {
+        self.record_inherited_this_result_access(object_name, member);
         if self.route_loader_data_bindings.contains(object_name) {
             self.member_accesses.push(MemberAccess {
                 object: ROUTE_LOADER_DATA_OBJECT.to_string(),
                 member: member.to_string(),
             });
+        }
+        if self.defer_independent_this_read(object_name, member) {
+            return;
         }
         // Qualify a `this.<field>` receiver with the enclosing class scope so
         // it resolves against the same class's binding key (issue #1821);
@@ -2995,6 +2880,15 @@ impl<'a> ModuleInfoExtractor {
                 self.promise_all_map_element_type(init)
                     .map(|name| (name, None))
             })
+            // `const tables = all()` with `function all(): Table[]` (issue #4313).
+            .or_else(|| {
+                declarator
+                    .type_annotation
+                    .is_none()
+                    .then(|| self.local_call_array_element_type(init))
+                    .flatten()
+                    .map(|name| (name, None))
+            })
         {
             let binding = id.name.to_string();
             self.record_vue_ref_value_array_binding_type(&binding, init, &element);
@@ -3065,7 +2959,7 @@ impl<'a> ModuleInfoExtractor {
             return;
         };
         let mut sources = Vec::new();
-        collect_static_import_specifiers(&import_expr.source, &mut sources);
+        self.collect_dynamic_import_specifiers(&import_expr.source, &mut sources);
         if sources.is_empty() {
             return;
         }
@@ -3320,40 +3214,6 @@ impl<'a> ModuleInfoExtractor {
         } else if Self::is_cjs_exports_expression(&member.object) {
             self.record_cjs_assignment(false);
             self.push_cjs_named_export(member.property.name.to_string(), expr.span);
-        }
-    }
-
-    /// Handle `this.member = ...` / `this.#member = ...` assignments: record the
-    /// member access and propagate the instance-binding target name from a
-    /// `new Class()` RHS, an identifier bound to a known class, and nested
-    /// binding targets. `member_name` is the property spelling (`dep` for a
-    /// public field, `#dep` for a `#`-private field, issue #1821), so the
-    /// recorded key is `this.<member_name>` and matches the receiver key
-    /// `static_member_object_name` produces for the same field.
-    fn handle_this_member_assignment(
-        &mut self,
-        member_name: &str,
-        expr: &AssignmentExpression<'a>,
-    ) {
-        self.member_accesses.push(MemberAccess {
-            object: "this".to_string(),
-            member: member_name.to_string(),
-        });
-        if let Expression::NewExpression(new_expr) = &expr.right
-            && let Expression::Identifier(callee) = &new_expr.callee
-            && !super::helpers::is_builtin_constructor(callee.name.as_str())
-        {
-            let key = self.this_member_key(member_name);
-            self.insert_class_binding_target(key, callee.name.to_string());
-        } else if let Expression::Identifier(ident) = &expr.right
-            && let Some(target_name) = self.binding_target_names.get(ident.name.as_str()).cloned()
-        {
-            let key = self.this_member_key(member_name);
-            self.binding_target_names.insert(key, target_name);
-        }
-        if let Expression::Identifier(ident) = &expr.right {
-            let target = self.this_member_key(member_name);
-            self.copy_nested_binding_targets(ident.name.as_str(), target.as_str());
         }
     }
 
@@ -3620,7 +3480,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.is_module_file = program_has_module_syntax(program);
         self.has_global_declarations =
             program_has_global_declarations(program, self.is_module_file);
-        self.triple_slash_reference_paths = triple_slash_reference_paths(program);
+        self.record_triple_slash_references(program);
         self.capture_subclass_provenance = program.body.iter().any(|statement| match statement {
             Statement::ClassDeclaration(class) => class.heritage.is_some(),
             Statement::ExportDeclaration(export) => matches!(&export.declaration, Declaration::ClassDeclaration(class) if class.heritage.is_some()),
@@ -3643,6 +3503,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         walk::walk_program(self, program);
         self.finish_local_import_loaders();
         self.finish_promise_import_bindings();
+        self.finish_register_loader_new_urls();
         self.record_jsx_import_source_pragma(program);
     }
 
@@ -3695,10 +3556,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
-        let (previous_span, previous_depth) = self.enter_method_definition(method);
+        let previous = self.enter_method_definition(method);
         walk::walk_method_definition(self, method);
-        self.independent_this_depth = previous_depth;
-        self.class_method_function_span = previous_span;
+        self.exit_method_definition(previous);
     }
 
     fn visit_property_definition(&mut self, prop: &PropertyDefinition<'a>) {
@@ -3770,6 +3630,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         {
             self.capture_hardcoded_secret_literal_sink(&name.text(), value, prop.span);
         }
+        self.record_this_bound_function(prop.value.as_ref());
 
         walk::walk_property_definition(self, prop);
     }
@@ -3781,19 +3642,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.push_direct_object_binding_scope(FxHashSet::default());
         self.preseed_direct_object_binding_scope_roots(&stmt.body);
         if self.namespace_depth == 0 {
-            self.nested_declaration_stack.push(FxHashSet::default());
-            self.scoped_require_aliases.push(FxHashSet::default());
-            self.scoped_non_instance_bindings.push(FxHashSet::default());
-            self.scoped_namespace_binding_names
-                .push(FxHashSet::default());
-            self.scoped_array_binding_element_types
-                .push(FxHashMap::default());
-            self.sanitizer_binding_stack.push(FxHashMap::default());
-            self.literal_allowlist_binding_stack
-                .push(FxHashMap::default());
-            self.risky_regex_binding_stack.push(FxHashMap::default());
-            self.path_sink_binding_stack.push(FxHashMap::default());
-            self.path_relative_binding_stack.push(FxHashMap::default());
+            self.push_nested_scope_frames();
             self.preseed_nested_declarations(&stmt.body);
         }
         self.preseed_direct_object_binding_targets(&stmt.body);
@@ -3807,16 +3656,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.pop_function_type_alias_scope();
         }
         if self.namespace_depth == 0 {
-            self.nested_declaration_stack.pop();
-            self.scoped_require_aliases.pop();
-            self.scoped_non_instance_bindings.pop();
-            self.scoped_namespace_binding_names.pop();
-            self.scoped_array_binding_element_types.pop();
-            self.sanitizer_binding_stack.pop();
-            self.literal_allowlist_binding_stack.pop();
-            self.risky_regex_binding_stack.pop();
-            self.path_sink_binding_stack.pop();
-            self.path_relative_binding_stack.pop();
+            self.pop_nested_scope_frames();
         }
         self.pop_direct_object_binding_scope();
         self.block_depth -= 1;
@@ -3862,16 +3702,16 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_catch_clause(&mut self, clause: &CatchClause<'a>) {
-        let roots = clause
+        let roots: FxHashSet<String> = clause
             .param
             .as_ref()
             .into_iter()
             .flat_map(|param| param.pattern.get_binding_identifiers())
             .map(|id| id.name.to_string())
             .collect();
-        self.push_direct_object_binding_scope(roots);
+        self.push_catch_clause_scope(roots);
         walk::walk_catch_clause(self, clause);
-        self.pop_direct_object_binding_scope();
+        self.pop_catch_clause_scope();
     }
 
     fn visit_declaration(&mut self, decl: &Declaration<'a>) {
@@ -3886,10 +3726,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
 
     fn visit_function(&mut self, func: &Function<'a>, flags: ScopeFlags) {
         let constructor_function = self.active_constructor_function.replace(func.span);
-        let independent_this = self.class_method_function_span != Some(func.span);
-        if independent_this {
-            self.independent_this_depth += 1;
-        }
+        let function_this = self.enter_function_this(func);
         self.record_next_function_param_sources(func);
         let type_parameter_scope_pushed = func
             .type_parameters
@@ -3941,9 +3778,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.pop_function_declaration_scope();
         self.direct_object_binding_function_scopes.pop();
         self.pop_direct_object_binding_scope();
-        if independent_this {
-            self.independent_this_depth -= 1;
-        }
+        self.exit_function_this(function_this);
         self.active_constructor_function = constructor_function;
     }
 
@@ -4090,6 +3925,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
 
         if self.namespace_depth > 0 {
             self.extract_namespace_members(&decl.declaration);
+            if let Declaration::TSNamespaceDeclaration(namespace) = &decl.declaration {
+                self.exported_namespace_member = Some(namespace.span);
+            }
             if is_namespace {
                 self.namespace_depth += 1;
             }
@@ -4115,6 +3953,10 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         if is_namespace {
             self.namespace_depth += 1;
             self.pending_namespace_members.clear();
+            self.namespace_member_path.clear();
+            if let Declaration::TSNamespaceDeclaration(namespace) = &decl.declaration {
+                self.exported_namespace_root = Some(namespace.span);
+            }
         }
         walk::walk_export_declaration(self, decl);
         if is_namespace {
@@ -4210,7 +4052,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                     },
                 );
                 (
-                    extract_class_members(class, is_angular),
+                    extract_class_members(class, is_angular, self.heritage_objects()),
                     extract_super_class_name(class),
                     extract_implemented_interface_names(class),
                     bindings,
@@ -4259,9 +4101,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 instance_bindings,
                 super_class_type_args,
                 generic_instance_bindings,
+                binding_super_class: None,
             });
         }
-
         self.exports.push(ExportInfo {
             name: ExportName::Default,
             local_name,
@@ -4302,9 +4144,34 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // namespace nested in one of those or in `declare global`. Its inner
         // `export` statements are members of the local binding, not file
         // exports (issue #2356).
-        let is_local_namespace = self.namespace_depth == 0 && self.ambient_module_depth == 0;
+        //
+        // Inside an exported namespace body, a nested namespace is a member
+        // only when it is exported itself (or is a segment of a dotted
+        // `namespace A.B`). A nested namespace without `export` is local to
+        // the body, so its inner exports are not members of the root.
+        let in_exported_body = self.namespace_depth > 0
+            && self.ambient_module_depth == 0
+            && self.local_namespace_depth == 0;
+        let is_root = in_exported_body && self.exported_namespace_root == Some(decl.span);
+        let is_member = in_exported_body
+            && !is_root
+            && self.exported_namespace_member.take() == Some(decl.span);
+        let is_local_namespace = (self.namespace_depth == 0 && self.ambient_module_depth == 0)
+            || (in_exported_body && !is_root && !is_member);
+        if is_root {
+            self.exported_namespace_root = None;
+        }
         if is_local_namespace {
             self.local_namespace_depth += 1;
+        }
+        if is_member {
+            self.namespace_member_path.push(decl.id.name.to_string());
+        }
+        if (is_root || is_member)
+            && let TSNamespaceDeclarationBody::TSNamespaceDeclaration(child) = &decl.body
+        {
+            self.push_namespace_member(child.id.name.to_string(), child.id.span);
+            self.exported_namespace_member = Some(child.span);
         }
         let body_statements = match &decl.body {
             TSNamespaceDeclarationBody::TSModuleBlock(block) => Some(&block.body),
@@ -4313,6 +4180,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.with_module_body_binding_scope(body_statements, Some(&decl.id.name), |visitor| {
             walk::walk_ts_namespace_declaration(visitor, decl);
         });
+        if is_member {
+            self.namespace_member_path.pop();
+        }
         if is_local_namespace {
             self.local_namespace_depth -= 1;
         }
@@ -4407,7 +4277,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // branch); only when none resolve, fall back to the pattern shapes
         // (substitution templates and `'./x/' + y` concatenations).
         let mut sources = Vec::new();
-        collect_static_import_specifiers(&expr.source, &mut sources);
+        self.collect_dynamic_import_specifiers(&expr.source, &mut sources);
         if sources.is_empty() {
             match &expr.source {
                 Expression::TemplateLiteral(tpl)
@@ -4461,6 +4331,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.preseed_direct_object_binding_declaration(decl);
         for declarator in &decl.declarations {
             self.record_variable_declarator(decl, declarator);
+            self.record_declarator_function_name(declarator);
         }
         walk::walk_variable_declaration(self, decl);
     }
@@ -4484,6 +4355,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
 
         self.record_angular_entry_component_refs(prop);
+        self.record_property_function_name(prop);
 
         walk::walk_object_property(self, prop);
     }
@@ -4558,9 +4430,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.record_vitest_do_mock(expr);
         self.record_vitest_unmock(expr);
 
-        self.try_record_pino_transport_targets(expr);
-        self.try_record_node_module_register(expr);
-        self.try_record_child_process_fork(expr);
+        self.record_node_runtime_call(expr);
         self.try_record_package_path_reference(expr);
         self.try_record_relative_require_resolve(expr);
         self.record_bare_require_call(expr);
@@ -4590,6 +4460,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
 
         self.record_callee_use(&expr.callee, expr.span.start, false);
         self.record_imported_call_site(expr);
+        self.record_this_binding_call(expr);
 
         walk::walk_call_expression(self, expr);
     }
@@ -4608,7 +4479,12 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             );
         }
         self.push_direct_object_binding_scope(roots);
-        if let Some(ForStatementInit::VariableDeclaration(declaration)) = &stmt.init {
+        let init_declaration = match &stmt.init {
+            Some(ForStatementInit::VariableDeclaration(declaration)) => Some(&**declaration),
+            _ => None,
+        };
+        let loop_scope = self.push_loop_head_scope(init_declaration);
+        if let Some(declaration) = init_declaration {
             self.preseed_direct_object_binding_declaration(declaration);
         }
         if let Some(init) = &stmt.init {
@@ -4638,6 +4514,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.visit_statement(&stmt.body);
         }
         self.pop_optional_binding_scope(values);
+        self.pop_loop_head_scope(loop_scope);
         self.pop_direct_object_binding_scope();
     }
 
@@ -4662,6 +4539,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             );
         }
         self.push_direct_object_binding_scope(roots);
+        let loop_scope = self.push_loop_head_scope(loop_head_declaration(&stmt.left));
         self.visit_for_statement_left(&stmt.left);
         self.visit_expression(&stmt.right);
         let values = self.push_conditional_binding_scope(&[]);
@@ -4673,6 +4551,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.record_for_of_member_destructuring(stmt);
         self.visit_statement(&stmt.body);
         self.pop_optional_binding_scope(values);
+        self.pop_loop_head_scope(loop_scope);
         self.pop_direct_object_binding_scope();
 
         if has_static_bindings {
@@ -4701,6 +4580,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_binary_expression(&mut self, expr: &BinaryExpression<'a>) {
+        self.record_in_operator_member_probe(expr);
         if expr.operator == oxc_ast::ast::BinaryOperator::Addition {
             if is_string_coercion_sibling(&expr.right) {
                 self.record_string_coercion_to_string(&expr.left);
@@ -4715,31 +4595,10 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     fn visit_new_expression(&mut self, expr: &oxc_ast::ast::NewExpression<'a>) {
         self.record_queue_worker_constructor_param_sources(expr);
         self.record_callee_use(&expr.callee, expr.span.start, true);
+        self.record_new_url_package_reference(expr);
+        self.record_worker_new_url_arguments(expr);
 
-        if let Some(source) = new_url_import_source(expr) {
-            // A speculative reference credits its target when it resolves, and
-            // the resolver drops it silently when it does not. Two rules make a
-            // `new URL(specifier, import.meta.url)` speculative:
-            // - The specifier has no file extension, so it may name a directory
-            //   (`new URL("./services", import.meta.url)`). See issue #840.
-            // - The expression is a direct argument of a filesystem call or of
-            //   `fileURLToPath`, so it names a file on disk. The file can be an
-            //   output that does not exist yet, or a probe for an optional file.
-            // Other specifiers with an extension (`new Worker(new URL("./worker.js",
-            // import.meta.url))`) keep `is_speculative = false`, so a missing file
-            // is still reported as `unresolved-import`.
-            let is_speculative = PathBuf::from(&source).extension().is_none()
-                || self.filesystem_path_new_url_spans.contains(&expr.span);
-            self.dynamic_imports.push(DynamicImportInfo {
-                source,
-                span: expr.span,
-                destructured_names: Vec::new(),
-                local_name: None,
-                is_speculative,
-                value_escapes: false,
-            });
-            self.mark_import_load_kind(expr.span, ImportLoadKind::OutOfThread);
-        }
+        self.record_new_url_edge(expr);
 
         self.capture_declarative_validation_new_expression(expr);
         self.capture_new_expression_sink(expr);
@@ -4829,6 +4688,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             if matches!(member.object, Expression::ThisExpression(_)) {
                 self.handle_this_member_assignment(member.property.name.as_str(), expr);
             }
+            self.record_member_assigned_function(member, &expr.right);
         }
         if !matches!(expr.left, AssignmentTarget::StaticMemberExpression(_))
             && Self::assignment_target_mutates_cjs_exports(&expr.left)
@@ -4851,6 +4711,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             && let AssignmentTarget::AssignmentTargetIdentifier(ident) = &expr.left
         {
             self.handle_dynamic_import_assignment(ident, &expr.right);
+            self.record_sink_assignment_binding(ident.name.as_str(), &expr.right);
         }
         walk::walk_assignment_expression(self, expr);
         if self.invalidate_projected_assignment(&expr.left) {
@@ -5006,6 +4867,12 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 member: expr.property.name.to_string(),
             });
         }
+        if let Some(type_name) = self.local_call_array_index_type(&expr.object) {
+            self.member_accesses.push(MemberAccess {
+                object: type_name,
+                member: expr.property.name.to_string(),
+            });
+        }
         if let Some(callee_name) = Self::bare_call_callee_name(&expr.object)
             && Self::inline_store_factory_receiver(&expr.object).is_none()
         {
@@ -5029,7 +4896,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 object: store_factory,
                 member: expr.property.name.to_string(),
             });
-        } else if let Some(object_name) = static_member_object_name(&expr.object) {
+        } else if let Some(object_name) = call_receiver_name(&expr.object) {
             self.record_named_member_access(&object_name, expr.property.name.as_str());
         } else if let Expression::ComputedMemberExpression(receiver) = &expr.object
             && receiver.static_property_name().is_none()
@@ -5177,12 +5044,14 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             );
         }
         self.push_direct_object_binding_scope(roots);
+        let loop_scope = self.push_loop_head_scope(loop_head_declaration(&stmt.left));
         let values = self.push_conditional_binding_scope(&[]);
         if let Some(target) = stmt.left.as_assignment_target() {
             self.invalidate_assignment_target_proof(target);
         }
         self.visit_statement(&stmt.body);
         self.pop_optional_binding_scope(values);
+        self.pop_loop_head_scope(loop_scope);
         self.pop_direct_object_binding_scope();
     }
 
@@ -5298,7 +5167,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             .map(|id| FxHashSet::from_iter([id.name.to_string()]))
             .unwrap_or_default();
         self.push_direct_object_binding_scope(direct_scope_roots);
+        // `this` in the class body is the instance of this class, also when
+        // the class is declared in a function with its own `this`.
+        let outer_independent_this_depth = std::mem::replace(&mut self.independent_this_depth, 0);
         walk::walk_class(self, class);
+        self.independent_this_depth = outer_independent_this_depth;
         self.pop_direct_object_binding_scope();
         self.record_class_this_facts(
             class,
@@ -5333,6 +5206,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     /// independently so an asset reference spanning an interpolation boundary
     /// is ignored rather than producing a garbled, unresolvable specifier.
     fn visit_tagged_template_expression(&mut self, expr: &TaggedTemplateExpression<'a>) {
+        self.try_record_command_template(expr);
         if is_html_tagged_template(&expr.tag) {
             for quasi in &expr.quasi.quasis {
                 let text = quasi
@@ -5388,6 +5262,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     fn visit_jsx_attribute(&mut self, attr: &oxc_ast::ast::JSXAttribute<'a>) {
         self.capture_jsx_attr_sink(attr);
         walk::walk_jsx_attribute(self, attr);
+    }
+
+    fn visit_jsx_spread_attribute(&mut self, spread: &oxc_ast::ast::JSXSpreadAttribute<'a>) {
+        self.capture_jsx_spread_sink(spread);
+        walk::walk_jsx_spread_attribute(self, spread);
     }
 
     fn visit_jsx_fragment(&mut self, fragment: &oxc_ast::ast::JSXFragment<'a>) {
@@ -5453,7 +5332,6 @@ fn split_angular_selectors(raw: &str) -> Vec<String> {
 /// `.then` already credits the named import elsewhere; this is the
 /// entry-point-abstain capture for the Angular `unrendered-component` rule).
 fn then_callback_member_class(value: &Expression<'_>) -> Option<String> {
-    // Unwrap the outer `() => <body>` arrow.
     let body = arrow_expression_body(value)?;
     // The body must be a `<expr>.then(<callback>)` call.
     let Expression::CallExpression(call) = body else {
@@ -5782,28 +5660,6 @@ fn unwrap_parens<'a, 'b>(mut expr: &'b Expression<'a>) -> &'b Expression<'a> {
     expr
 }
 
-/// Flatten an `Identifier` or `StaticMemberExpression` callee to a dotted path.
-///
-/// Deliberately narrower than `static_member_object_name`: it accepts ONLY bare
-/// identifiers and static member chains (no call/new forms), so the catalogue
-/// matcher sees a clean dotted callee path. Returns `None` for dynamic dispatch,
-/// computed members, or aliased call forms (those count as blind spots).
-fn flatten_callee_path(mut expr: &Expression<'_>) -> Option<String> {
-    let mut properties = Vec::new();
-    let root = loop {
-        crate::cost::walk_step();
-        match unwrap_parens(expr) {
-            Expression::Identifier(ident) => break ident.name.as_str(),
-            Expression::StaticMemberExpression(member) => {
-                properties.push(member.property.name.as_str());
-                expr = &member.object;
-            }
-            _ => return None,
-        }
-    };
-    Some(visit_source_paths::join_member_path(root, &properties))
-}
-
 /// Root reference of a static callee without optional or computed members.
 fn imported_callee_root<'a>(expression: &'a Expression<'a>) -> Option<&'a IdentifierReference<'a>> {
     match unwrap_parens(expression) {
@@ -5812,81 +5668,6 @@ fn imported_callee_root<'a>(expression: &'a Expression<'a>) -> Option<&'a Identi
             imported_callee_root(&member.object)
         }
         _ => None,
-    }
-}
-
-fn terminal_static_member_name<'a>(expr: &'a Expression<'_>) -> Option<&'a str> {
-    match unwrap_parens(expr) {
-        Expression::StaticMemberExpression(member) => Some(member.property.name.as_str()),
-        _ => None,
-    }
-}
-
-fn callee_method_name<'a>(
-    callee: &'a Expression<'_>,
-    callee_path: Option<&'a str>,
-) -> Option<&'a str> {
-    if let Some(callee_path) = callee_path {
-        return callee_path.rsplit_once('.').map(|(_, method)| method);
-    }
-    terminal_static_member_name(callee)
-}
-
-/// Collect bare identifier references from a declarator initializer for the
-/// #1146 taint chain step, recursing through the same conservative expression
-/// shapes `collect_binding_source_path_candidates` admits (static TS wrappers,
-/// await, template substitutions, `+` concat operands, object-literal property
-/// values) plus the top-level bare-identifier alias (`const b = a`).
-///
-/// Deliberately NOT collected (each chained identifier becomes a fresh
-/// source-backed binding that can chain further, so every arm here is a
-/// false-positive amplifier):
-/// - member-expression roots (`const b = a.id`): a property read off a tainted
-///   local frequently strips taint in practice (`a.length`,
-///   `a.startsWith("/")`); unlike the sink-side `collect_idents_into` member
-///   rule (sound because the whole expression flows into a sink), re-tainting
-///   the result here would propagate boolean/length/index reads
-/// - call expressions (`const b = f(a)`): the call boundary is where
-///   sanitizers live; #878 already covers proven helper-return shapes
-/// - logical / conditional / sequence expressions (`a || "x"`, `c ? a : b`)
-fn collect_chained_taint_idents(expr: &Expression<'_>, out: &mut Vec<String>) {
-    match expr {
-        Expression::Identifier(ident) => push_ident(ident.name.as_str(), out),
-        Expression::ParenthesizedExpression(paren) => {
-            collect_chained_taint_idents(&paren.expression, out);
-        }
-        Expression::TSAsExpression(ts_as) => {
-            collect_chained_taint_idents(&ts_as.expression, out);
-        }
-        Expression::TSSatisfiesExpression(ts_sat) => {
-            collect_chained_taint_idents(&ts_sat.expression, out);
-        }
-        Expression::TSNonNullExpression(ts_non_null) => {
-            collect_chained_taint_idents(&ts_non_null.expression, out);
-        }
-        Expression::AwaitExpression(await_expr) => {
-            collect_chained_taint_idents(&await_expr.argument, out);
-        }
-        Expression::TemplateLiteral(template) => {
-            for expression in &template.expressions {
-                collect_chained_taint_idents(expression, out);
-            }
-        }
-        Expression::BinaryExpression(binary)
-            if binary.operator == oxc_ast::ast::BinaryOperator::Addition =>
-        {
-            collect_chained_taint_idents(&binary.left, out);
-            collect_chained_taint_idents(&binary.right, out);
-        }
-        Expression::ObjectExpression(object) => {
-            for property in &object.properties {
-                let ObjectPropertyKind::ObjectProperty(property) = property else {
-                    continue;
-                };
-                collect_chained_taint_idents(&property.value, out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -6194,23 +5975,6 @@ impl ModuleInfoExtractor {
             return Some((&member.object, pattern));
         }
         None
-    }
-
-    /// Record the statically flattenable callee path of a call or `new` site, deduped per path
-    /// and form (first occurrence wins). Capture is unconditional because extraction is
-    /// config-blind. Computed members, dynamic dispatch, and optional-chaining callees flatten
-    /// to `None` and stay uncaptured (documented false negatives).
-    fn record_callee_use(&mut self, callee: &Expression<'_>, span_start: u32, is_new: bool) {
-        let Some(callee_path) = flatten_callee_path(callee) else {
-            return;
-        };
-        if self.seen_callee_paths.insert((callee_path.clone(), is_new)) {
-            self.callee_uses.push(CalleeUse {
-                callee_path,
-                span_start,
-                is_new,
-            });
-        }
     }
 
     /// Capture each static call and defer lexical import admission to semantics.

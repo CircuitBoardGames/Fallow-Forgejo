@@ -16,5 +16,8 @@
 
 pub mod cache;
 pub mod graph;
+pub mod installed_versions;
+pub mod missed_probes;
 pub mod project;
+pub mod read_trace;
 pub mod resolve;

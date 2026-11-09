@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use fallow_config::OutputFormat;
 use fallow_output::{DoctorCheckStatus, DoctorOutput, DoctorStatus};
 
+use crate::exit_codes::exit_invalid_input;
 use crate::json_style::JsonStyle;
 use crate::report::{HumanStatus, human_status_line, sink::outln};
 
@@ -48,9 +49,8 @@ pub fn validate_output(output: OutputFormat, json_style: JsonStyle) -> Result<()
     if matches!(output, OutputFormat::Human | OutputFormat::Json) {
         return Ok(());
     }
-    Err(crate::error::emit_error_with_style(
+    Err(crate::error::emit_input_error_with_style(
         "doctor supports human and json output",
-        2,
         output,
         json_style,
     ))
@@ -60,9 +60,8 @@ fn render_json(report: &DoctorOutput, json_style: JsonStyle) -> ExitCode {
     let value = match fallow_output::serialize_doctor_json_output(report.clone()) {
         Ok(value) => value,
         Err(error) => {
-            return crate::error::emit_error_with_style(
+            return crate::error::emit_input_error_with_style(
                 &format!("failed to serialize doctor report: {error}"),
-                2,
                 OutputFormat::Json,
                 json_style,
             );
@@ -71,9 +70,8 @@ fn render_json(report: &DoctorOutput, json_style: JsonStyle) -> ExitCode {
     match json_style.serialize(&value) {
         Ok(json) => outln!("{json}"),
         Err(error) => {
-            return crate::error::emit_error_with_style(
+            return crate::error::emit_input_error_with_style(
                 &format!("failed to serialize doctor report: {error}"),
-                2,
                 OutputFormat::Json,
                 json_style,
             );
@@ -131,7 +129,7 @@ const fn check_id(id: fallow_output::DoctorCheckId) -> &'static str {
 
 fn report_exit(report: &DoctorOutput) -> ExitCode {
     if report.status == DoctorStatus::Fail {
-        ExitCode::from(2)
+        exit_invalid_input()
     } else {
         ExitCode::SUCCESS
     }
@@ -147,7 +145,7 @@ mod tests {
             root: Path::new("/definitely/missing/fallow-doctor-root"),
             config_path: None,
         });
-        assert_eq!(report_exit(&report), ExitCode::from(2));
+        assert_eq!(report_exit(&report), exit_invalid_input());
         // A required failure still emits the complete envelope, in the stable
         // order the compatibility contract documents.
         assert_eq!(

@@ -2,6 +2,8 @@ use fallow_extract::css_metrics::{
     MAX_DECLARATION_BLOCKS, MAX_NOTABLE_RULES, MAX_RAW_STYLE_VALUES,
 };
 
+use super::keyframe_hints::{BlockComments, blank_comments};
+
 /// Upper bound on a compiled (flat) parent selector. Each `&` copies the whole
 /// parent, so repeated `& &` nesting doubles it per level; past this size the
 /// parent is treated as unknown and suffixes below it stay as written. Real
@@ -20,7 +22,7 @@ const MAX_COMPILED_SELECTOR_BYTES: usize = 4096;
 /// descendant `&`. The layers are analysed separately and merged with
 /// [`merge_css_analytics`].
 pub(super) fn preprocessor_virtual_stylesheets(source: &str) -> Vec<String> {
-    let clean = strip_preprocessor_comments(source);
+    let clean = blank_comments(source, BlockComments::Keep);
     let mut out = LayeredWriter::new(&clean);
     let context = RenderContext {
         layer: 0,
@@ -243,29 +245,6 @@ fn trimmed_start_offset(source: &str, start: usize, end: usize) -> usize {
     start + (raw.len() - raw.trim_start().len())
 }
 
-fn strip_preprocessor_comments(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let bytes = source.as_bytes();
-    let mut cursor = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            out.push_str(&source[cursor..i]);
-            out.push_str("  ");
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                out.push(' ');
-                i += 1;
-            }
-            cursor = i;
-            continue;
-        }
-        i += 1;
-    }
-    out.push_str(&source[cursor..]);
-    out
-}
-
 fn render_preprocessor_children<'a>(
     source: &'a str,
     start: usize,
@@ -349,6 +328,10 @@ fn render_preprocessor_block<'a>(
         out.write(layer, " }");
         return;
     }
+    if is_definition_at_rule(prelude) {
+        render_definition_at_rule(source, block, context, out);
+        return;
+    }
     if prelude.starts_with('@') || prelude.ends_with(':') {
         return;
     }
@@ -385,6 +368,95 @@ fn render_preprocessor_block<'a>(
     out.write(layer, " }");
 }
 
+/// At-rules that define a name the CSS analytics read: `@keyframes` (also
+/// with a vendor prefix), `@font-face` and `@property`. A name that holds a
+/// Sass or Less variable is not known before compilation, so it stays out.
+fn is_definition_at_rule(prelude: &str) -> bool {
+    let Some(rest) = prelude.strip_prefix('@') else {
+        return false;
+    };
+    let (keyword, name) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if name.contains(['$', '@']) {
+        return false;
+    }
+    let keyword = keyword.to_ascii_lowercase();
+    let unprefixed = ["-webkit-", "-moz-", "-o-", "-ms-"]
+        .iter()
+        .find_map(|prefix| keyword.strip_prefix(prefix))
+        .unwrap_or(&keyword);
+    unprefixed == "keyframes" || matches!(keyword.as_str(), "font-face" | "property")
+}
+
+/// Write a defining at-rule with its body. At the root, or inside root
+/// at-rules, it stays in place. Inside a style rule, CSS does not accept it,
+/// so it moves to the top level of the next layer with its enclosing at-rules,
+/// as Sass bubbles a `@keyframes` block out. Sass compiles a nested
+/// `@font-face` or `@property` in a different shape, but the analytics read
+/// only the defined name, which the move keeps. The rule stays when its body
+/// is empty, because the name alone is the definition.
+fn render_definition_at_rule<'a>(
+    source: &'a str,
+    block: &PreprocessorBlock<'a>,
+    context: &RenderContext<'a>,
+    out: &mut LayeredWriter,
+) {
+    let (layer, wrappers): (usize, &[&str]) = match context.parent {
+        ParentSelector::Root => (context.layer, &[]),
+        _ => (context.layer + 1, &context.at_rules),
+    };
+    open_at_rule_wrappers(out, layer, block.prelude_offset, wrappers);
+    out.write_at(
+        layer,
+        block.prelude_offset,
+        &format!("{} {{", unescape_less_name(block.prelude)),
+    );
+    let inner = RenderContext {
+        layer,
+        parent: ParentSelector::Unknown,
+        at_rules: Vec::new(),
+    };
+    render_preprocessor_body(source, block.body_start, block.body_end, &inner, out);
+    out.write(layer, " }");
+    for _ in wrappers {
+        out.write(layer, " }");
+    }
+}
+
+/// Write a Less escaped name (`@keyframes ~"spin"`) as Less compiles it
+/// (`@keyframes spin`). A name with an interpolation never gets here, because
+/// [`is_definition_at_rule`] keeps it out.
+fn unescape_less_name(prelude: &str) -> std::borrow::Cow<'_, str> {
+    let Some((keyword, name)) = prelude.split_once(char::is_whitespace) else {
+        return prelude.into();
+    };
+    let escaped = name.trim().strip_prefix('~').and_then(|quoted| {
+        ['"', '\'']
+            .into_iter()
+            .find_map(|quote| quoted.strip_prefix(quote)?.strip_suffix(quote))
+    });
+    match escaped {
+        Some(inner) => format!("{keyword} {inner}").into(),
+        None => prelude.into(),
+    }
+}
+
+/// Re-open the enclosing at-rules of a rule that moves to another layer, on
+/// the free line above the rule when there is one.
+fn open_at_rule_wrappers(out: &mut LayeredWriter, layer: usize, offset: usize, at_rules: &[&str]) {
+    let wrapper_offset = if at_rules.is_empty() {
+        offset
+    } else {
+        out.free_line_above(layer, offset).unwrap_or(offset)
+    };
+    for at_rule in at_rules {
+        out.write_at(
+            layer,
+            wrapper_offset,
+            &format!("{} {{", single_line(at_rule)),
+        );
+    }
+}
+
 /// Write a resolved parent-suffix rule flat at the top level of the next
 /// layer, re-entering its enclosing at-rules. Its nesting depth restarts at 0,
 /// as in the compiled stylesheet, where suffix concatenation adds no nesting.
@@ -398,19 +470,7 @@ fn render_hoisted_rule<'a>(
 ) {
     let layer = context.layer + 1;
     let checkpoint = out.checkpoint(layer);
-    let wrapper_offset = if context.at_rules.is_empty() {
-        block.prelude_offset
-    } else {
-        out.free_line_above(layer, block.prelude_offset)
-            .unwrap_or(block.prelude_offset)
-    };
-    for at_rule in &context.at_rules {
-        out.write_at(
-            layer,
-            wrapper_offset,
-            &format!("{} {{", single_line(at_rule)),
-        );
-    }
+    open_at_rule_wrappers(out, layer, block.prelude_offset, &context.at_rules);
     out.write_at(
         layer,
         block.prelude_offset,
@@ -758,6 +818,64 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn absolute_url_in_a_value_survives_the_line_comment_strip() {
+        // A `//` inside url() or a string is part of the value. When the
+        // strip blanked it, the file lowered to nothing and dropped out of
+        // css_analytics (#4324).
+        for rule in [
+            ".x { background: url(//cdn.example.com/a.png); }",
+            ".x { background: url(https://cdn.example.com/a.png); }",
+            ".x { background: url(\"//cdn.example.com/a.png\"); }",
+        ] {
+            let source = format!("{rule}\n.y {{ color: red; }}\n");
+            let layer = main_layer(&source);
+            assert!(layer.contains("cdn.example.com"), "{rule} -> {layer}");
+            assert!(layer.contains("color: red"), "{rule} -> {layer}");
+        }
+    }
+
+    #[test]
+    fn a_quote_inside_a_block_comment_does_not_hide_later_line_comments() {
+        let source = "/* Don't edit */\n.x { color: red; } // drop me\n/* it's // here */ .y { color: blue; }\n";
+        let layer = main_layer(source);
+        assert!(!layer.contains("drop me"), "{layer}");
+        assert!(layer.contains("color: blue"), "{layer}");
+        assert!(layer.contains("Don't edit"), "{layer}");
+    }
+
+    #[test]
+    fn line_comments_inside_parentheses_are_stripped() {
+        let source = "$map: (\n  a: 1, // don't\n  b: 2\n);\n.x { color: red; } // gone\n.y { color: blue; }\n";
+        let layer = main_layer(source);
+        assert!(!layer.contains("don't"), "{layer}");
+        assert!(!layer.contains("gone"), "{layer}");
+        assert!(layer.contains("color: blue"), "{layer}");
+    }
+
+    #[test]
+    fn a_string_inside_an_unquoted_url_keeps_its_parenthesis() {
+        let layer =
+            main_layer(".x { background: url($a + \"x)//y\"); }\n.y { color: blue; } // gone\n");
+        assert!(layer.contains("\"x)//y\")"), "{layer}");
+        assert!(!layer.contains("gone"), "{layer}");
+    }
+
+    #[test]
+    fn an_unclosed_quote_ends_at_the_line_end() {
+        let layer = main_layer(".x { font-family: Bob's; }\n// gone\n.y { color: blue; }\n");
+        assert!(!layer.contains("gone"), "{layer}");
+        assert!(layer.contains("color: blue"), "{layer}");
+    }
+
+    #[test]
+    fn real_line_comments_are_still_stripped() {
+        let layer = main_layer("// noted\n.x {\n  // inline note\n  color: red;\n}\n");
+        assert!(layer.contains("color: red"), "{layer}");
+        assert!(!layer.contains("noted"), "{layer}");
+        assert!(!layer.contains("inline note"), "{layer}");
     }
 
     fn line_of(output: &str, needle: &str) -> usize {
@@ -1168,6 +1286,71 @@ mod tests {
         let source = ".a { color: red; }      .b { color: blue; }\n";
         let output = main_layer(source);
         assert_eq!(output.find(".b"), source.find(".b"), "{output}");
+    }
+
+    #[test]
+    fn keyframes_define_their_name() {
+        let source = ".spinner {\n  animation: spin 1s linear infinite;\n}\n\n@keyframes spin {\n  to {\n    transform: rotate(360deg);\n  }\n}\n";
+        let analytics = lowered_analytics(source);
+        assert_eq!(analytics.defined_keyframes, vec!["spin".to_owned()]);
+        assert_eq!(analytics.referenced_keyframes, vec!["spin".to_owned()]);
+        assert_eq!(line_of(&main_layer(source), "@keyframes spin"), 5);
+    }
+
+    #[test]
+    fn keyframes_with_empty_or_dynamic_steps_define_their_name() {
+        let source = "@keyframes fade { from {} to { opacity: #{$x}; } }\n@-webkit-keyframes pulse { 0%, 100% { opacity: $o; } }\n";
+        let analytics = lowered_analytics(source);
+        assert_eq!(
+            analytics.defined_keyframes,
+            vec!["fade".to_owned(), "pulse".to_owned()]
+        );
+    }
+
+    #[test]
+    fn keyframes_nested_in_a_rule_define_their_name() {
+        let source = ".a {\n  color: red;\n  @media (min-width: 1px) {\n    @keyframes grow {\n      from { width: 0; }\n    }\n  }\n}\n";
+        let analytics = lowered_analytics(source);
+        assert_eq!(analytics.defined_keyframes, vec!["grow".to_owned()]);
+        assert_eq!(analytics.total_declarations, 1);
+    }
+
+    #[test]
+    fn interpolated_keyframes_name_stays_out() {
+        let source = "@keyframes #{$name} { to { opacity: 1; } }\n.a { color: red; }\n";
+        assert!(lowered_analytics(source).defined_keyframes.is_empty());
+    }
+
+    #[test]
+    fn less_variable_keyframes_name_stays_out() {
+        let source = "@keyframes @name { to { opacity: 1; } }\n.a { color: red; }\n";
+        let output = main_layer(source);
+        assert!(!output.contains("@keyframes"), "{output}");
+    }
+
+    #[test]
+    fn less_keyframes_define_their_name() {
+        let source = "@speed: 1s;\n.a { animation: spin @speed linear; }\n@keyframes spin { to { opacity: 1; } }\n";
+        let analytics = lowered_analytics(source);
+        assert_eq!(analytics.defined_keyframes, vec!["spin".to_owned()]);
+    }
+
+    #[test]
+    fn less_escaped_keyframes_name_defines_the_unescaped_name() {
+        let source = "@keyframes ~\"spin\" { to { opacity: 1; } }\n.a { animation: spin 1s; }\n";
+        let analytics = lowered_analytics(source);
+        assert_eq!(analytics.defined_keyframes, vec!["spin".to_owned()]);
+    }
+
+    #[test]
+    fn font_face_and_property_rules_are_kept() {
+        let source = "@font-face {\n  font-family: \"Brand\";\n  src: url(brand.woff2);\n}\n@property --angle {\n  syntax: \"<angle>\";\n  inherits: false;\n  initial-value: 0deg;\n}\n.a { font-family: \"Brand\"; }\n";
+        let analytics = lowered_analytics(source);
+        assert_eq!(analytics.defined_font_faces, vec!["Brand".to_owned()]);
+        assert_eq!(
+            analytics.registered_custom_properties,
+            vec!["--angle".to_owned()]
+        );
     }
 
     #[test]

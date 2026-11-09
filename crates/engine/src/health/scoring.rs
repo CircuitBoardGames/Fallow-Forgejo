@@ -269,7 +269,7 @@ fn compute_complexity_density(total_cyclomatic: u32, lines: u32) -> f64 {
 
 /// CRAP score threshold (inclusive). CC=5 untested gives exactly 30 (5^2 + 5),
 /// matching the canonical CRAP threshold from Savoia & Evans (2007).
-pub(super) const CRAP_THRESHOLD: f64 = 30.0;
+const CRAP_THRESHOLD: f64 = 30.0;
 
 /// Effective-threshold inputs for the CRAP columns of file scoring: the run
 /// resolver plus the `enforce_crap` bit from the health scope.
@@ -628,7 +628,7 @@ fn compute_crap_scores_estimated(
 /// "inherited from" suffix points at a meaningful owner rather than an
 /// arbitrary first match.
 #[derive(Debug, Clone)]
-pub(super) struct TemplateInheritContext {
+struct TemplateInheritContext {
     pub is_test_reachable: bool,
     pub test_referenced_exports: rustc_hash::FxHashSet<String>,
     /// The owning `.ts` file path used for human-output provenance
@@ -1965,7 +1965,7 @@ fn accessor_property_name(name: &str) -> Option<&str> {
 /// with its canonicalized form: coverage generated inside a symlinked
 /// directory (macOS `/var` vs `/private/var`) records the symlinked spelling
 /// while the rebase prefix is typically canonical. Paths under neither
-/// spelling are kept as-is, matching the previous behavior.
+/// spelling are kept as-is.
 fn rebase_coverage_path(
     raw_path: std::path::PathBuf,
     coverage_root: &std::path::Path,

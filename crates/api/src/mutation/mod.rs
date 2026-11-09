@@ -6,6 +6,7 @@
 //! [`crate::run_mutation`] and [`crate::plan_mutation`].
 
 pub(crate) mod companion;
+pub(crate) mod companion_temp;
 pub(crate) mod discovery;
 pub(crate) mod journal;
 pub(crate) mod kill_matrix;
@@ -23,6 +24,9 @@ pub(crate) mod typecheck;
 pub(crate) mod verdicts;
 pub(crate) mod worktree;
 
+/// The model runs link `node_modules` with a Unix symlink.
+#[cfg(all(test, unix))]
+mod cache_model;
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests unwrap to keep assertions short")]
 mod e2e_tests;
@@ -120,10 +124,25 @@ pub struct MutationRunOptions {
     pub allow_side_effects: bool,
     /// Execute all covering tests and retain complete killing test sets.
     pub kill_matrix: bool,
+    /// The `--kill-matrix-for` targets: test files or runner test ids. Each
+    /// mutant that a target test covers runs its target tests without bail
+    /// and its other covering tests with bail. The other mutants are
+    /// `pruned`. Exclusive with `kill_matrix`.
+    pub kill_matrix_targets: Vec<String>,
     /// The maximum number of covered mutants to run, in rank order. A
     /// mutant that no dry-run test covers is `no_coverage` and does not
     /// count. The others become `pending`.
     pub max_mutants: Option<usize>,
+    /// The maximum number of mutants on one source line, chosen at plan time
+    /// in a fixed operator order. The others become `pending` with the reason
+    /// `sampled-out`, and the run never executes them. `None` uses the
+    /// `mutation.mutantsPerLine` config key, else keeps each mutant. A run of
+    /// `mutant_ids` never samples.
+    pub mutants_per_line: Option<usize>,
+    /// Widen each changed line of the changed-code scope to the whole
+    /// function that holds it. The other scopes ignore it. `false` still
+    /// uses the `mutation.functionScope` config key.
+    pub function_scope: bool,
     /// Run in a dirty git worktree, or outside a git worktree. The run still
     /// compares the worktree after the run.
     pub allow_dirty: bool,
@@ -162,4 +181,14 @@ pub struct MutationRunOptions {
     /// journal, the run starts from the beginning and the report says so.
     /// Without this option, the run starts a new journal.
     pub resume: bool,
+    /// Run only the mutants with these ids, for example the survivors of an
+    /// earlier report after new tests. Each id must be in the plan of the
+    /// scope, or the run fails with `FALLOW_MUTATION_UNKNOWN_MUTANT`. Empty
+    /// runs each mutant of the scope.
+    pub mutant_ids: Vec<String>,
+    /// Allow a dirty worktree when each dirty path is a test file: a path
+    /// that the test path rules match, or a test file of the plan. Another
+    /// dirty path fails the run with `FALLOW_MUTATION_NON_TEST_CHANGE`, so
+    /// the run proves a change of the tests only. `allow_dirty` wins.
+    pub test_changes_only: bool,
 }

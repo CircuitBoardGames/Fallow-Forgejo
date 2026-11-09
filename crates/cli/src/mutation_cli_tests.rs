@@ -130,6 +130,149 @@ fn mutation_kill_matrix_flag_reaches_the_run_options() {
 }
 
 #[test]
+fn mutation_kill_matrix_for_targets_reach_the_run_options_and_exclude_the_full_matrix() {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        args: MutationArgs,
+    }
+
+    let command = Command::try_parse_from([
+        "mutation",
+        "src/a.ts",
+        "--kill-matrix-for",
+        "test/a.test.ts",
+        "--kill-matrix-for",
+        "test/b.test.ts::adds, then rounds",
+    ])
+    .expect("each flag takes one target");
+    let mut args = command.args;
+    assert_eq!(
+        std::mem::take(&mut args.paths),
+        [PathBuf::from("src/a.ts")],
+        "a target does not take the positional paths"
+    );
+    let options = run_options(&input(
+        Path::new("/project"),
+        args,
+        MutationConfig::default(),
+    ))
+    .unwrap();
+    assert_eq!(
+        options.kill_matrix_targets,
+        ["test/a.test.ts", "test/b.test.ts::adds, then rounds"]
+    );
+    assert!(!options.kill_matrix);
+    assert!(
+        Command::try_parse_from(["mutation", "--kill-matrix", "--kill-matrix-for", "t.ts"])
+            .is_err(),
+        "the full matrix and the target matrix are exclusive"
+    );
+
+    let plan = MutationArgs {
+        plan: true,
+        kill_matrix_for: vec!["test/a.test.ts".to_owned()],
+        ..MutationArgs::default()
+    };
+    let error = run_inner(&input(
+        Path::new("/project"),
+        plan,
+        MutationConfig::default(),
+    ))
+    .expect_err("a plan cannot collect test outcomes");
+    assert!(
+        error.message.contains("--kill-matrix-for requires a run"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn mutation_kill_matrix_for_human_report_names_targets_and_shared_kills() {
+    use fallow_output::{
+        MutationKillMatrixTarget, MutationKillMatrixTargetStatus, MutationTargetOnlyKill,
+    };
+
+    let mut measured = report(
+        vec![mutant("m1", "src/math.ts", 1, MutantStatus::Killed)],
+        Vec::new(),
+    );
+    let mut matrix = kill_matrix_fixture();
+    matrix.tests.truncate(2);
+    matrix.coverage_without_kills.clear();
+    matrix.targets = Some(vec![MutationKillMatrixTarget {
+        target: "test/a.test.ts".to_owned(),
+        test_ids: vec!["test/a.test.ts::adds".to_owned()],
+        status: MutationKillMatrixTargetStatus::Complete,
+        reasons: Vec::new(),
+    }]);
+    matrix.tests[0].subsuming_tests.clear();
+    matrix.tests[0].notes = vec!["subsumers-not-computed".to_owned()];
+    matrix.tests[0].target_only_kills = Some(vec![MutationTargetOnlyKill {
+        mutant_id: "m1".to_owned(),
+        targets: vec!["test/b.test.ts::adds".to_owned()],
+    }]);
+    matrix.tests[1].target_only_kills = Some(Vec::new());
+    measured.kill_matrix = matrix;
+    let text = run_text(&measured, &OPTIONS);
+    for expected in [
+        "Target test/a.test.ts: 1 test, complete\n",
+        "Kills shared only with other targets:\n      m1 (also: test/b.test.ts::adds)",
+        "Kills shared only with other targets: none",
+        "Subsumers are not computed: the other tests stop at the first failure.",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}: {text}");
+    }
+    assert!(!text.contains("Individual subsumers"), "{text}");
+}
+
+#[test]
+fn mutation_kill_matrix_for_human_report_shows_candidates_of_complete_targets() {
+    use fallow_output::{
+        MutationKillMatrixStatus, MutationKillMatrixTarget, MutationKillMatrixTargetStatus,
+    };
+
+    let mut measured = report(
+        vec![mutant("m1", "src/math.ts", 1, MutantStatus::Killed)],
+        Vec::new(),
+    );
+    let mut matrix = kill_matrix_fixture();
+    matrix.status = MutationKillMatrixStatus::Incomplete;
+    matrix.reasons = vec!["incomplete-mutant-results".to_owned()];
+    matrix.targets = Some(vec![
+        MutationKillMatrixTarget {
+            target: "test/a.test.ts".to_owned(),
+            test_ids: vec!["test/a.test.ts::adds".to_owned()],
+            status: MutationKillMatrixTargetStatus::Complete,
+            reasons: Vec::new(),
+        },
+        MutationKillMatrixTarget {
+            target: "test/c.test.ts".to_owned(),
+            test_ids: vec!["test/c.test.ts::loads".to_owned()],
+            status: MutationKillMatrixTargetStatus::Incomplete,
+            reasons: vec!["incomplete-mutant-results".to_owned()],
+        },
+    ]);
+    measured.kill_matrix = matrix;
+    let text = run_text(&measured, &OPTIONS);
+    for expected in [
+        "Test kill evidence: incomplete",
+        "Target test/a.test.ts: 1 test, complete\n",
+        "Target test/c.test.ts: 1 test, incomplete (incomplete-mutant-results)\n",
+        "Only the tests of complete targets can be candidates.",
+        "Redundant-test candidates for review (1)",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}: {text}");
+    }
+    assert!(
+        !text.contains("Candidates are unavailable because the kill matrix is incomplete."),
+        "{text}"
+    );
+}
+
+#[test]
 fn mutation_plan_rejects_a_kill_matrix_before_analysis() {
     let args = MutationArgs {
         plan: true,
@@ -157,6 +300,8 @@ fn flags_win_over_config_and_config_fills_the_gaps() {
         operators: Some(vec![MutationOperatorName::RemovedCall]),
         concurrency: Some(3),
         min_score: Some(60.0),
+        mutants_per_line: Some(2),
+        function_scope: Some(true),
         ..MutationConfig::default()
     };
     let from_config = run_options(&input(root, MutationArgs::default(), config.clone())).unwrap();
@@ -165,6 +310,11 @@ fn flags_win_over_config_and_config_fills_the_gaps() {
         "the API plan applies the config operators, so CLI and MCP share one rule"
     );
     assert_eq!(from_config.concurrency, Some(3));
+    assert_eq!(
+        from_config.mutants_per_line, None,
+        "the API applies these config keys, so CLI and MCP share one rule"
+    );
+    assert!(!from_config.function_scope);
     assert_eq!(from_config.scope, MutationRunScope::Changed { base: None });
     assert!(!from_config.allow_side_effects);
 
@@ -172,6 +322,7 @@ fn flags_win_over_config_and_config_fills_the_gaps() {
         operators: vec!["arithmetic-operator".to_owned(), "return-value".to_owned()],
         concurrency: Some(1),
         min_score: Some(90.0),
+        mutants_per_line: Some(1),
         all: true,
         allow_side_effects: true,
         time_budget: Some("2m".to_owned()),
@@ -185,6 +336,7 @@ fn flags_win_over_config_and_config_fills_the_gaps() {
         Some(vec![Operator::ArithmeticOperator, Operator::ReturnValue])
     );
     assert_eq!(from_flags.concurrency, Some(1));
+    assert_eq!(from_flags.mutants_per_line, Some(1), "the flag wins");
     assert_eq!(from_flags.scope, MutationRunScope::All);
     assert!(from_flags.allow_side_effects);
     assert_eq!(from_flags.time_budget, Some(Duration::from_secs(120)));
@@ -193,9 +345,50 @@ fn flags_win_over_config_and_config_fills_the_gaps() {
 }
 
 #[test]
+fn a_recheck_never_samples_whatever_the_config_and_the_flags_say() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/add.js"),
+        "export const add = (a, b) => a + b;\n",
+    )
+    .unwrap();
+    let digest = crate::mutation_inspect::sha256_hex(b"export const add = (a, b) => a + b;\n");
+    let report = serde_json::json!({
+        "kind": "mutation",
+        "mutants": [{
+            "mutant_id": "a", "file": "src/add.js", "line": 1, "column": 1,
+            "span": [0, 1], "operator": "x", "status": "survived",
+        }],
+        "files": [{ "path": "src/add.js", "source_sha256": digest }],
+    });
+    let report_path = dir.path().join("report.json");
+    std::fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+    let selection = recheck::select(&report_path, dir.path(), &[]).unwrap();
+
+    let config = MutationConfig {
+        mutants_per_line: Some(2),
+        function_scope: Some(true),
+        ..MutationConfig::default()
+    };
+    let args = MutationArgs {
+        mutants_per_line: Some(3),
+        function_scope: true,
+        ..MutationArgs::default()
+    };
+    let rechecking = input(dir.path(), args, config);
+    let mut options = run_options(&rechecking).unwrap();
+    apply_recheck(&rechecking, &mut options, Some(&selection)).unwrap();
+
+    assert_eq!(options.mutants_per_line, None);
+    assert!(!options.function_scope);
+    assert_eq!(options.mutant_ids, ["a"]);
+}
+
+#[test]
 fn invalid_flags_and_scope_conflicts_exit_2() {
     let root = Path::new("/project");
-    let cases: [(MutationArgs, Option<&str>, &str); 7] = [
+    let cases: [(MutationArgs, Option<&str>, &str); 8] = [
         (
             MutationArgs {
                 operators: vec!["bogus".to_owned()],
@@ -235,6 +428,14 @@ fn invalid_flags_and_scope_conflicts_exit_2() {
             },
             None,
             "--max-mutants must be at least 1",
+        ),
+        (
+            MutationArgs {
+                mutants_per_line: Some(0),
+                ..MutationArgs::default()
+            },
+            None,
+            "--mutants-per-line must be at least 1",
         ),
         (
             MutationArgs {
@@ -292,6 +493,7 @@ fn mutant(id: &str, file: &str, rank: u32, status: MutantStatus) -> MutantResult
         },
         status,
         prune_reason: (status == MutantStatus::Pruned).then(|| "side-effect-sink".to_owned()),
+        pending_reason: None,
         killed_by: (status == MutantStatus::Killed).then(|| "test/a.test.ts::adds".to_owned()),
         covering_tests: if matches!(status, MutantStatus::Survived | MutantStatus::Killed) {
             vec![
@@ -311,6 +513,7 @@ fn mutant(id: &str, file: &str, rank: u32, status: MutantStatus) -> MutantResult
         cached: false,
         resumed: false,
         type_error_codes: Vec::new(),
+        equivalence_hint: None,
     }
 }
 
@@ -351,6 +554,8 @@ fn report(mutants: Vec<MutantResult>, reasons: Vec<MutationIncompleteReason>) ->
         files: Vec::new(),
         verdicts: None,
         typecheck: None,
+        recheck: None,
+        compare: None,
     }
 }
 
@@ -689,6 +894,58 @@ fn human_summary_names_pending_equivalent_errors_and_flaky_only_when_not_zero() 
 }
 
 #[test]
+fn the_summary_line_names_the_sampled_out_mutants() {
+    let mut sampled = mutant("m2", "src/a.ts", 2, MutantStatus::Pending);
+    sampled.pending_reason = Some("sampled-out".to_owned());
+    let sampled_report = report(
+        vec![
+            mutant("m1", "src/a.ts", 1, MutantStatus::Killed),
+            sampled,
+            mutant("m3", "src/a.ts", 3, MutantStatus::Pending),
+        ],
+        vec![MutationIncompleteReason::SampledOut],
+    );
+    let text = run_text(&sampled_report, &OPTIONS);
+    assert_eq!(
+        text.lines().nth(2).unwrap_or_default(),
+        "Score 100.0%  killed 1  survived 0  timeout 0  pending 2  sampled out 1  partial (sampled-out)",
+        "{text}"
+    );
+}
+
+#[test]
+fn the_plan_line_names_the_sampled_out_mutants() {
+    let plan = MutationPlanOutput {
+        schema_version: MutationPlanSchemaVersion::V1,
+        version: ToolVersion("0.0.0".to_owned()),
+        elapsed_ms: ElapsedMs(0),
+        scope: MutationScopeOutput {
+            kind: MutationScopeKind::All,
+            base_ref: None,
+        },
+        counts: MutationPlanCountsOutput {
+            total: 4,
+            planned: 1,
+            pending: 3,
+            sampled_out: 2,
+            ..MutationPlanCountsOutput::default()
+        },
+        mutants: Vec::new(),
+        files: Vec::new(),
+        test_files: Vec::new(),
+        no_test_files: false,
+        framework_config_checked: true,
+        skipped_files: Vec::new(),
+        unmatched_paths: Vec::new(),
+    };
+    let text = plain(&render_plan(&plan));
+    assert!(
+        text.contains("Mutants: 1 planned, 3 pending (2 sampled out), 0 no coverage, 0 pruned\n"),
+        "{text}"
+    );
+}
+
+#[test]
 fn the_only_next_step_is_a_read_only_inspect_of_the_saved_report() {
     let survivor = report(
         vec![mutant("m1", "src/a.ts", 1, MutantStatus::Survived)],
@@ -987,6 +1244,7 @@ fn a_survivor_type_check_shows_its_counts_and_a_failed_check_says_so() {
         survivors: 3,
         checked: 2,
         compile_errors: 1,
+        hinted: 0,
         skipped: vec![fallow_output::MutationTypecheckSkip {
             reason: fallow_output::MutationTypecheckSkipReason::NoProject,
             count: 1,
@@ -1000,10 +1258,26 @@ fn a_survivor_type_check_shows_its_counts_and_a_failed_check_says_so() {
         "{text}"
     );
     checked.typecheck = Some(fallow_output::MutationTypecheckOutput {
+        completed: true,
+        survivors: 3,
+        checked: 3,
+        compile_errors: 0,
+        hinted: 2,
+        skipped: Vec::new(),
+    });
+    let text = run_text(&checked, &OPTIONS);
+    assert!(
+        text.contains(
+            "Survivor type check: 3 checked, 0 do not type-check, 2 have an equivalence hint\n"
+        ),
+        "{text}"
+    );
+    checked.typecheck = Some(fallow_output::MutationTypecheckOutput {
         completed: false,
         survivors: 2,
         checked: 0,
         compile_errors: 0,
+        hinted: 0,
         skipped: Vec::new(),
     });
     let text = run_text(&checked, &OPTIONS);
@@ -1097,6 +1371,7 @@ fn human_plan_counts_the_no_coverage_mutants_by_test_reach() {
         location: mutant(id, "src/a.ts", 1, MutantStatus::Pending).location,
         disposition: MutationPlanDisposition::NoCoverage,
         prune_reason: None,
+        pending_reason: None,
         test_reach: reach.map(|reach| MutantTestReach {
             reach,
             export_name: None,
@@ -1142,6 +1417,7 @@ fn human_plan_lists_planned_mutants_and_prune_reasons() {
         location: mutant(id, "src/a.ts", rank, MutantStatus::Pending).location,
         disposition,
         prune_reason: reason.map(str::to_owned),
+        pending_reason: None,
         test_reach: None,
     };
     let plan = MutationPlanOutput {
@@ -1413,6 +1689,50 @@ fn an_error_line_names_its_mutant() {
 }
 
 #[test]
+fn skipped_tests_show_as_a_warning() {
+    let mut warned = report(Vec::new(), Vec::new());
+    warned.errors = vec![fallow_output::MutationRunIssue {
+        code: fallow_output::SKIPPED_TESTS_CODE.to_owned(),
+        message: "1 test in the test files of the plan is skipped or todo".to_owned(),
+        mutant_id: None,
+        stderr_tail: None,
+    }];
+    let text = run_text(&warned, &OPTIONS);
+    assert!(
+        text.contains("Warning (skipped-tests): 1 test in the test files"),
+        "{text}"
+    );
+}
+
+#[test]
+fn duplicate_test_ids_show_as_a_warning_and_other_issues_as_errors() {
+    let mut warned = report(Vec::new(), Vec::new());
+    warned.errors = vec![
+        fallow_output::MutationRunIssue {
+            code: fallow_output::DUPLICATE_TEST_IDS_CODE.to_owned(),
+            message: "2 dry-run test ids belong to tests with the same title".to_owned(),
+            mutant_id: None,
+            stderr_tail: None,
+        },
+        fallow_output::MutationRunIssue {
+            code: "runtime-error".to_owned(),
+            message: "the companion exited".to_owned(),
+            mutant_id: None,
+            stderr_tail: None,
+        },
+    ];
+    let text = run_text(&warned, &OPTIONS);
+    assert!(
+        text.contains("Warning (duplicate-test-ids): 2 dry-run test ids"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Error (runtime-error): the companion exited"),
+        "{text}"
+    );
+}
+
+#[test]
 fn the_survived_section_shows_ten_mutants_and_one_more_line() {
     let survivors: Vec<MutantResult> = (1..=12)
         .map(|rank| {
@@ -1576,6 +1896,7 @@ fn the_plan_list_shows_twenty_mutants_and_one_more_line() {
                     .location,
                 disposition: MutationPlanDisposition::Planned,
                 prune_reason: None,
+                pending_reason: None,
                 test_reach: None,
             })
             .collect(),
@@ -1699,6 +2020,7 @@ fn kill_matrix_fixture() -> fallow_output::MutationKillMatrix {
                 unique_kills: Vec::new(),
                 subsuming_tests: vec!["test/b.test.ts::adds".to_owned()],
                 notes: vec!["static-test-file-only-export-reach".to_owned()],
+                target_only_kills: None,
             },
             MutationTestKillRow {
                 test_id: "test/b.test.ts::adds".to_owned(),
@@ -1707,6 +2029,7 @@ fn kill_matrix_fixture() -> fallow_output::MutationKillMatrix {
                 unique_kills: vec!["m2".to_owned()],
                 subsuming_tests: Vec::new(),
                 notes: Vec::new(),
+                target_only_kills: None,
             },
             MutationTestKillRow {
                 test_id: "test/c.test.ts::loads".to_owned(),
@@ -1715,8 +2038,10 @@ fn kill_matrix_fixture() -> fallow_output::MutationKillMatrix {
                 unique_kills: Vec::new(),
                 subsuming_tests: Vec::new(),
                 notes: vec!["observed-instrumented-file-only-test".to_owned()],
+                target_only_kills: None,
             },
         ],
+        targets: None,
     }
 }
 
@@ -1929,4 +2254,20 @@ fn mutation_human_inspect_bounds_killers_without_truncating_json() {
         json["killing_tests"][10],
         format!("test/killers/10::{long_name}")
     );
+}
+
+#[test]
+fn a_hinted_survivor_shows_the_advisory_note() {
+    let plain = mutant("m1", "src/a.ts", 1, MutantStatus::Survived);
+    let mut hinted = mutant("m2", "src/a.ts", 2, MutantStatus::Survived);
+    hinted.equivalence_hint = Some(fallow_output::MutantEquivalenceHint::TypeNonNullish);
+    let text = run_text(&report(vec![plain.clone(), hinted], Vec::new()), &OPTIONS);
+    assert_eq!(
+        text.matches("hint: the type of the receiver").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("record it in a verdict file"), "{text}");
+    let without = run_text(&report(vec![plain], Vec::new()), &OPTIONS);
+    assert!(!without.contains("hint: the type"), "{without}");
 }

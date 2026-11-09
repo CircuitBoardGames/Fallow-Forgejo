@@ -119,7 +119,7 @@ impl PackageChangeScope {
 
     /// Authored workspace keys and their refs. A key is project-relative and
     /// uses the path that discovery reports, also for a symlinked workspace.
-    pub fn configured_baselines(&self) -> impl Iterator<Item = (&str, &str)> {
+    pub(crate) fn configured_baselines(&self) -> impl Iterator<Item = (&str, &str)> {
         self.workspaces.values().filter_map(|baseline| {
             if let WorkspaceBaseline::Changed { key, reference, .. } = baseline {
                 Some((key.as_str(), reference.as_str()))
@@ -251,7 +251,7 @@ impl PackageChangeScope {
 
     /// Whether a finding owner path belongs to this mixed scope.
     #[must_use]
-    pub(crate) fn includes(&self, path: &Path) -> bool {
+    fn includes(&self, path: &Path) -> bool {
         let absolute = self.absolute_path(path);
         match self.owner_absolute(&absolute) {
             Some(WorkspaceBaseline::Changed { files, .. }) => files.contains(&absolute),

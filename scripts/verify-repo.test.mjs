@@ -20,7 +20,7 @@ const commandSignatures = (commands) => commands.map(({ command, args }) => [com
 const FAST_COMMANDS = [
   ["npm", ["run", "check:knowledge-architecture"]],
   ["npm", ["run", "check:agent-adapters"]],
-  ["node", ["scripts/check-file-size.mjs", "--base", "origin/main"]],
+  ["cargo", ["fallow", "size", "--base", "origin/main", "--fail-on-growth", "--quiet"]],
   ["node", ["scripts/changelog-fragments.mjs", "check", "--base", "origin/main"]],
   ["cargo", ["fmt", "--all", "--", "--check"]],
   ["cargo", ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]],
@@ -41,13 +41,15 @@ const FAST_COMMANDS = [
   ["npm", ["run", "lint:js"]],
   ["npm", ["run", "fmt:js:check"]],
   ["npm", ["run", "generate:contracts:check"]],
-  ["npm", ["run", "check:cargo-features"]],
-  ["npm", ["run", "check:crate-boundaries"]],
-  ["npm", ["run", "check:miri-cfg"]],
-  ["npm", ["run", "check:parse-sites"]],
+  [
+    "cargo",
+    ["fallow", "check", "--baseline", "cargo-fallow-baseline.json", "--fail-on-issues", "--quiet"],
+  ],
   ["npm", ["run", "check:emitted-versions"]],
   ["npm", ["run", "check:conformance-fixtures"]],
+  ["sh", ["scripts/hook-file-length.sh", "origin/main"]],
   ["node", ["--test", "scripts/workflow-policy.test.mjs"]],
+  ["npm", ["run", "check:miri-fs-tests"]],
 ];
 
 const FULL_ONLY_COMMANDS = [
@@ -147,9 +149,10 @@ test("the base ref steps run when the base ref exists", () => {
   });
 
   assert.equal(exitCode, 0);
-  assert.deepEqual(checkedRefs, ["origin/main", "origin/main"]);
+  assert.deepEqual(checkedRefs, ["origin/main", "origin/main", "origin/main"]);
   assert.ok(executed.includes("Large file growth"));
   assert.ok(executed.includes("Changelog fragments"));
+  assert.ok(executed.includes("File length"));
 });
 
 test("the base ref steps are skipped when the base ref is missing", () => {
@@ -170,9 +173,11 @@ test("the base ref steps are skipped when the base ref is missing", () => {
   assert.equal(exitCode, 0);
   assert.ok(!executed.includes("Large file growth"));
   assert.ok(!executed.includes("Changelog fragments"));
-  assert.equal(executed.length, commandsForMode("fast").length - 2);
+  assert.ok(!executed.includes("File length"));
+  assert.equal(executed.length, commandsForMode("fast").length - 3);
   assert.match(output, /Large file growth: skipped, because origin\/main does not exist/u);
   assert.match(output, /Changelog fragments: skipped, because origin\/main does not exist/u);
+  assert.match(output, /File length: skipped, because origin\/main does not exist/u);
   assert.match(output, /git fetch origin main/u);
 });
 
@@ -213,7 +218,7 @@ test("preflight names every missing install and runs no gate", () => {
 
   assert.equal(exitCode, 1);
   assert.deepEqual(executed, []);
-  assert.match(output, /oxlint missing; run `npm ci`/u);
+  assert.match(output, /oxlint missing; run `pnpm install`/u);
   assert.match(
     output,
     /json-schema-to-typescript missing; run `pnpm --dir editors\/vscode install`/u,
@@ -221,10 +226,10 @@ test("preflight names every missing install and runs no gate", () => {
   assert.doesNotMatch(output, /oxfmt/u);
 });
 
-test("full mode also checks the NAPI and type-aware sidecar installs", () => {
+test("full mode also checks the NAPI, sidecar and contributor-render installs", () => {
   const fast = installsForMode("fast").map(({ dependency }) => dependency);
   const full = installsForMode("full").map(({ dependency }) => dependency);
-  assert.deepEqual(full, [...fast, "@napi-rs/cli", "tsrs"]);
+  assert.deepEqual(full, [...fast, "@napi-rs/cli", "tsrs", "@resvg/resvg-js"]);
   assert.deepEqual(
     findInstallProblems("full", () => {}),
     [],

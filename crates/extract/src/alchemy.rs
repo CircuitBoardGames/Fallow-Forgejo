@@ -39,7 +39,6 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use oxc_allocator::Allocator;
-#[allow(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -84,7 +83,7 @@ impl AlchemyMains {
 /// Returns an empty result without parsing when the source does not name the
 /// package, which is the case for almost every file.
 #[must_use]
-pub fn extract_alchemy_mains(path: &Path, source: &str) -> AlchemyMains {
+pub(crate) fn extract_alchemy_mains(path: &Path, source: &str) -> AlchemyMains {
     if !source.contains(ALCHEMY_PACKAGE) {
         return AlchemyMains::default();
     }

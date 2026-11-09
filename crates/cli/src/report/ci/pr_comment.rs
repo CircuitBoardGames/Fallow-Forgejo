@@ -30,10 +30,6 @@ static WORKSPACE_MARKER: OnceLock<String> = OnceLock::new();
 /// list, prefixed with `w-`. Sort + join is deterministic so the same
 /// selection produces the same suffix across runs; two jobs with disjoint
 /// selections get distinct markers and don't race.
-#[allow(
-    dead_code,
-    reason = "called from main.rs bin target; lib target sees no caller"
-)]
 pub fn set_workspace_marker_from_list(values: &[String]) {
     let trimmed: Vec<&str> = values
         .iter()
@@ -516,6 +512,7 @@ mod tests {
                 owner: None,
                 group: None,
                 legacy_fingerprint: None,
+                audit: None,
             })
             .collect::<Vec<_>>();
         let value = serde_json::to_value(&typed).expect("typed fixture serializes");
@@ -578,9 +575,11 @@ mod tests {
             "fallow/unused-type",
             "fallow/unused-enum-member",
             "fallow/unused-class-member",
+            "fallow/unused-namespace-member",
             "fallow/unused-store-member",
             "fallow/unresolved-import",
             "fallow/unlisted-dependency",
+            "fallow/unlisted-binary",
             "fallow/duplicate-export",
             "fallow/circular-dependency",
             "fallow/re-export-cycle",
@@ -610,6 +609,7 @@ mod tests {
             severity: "minor".to_owned(),
             fingerprint: "abc".to_owned(),
             legacy_fingerprint: None,
+            audit: None,
         }];
         let envelope = PrCommentEnvelope {
             marker_id: "fallow-results".to_owned(),

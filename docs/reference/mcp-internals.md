@@ -177,11 +177,15 @@ Contract rules:
   whitespace is trimmed. Without `report`, the CLI reads
   `<cache dir>/mutation/last-report.json`, and `root`, `config` and
   `allow_remote_extends` select that cache directory. A plan document is a
-  valid `report` input. No MCP tool runs
+  valid `report` input. `mutation_tasks` runs
+  `fallow mutation tasks [--report <file>]` as a subprocess, with the same
+  `report`, `root`, `config` and `allow_remote_extends` rules. It refuses a
+  plan document, and it refuses a Rust root with
+  `FALLOW_RUST_UNSUPPORTED_TOOL`. No MCP tool runs
   mutants in version 1: a run executes the tests of the project, so the agent
-  host decides it through the CLI. Both descriptions name `fallow mutation`
-  for that reason. Code Mode refuses both tools and names the standalone
-  tools.
+  host decides it through the CLI. The descriptions name `fallow mutation`
+  for that reason. Code Mode refuses the three tools and names the
+  standalone tools.
 - The `analyze` description keeps the routing summary and the `finding_id`
   contract. The `fallow://tools/analyze` guide (`crates/mcp/src/tool_guides.rs`)
   holds the per-flag prose: the `boundary_violations` alias, the `group_by`
@@ -408,6 +412,39 @@ Contract rules:
 - The response carries `finding_id_query`. Read the contract in
   [CLI internals](cli-internals.md): a missing id is resolved only when
   `conclusive` is true.
+
+## Rust route
+
+`crates/mcp/src/tools/rust.rs` owns the Rust route. A root with a `Cargo.toml`
+and no `package.json` takes it. Without `root`, the server folder decides.
+
+- The route builds the `cargo-fallow` arguments and runs the binary through
+  `run_tool`. The timeout, the cancellation, the output cap and the exit-code
+  policy are the same as for the JavaScript route.
+- The route passes the JSON of `cargo-fallow` through unchanged. The report has
+  the shared contract fields and `language: "rust"`.
+- The route fails closed. It serializes the parameters and rejects each set
+  key that it does not map (`FALLOW_RUST_UNSUPPORTED_PARAMS`). `null` and
+  `false` count as not set. A new parameter is so rejected until someone maps
+  it.
+- `analyze` runs `check --only deps --only visibility`. `find_dupes`,
+  `check_health` and `check_architecture` run `dupes`, `complexity` and
+  `boundaries`.
+- `mutation_plan` runs `mutants --list`, and `mutation_inspect` runs
+  `mutants --inspect <id> --no-build`. Without `paths` or `changed_since`, the
+  plan covers the whole package, because `cargo-fallow` has no base-ref
+  detection. Neither compiles or runs tests. A missing
+  coverage map (`CARGO_FALLOW_NO_CACHED_MAP`) keeps the `help` of
+  `cargo-fallow`, and the route adds that the command which builds the map runs
+  the tests.
+- `project_info` gives `FALLOW_RUST_UNSUPPORTED_TOOL`. Code Mode gives the same
+  code for a Rust `root`, for a Rust server folder, and for a host call on a
+  Rust root, because its host calls build JavaScript arguments.
+- On a root with both manifests, the routed tools keep the JavaScript route and
+  add a root `warnings` entry that points to `cargo fallow`.
+- `CARGO_FALLOW_BIN`, then a `cargo-fallow` binary next to `fallow-mcp`, then
+  the `PATH` names the binary. A missing binary gives
+  `FALLOW_RUST_BINARY_NOT_FOUND`.
 
 ## Execution and telemetry
 

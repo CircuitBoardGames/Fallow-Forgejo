@@ -1,6 +1,5 @@
 //! Scope-local binding state helpers for the visitor implementation.
 
-#[allow(clippy::wildcard_imports, reason = "many scope helper AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_semantic::ScopeFlags;
@@ -126,6 +125,30 @@ impl ModuleInfoExtractor {
         self.block_depth == 0 && self.function_depth == 0 && self.namespace_depth == 0
     }
 
+    /// Module-scope object literal `const` names for a class heritage check,
+    /// or `None` in a nested scope, where a local binding can shadow them. A
+    /// heritage call that takes one of them takes data, not a class to mix in.
+    pub(in crate::visitor) fn heritage_objects(&self) -> Option<&FxHashSet<String>> {
+        self.is_module_scope()
+            .then_some(&self.module_plain_object_consts)
+    }
+
+    /// Record a module-scope `const` binding and its initializer.
+    pub(in crate::visitor) fn record_module_const_values(
+        &mut self,
+        name: &str,
+        init: &Expression<'_>,
+    ) {
+        self.record_static_package_values(name, init);
+        if super::super::helpers::is_object_literal_initializer(init) {
+            self.module_plain_object_consts.insert(name.to_string());
+        }
+    }
+
+    pub(in crate::visitor) fn record_local_declaration_name(&mut self, name: &str) {
+        self.local_declaration_names.insert(name.to_string());
+    }
+
     pub(in crate::visitor) fn is_module_or_function_runtime_scope(&self) -> bool {
         self.namespace_depth == 0
     }
@@ -136,6 +159,9 @@ impl ModuleInfoExtractor {
     /// name in an outer or sibling scope.
     pub(in crate::visitor) fn class_binding_root_is_shadowed(&self, object: &str) -> bool {
         let root = object.split_once('.').map_or(object, |(root, _)| root);
+        if self.this_result_local_is_shadowed(root) {
+            return true;
+        }
         self.nested_declaration_stack
             .iter()
             .rposition(|scope| scope.contains(root))
@@ -162,9 +188,11 @@ impl ModuleInfoExtractor {
     }
 
     /// A class binding under the root of `binding` disproves the shadow that
-    /// the declaring scope recorded for the root.
-    pub(in crate::visitor) fn clear_non_instance_binding(&mut self, binding: &str) {
+    /// the declaring scope recorded for the root. It also rebinds a `this`
+    /// result local with the name of the root in the current frame.
+    fn clear_non_instance_binding(&mut self, binding: &str) {
         let root = binding.split_once('.').map_or(binding, |(root, _)| root);
+        self.mark_this_result_local_rebound(root);
         if let Some(index) = self
             .nested_declaration_stack
             .iter()
@@ -334,6 +362,8 @@ impl ModuleInfoExtractor {
         declarator: &VariableDeclarator<'_>,
         init: &Expression<'_>,
     ) {
+        // A string `const` in any scope can also name a dynamic import.
+        self.record_const_specifier(decl, declarator, init);
         if !self.is_module_scope() {
             return;
         }
@@ -665,7 +695,8 @@ impl ModuleInfoExtractor {
             .map(|name| (name.clone(), None))
             .collect::<FxHashMap<_, _>>();
         self.nested_declaration_stack.push(scope);
-        self.scoped_require_aliases.push(FxHashSet::default());
+        self.const_specifiers.push_frame();
+        self.push_scoped_alias_frames();
         self.scoped_non_instance_bindings.push(non_instance_scope);
         self.scoped_namespace_binding_names
             .push(FxHashSet::default());
@@ -681,10 +712,74 @@ impl ModuleInfoExtractor {
         self.path_relative_binding_stack.push(path_relative_scope);
     }
 
+    /// Open the nested scope frames of a block. Outside a namespace only.
+    pub(super) fn push_nested_scope_frames(&mut self) {
+        self.nested_declaration_stack.push(FxHashSet::default());
+        self.const_specifiers.push_frame();
+        self.push_scoped_alias_frames();
+        self.scoped_non_instance_bindings.push(FxHashSet::default());
+        self.scoped_namespace_binding_names
+            .push(FxHashSet::default());
+        self.scoped_array_binding_element_types
+            .push(FxHashMap::default());
+        self.sanitizer_binding_stack.push(FxHashMap::default());
+        self.literal_allowlist_binding_stack
+            .push(FxHashMap::default());
+        self.risky_regex_binding_stack.push(FxHashMap::default());
+        self.path_sink_binding_stack.push(FxHashMap::default());
+        self.path_relative_binding_stack.push(FxHashMap::default());
+    }
+
+    /// Close the frames that [`Self::push_nested_scope_frames`] opened.
+    pub(super) fn pop_nested_scope_frames(&mut self) {
+        self.nested_declaration_stack.pop();
+        self.const_specifiers.pop_frame();
+        self.pop_scoped_alias_frames();
+        self.scoped_non_instance_bindings.pop();
+        self.scoped_namespace_binding_names.pop();
+        self.scoped_array_binding_element_types.pop();
+        self.sanitizer_binding_stack.pop();
+        self.literal_allowlist_binding_stack.pop();
+        self.risky_regex_binding_stack.pop();
+        self.path_sink_binding_stack.pop();
+        self.path_relative_binding_stack.pop();
+    }
+
+    /// Record the declaration in a loop head (`for (const s of list)`). A
+    /// lexical declaration opens its own frame, which the loop scope owns, so
+    /// the loop variable hides an outer binding of the same name. A `var`
+    /// joins the current frame. Returns whether a frame was opened; pass it to
+    /// [`Self::pop_loop_head_scope`].
+    pub(super) fn push_loop_head_scope(
+        &mut self,
+        declaration: Option<&VariableDeclaration<'_>>,
+    ) -> bool {
+        let Some(declaration) = declaration else {
+            return false;
+        };
+        if self.namespace_depth > 0 {
+            return false;
+        }
+        let lexical = declaration.kind.is_lexical();
+        if lexical {
+            self.push_nested_scope_frames();
+        }
+        self.record_nested_scope_declarators(declaration);
+        self.record_non_instance_declarators(declaration);
+        lexical
+    }
+
+    pub(super) fn pop_loop_head_scope(&mut self, pushed: bool) {
+        if pushed {
+            self.pop_nested_scope_frames();
+        }
+    }
+
     pub(super) fn pop_function_declaration_scope(&mut self) {
         if self.namespace_depth == 0 {
             self.nested_declaration_stack.pop();
-            self.scoped_require_aliases.pop();
+            self.const_specifiers.pop_frame();
+            self.pop_scoped_alias_frames();
             self.scoped_non_instance_bindings.pop();
             self.scoped_namespace_binding_names.pop();
             self.scoped_array_binding_element_types.pop();
@@ -722,6 +817,7 @@ impl ModuleInfoExtractor {
         self.scoped_direct_object_binding_targets.pop();
         self.scoped_direct_object_binding_generations.pop();
         self.scoped_direct_object_binding_paths_by_root.pop();
+        self.close_this_result_local_frames(self.scoped_direct_object_binding_roots.len());
     }
 
     pub(super) fn record_direct_object_binding_scope_roots(
@@ -764,4 +860,14 @@ impl ModuleInfoExtractor {
 
 fn static_enum_member_key(enum_name: &str, member_name: &str) -> String {
     format!("{enum_name}.{member_name}")
+}
+
+/// The declaration in the head of a `for...of` or `for...in` loop, if any.
+pub(super) fn loop_head_declaration<'s, 'a>(
+    left: &'s ForStatementLeft<'a>,
+) -> Option<&'s VariableDeclaration<'a>> {
+    match left {
+        ForStatementLeft::VariableDeclaration(declaration) => Some(declaration),
+        _ => None,
+    }
 }

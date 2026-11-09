@@ -1517,6 +1517,15 @@ assert_contains "$OUT_UEL_ANN" "::warning file=src/services.ts,line=3,col=7,titl
 OUT_UEL_FILTERED=$(jq '.unused_effect_layers = [{"path": "src/services.ts", "line": 3, "col": 0, "name": "CacheLive", "actions": []}, {"path": "src/other.ts", "line": 5, "col": 0, "name": "OtherLive", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/services.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
 assert_json_value "$OUT_UEL_FILTERED" '.unused_effect_layers | length' "1" "uel: filter-changed keeps only changed-file findings"
 
+DEA_ITEM='{"path": "src/worker.ts", "line": 1, "col": 13, "local_name": "layer", "export_names": ["layer", "default"], "locations": [], "actions": []}'
+OUT_DEA=$(jq --argjson item "$DEA_ITEM" '.duplicate_export_aliases = [$item] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_DEA" "Duplicate export aliases" "dea: shows summary row and section"
+assert_contains "$OUT_DEA" '`layer`, `default`' "dea: shows export names in section"
+OUT_DEA_ANN=$(jq --argjson item "$DEA_ITEM" '.duplicate_export_aliases = [$item]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_DEA_ANN" "::warning file=src/worker.ts,line=1,col=14,title=Duplicate export alias::" "dea: warning-severity annotation"
+OUT_DEA_FILTERED=$(jq --argjson item "$DEA_ITEM" '.duplicate_export_aliases = [$item, ($item | .path = "src/other.ts")]' "$FIXTURES/check.json" | jq --argjson changed '["src/worker.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_DEA_FILTERED" '.duplicate_export_aliases | length' "1" "dea: filter-changed keeps only changed-file findings"
+
 OUT_UTE=$(jq '.unused_tagged_errors = [{"path": "src/errors.ts", "line": 4, "col": 0, "name": "Expired", "tag": "Expired", "catch_sites": [], "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
 assert_contains "$OUT_UTE" "Unused tagged errors" "ute: shows summary row and section"
 assert_contains "$OUT_UTE" "Expired" "ute: shows class name in section"
@@ -4961,8 +4970,8 @@ else
   fail "gate: an unenforced parse-error entry exits 0" "got $GATE_EXIT: $GATE_STDOUT"
 fi
 
-# #2685: the security gate keeps its documented exit 8, and it used to be
-# unreachable because the whole branch sat inside the fail-on-issues conditional.
+# #2685: the security gate keeps its documented exit 8. It must stay reachable
+# when the gate branch is not inside the fail-on-issues conditional.
 run_gate_analyze "$(gate_envelope '{"security":{"status":"fail","enforced":true}}' '"gate":{"mode":"new","verdict":"fail","new_count":2}')" \
   INPUT_COMMAND="security" INPUT_FAIL_ON_ISSUES="false" INPUT_SECURITY_GATE="new"
 assert_contains "$GATE_STDOUT" "::error::Fallow security gate failed" \
@@ -5143,6 +5152,22 @@ assert_contains "$GATE_STDOUT" "have no effect: ignoreDependencies @typo/*." \
 run_gate_analyze "$(gate_envelope '' "$DEGRADED")" INPUT_COMMAND="dead-code" INPUT_FAIL_ON_ISSUES="false"
 assert_not_contains "$GATE_STDOUT" "matched nothing in this run" \
   "unmatched patterns: no warning without an unmatched entry"
+
+# #4067: a requested check whose rule is off reaches the job log in one warning,
+# because this step runs fallow with `--quiet --format json`. Audit keeps the
+# entries under `dead_code`.
+REQUESTED_OFF='"workspace_diagnostics":[{"path":".","kind":"requested-rule-off","rule":"unused-dependencies","flag":"--unused-deps","message":"m"},{"path":".","kind":"requested-rule-off","rule":"unused-dev-dependencies","flag":"--unused-deps","message":"m"},{"path":".","kind":"boundaries-not-configured","message":"m"}]'
+run_gate_analyze "$(gate_envelope '' "$REQUESTED_OFF")" INPUT_COMMAND="dead-code" INPUT_FAIL_ON_ISSUES="false"
+assert_contains "$GATE_STDOUT" "::warning::Fallow did not run these requested checks because their rules are off in config: unused-dependencies (--unused-deps), unused-dev-dependencies (--unused-deps). Set each rule to error or warn to run the check." \
+  "requested rule off: one warning names each rule and flag"
+assert_contains "$GATE_OUTPUTS" "analysis_degraded=false" "requested rule off: the run is not degraded"
+AUDIT_REQUESTED_OFF='"dead_code":{"workspace_diagnostics":[{"path":".","kind":"requested-rule-off","rule":"unused-exports","flag":"--unused-exports","message":"m"}]}'
+run_gate_analyze "$(gate_envelope '' "$AUDIT_REQUESTED_OFF")" INPUT_COMMAND="audit" INPUT_FAIL_ON_ISSUES="false"
+assert_contains "$GATE_STDOUT" "rules are off in config: unused-exports (--unused-exports)." \
+  "requested rule off: the audit envelope is read under dead_code"
+run_gate_analyze "$(gate_envelope '' "$DEGRADED")" INPUT_COMMAND="dead-code" INPUT_FAIL_ON_ISSUES="false"
+assert_not_contains "$GATE_STDOUT" "did not run these requested checks" \
+  "requested rule off: no warning without an entry"
 
 # #2689: the health pipeline's own degraded inputs reach the same aggregated
 # warning through the same selector, with no change to this script's jq.
@@ -5810,6 +5835,11 @@ fi
 assert_not_contains "$OUT" "no merge base" "merge base: PR head checkout gets a merge base"
 
 rm -rf "$MB_TMP"
+
+# --- Mutation testing ---
+
+# shellcheck source=mutation.sh
+source "$DIR/mutation.sh"
 
 # --- Summary ---
 

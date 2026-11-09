@@ -4,28 +4,44 @@ Use this before large changes, reviews, commits, and pushes.
 
 ## One-time local setup
 
+```bash
+mise install     # Optional: pinned Node.js, pnpm, hk, pkl and cargo tools
+pnpm bootstrap   # Install the git hooks and all dependencies
+```
+
+`pnpm bootstrap` runs `scripts/bootstrap.mjs`. The script uses only Node
+built-ins, so it runs before any install. It checks for Node.js 22.13.0 or
+later, pnpm and hk, and prints one install hint for each missing tool. It
+removes a `core.hooksPath=.githooks` setting from the repository config of an
+old clone, and warns about any other `core.hooksPath` value. Before git 2.54,
+hk installs hook files that git ignores while `core.hooksPath` is set, so the
+warning then tells you that the hk hooks do not run. Then it installs the hk hooks and runs
+`pnpm install --frozen-lockfile` at the root and in `editors/vscode`. You can
+run it again at any time.
+
 ### Git hooks with hk
 
 [hk](https://hk.jdx.dev) runs the git hooks. The root `hk.pkl` defines the
 `pre-commit`, `commit-msg` and `pre-push` hooks. hk evaluates `hk.pkl` with the
-`pkl` CLI, so install both, then run `hk install` once per clone:
+`pkl` CLI, so install both. `pnpm bootstrap` then runs `hk install --mise`
+when mise is on `PATH`, and `hk install` when it is not.
 
-```bash
-mise install
-hk install --mise
-```
-
-Without mise, install `hk` and `pkl` at the versions in `mise.toml` and run
-`hk install`. `--mise` starts the hooks through `mise x`, so a shell or git
+Without mise, install `hk` and `pkl` at the versions in `mise.toml`.
+`--mise` starts the hooks through `mise x`, so a shell or git
 client without mise activation still finds hk. `HK=0 git commit` skips the
 hooks for one command. `HK_SKIP_STEPS=<step> git commit` skips only the named
 step, for example `HK_SKIP_STEPS=file-size`.
 
 hk runs the steps of a hook in parallel. A pre-commit step with a `glob` runs
 only when a staged file matches it, so a commit without Rust inputs skips
-`cargo fmt`, Clippy and the Miri cfg check. hk does not match deleted files, so
-a commit that only deletes a Rust file also skips them. The pre-push hook runs
-`cargo fmt` and Clippy with no glob and catches that case. The pre-commit hook only checks.
+`cargo fmt`, Clippy, the Miri cfg check and the Miri file system test check.
+hk does not match deleted files, so a commit that only deletes a Rust file
+also skips them. The pre-push hook runs
+`cargo fmt` and Clippy with no glob and catches that case. A rebase applies
+resolved conflicts without the pre-commit hook, so the pre-push hook also runs
+`npm run lint:js` and `npm run fmt:js:check` on every file in the JavaScript
+scopes. Like `cargo fmt`, this step checks the working tree, not only the
+pushed commits. The pre-commit hook only checks.
 Run `hk fix` to apply the fix commands, for example `cargo fmt --all`. The
 hooks use `stash = "none"`, because every worktree of this repository shares
 one git stash stack.
@@ -36,7 +52,7 @@ Run one hook by hand with `hk run pre-commit` or `hk run pre-push`. Add
 ### Pinned tools with mise (optional)
 
 The root `mise.toml` pins the local tools that the hooks and quality gates
-call: hk, pkl, Node.js, `typos`, `cargo-shear`, `cargo-deny`, `cargo-audit`,
+call: hk, pkl, Node.js, pnpm, `typos`, `cargo-fallow`, `cargo-deny`, `cargo-audit`,
 `cargo-nextest`, `cargo-llvm-cov` and `cargo-insta`. With
 [mise](https://mise.jdx.dev) installed, run `mise install` to get the pinned
 set. mise downloads prebuilt binaries, so the install does not compile tools.
@@ -49,27 +65,57 @@ version through rustup, so `mise.toml` does not pin Rust.
 Where CI pins a tool version, `mise.toml` uses the same version.
 `scripts/workflow-policy.test.mjs` fails when the CI Node.js version or a
 `tool: name@version` pin changes and `mise.toml` does not follow. The test
-does not check typos and cargo-deny, because their CI actions fix the tool
-version in the action commit. A Dependabot action bump then does not fail.
-Update those two versions by hand.
+does not check typos, cargo-deny and cargo-fallow, because their CI actions
+fix the tool version in the action commit. A Dependabot action bump then does
+not fail. Update those three versions by hand. The same test fails when the pnpm version
+in `mise.toml` is not the lower bound of `engines.pnpm` in the root
+`package.json`,
+the `packageManager` of `editors/vscode`, or a `pnpm/action-setup` step in
+`ci.yml`, `commitlint.yml` or `contributors.yml`.
 
 ### Package installs
 
-The root `.npmrc` disables dependency lifecycle scripts by default. Keep
+The root tools and `editors/vscode` are two separate pnpm projects. Each has
+its own `pnpm-workspace.yaml` and `pnpm-lock.yaml`. The root
+`pnpm-workspace.yaml` sets a 7-day minimum release age, fails the install on
+an unapproved dependency build script, and keeps the flat `node_modules`
+layout (`nodeLinker: hoisted`) that tools under `tools/` resolve through.
+`editors/vscode/pnpm-workspace.yaml` sets the same 7-day minimum release age.
+pnpm 11 ignores pnpm keys in `.npmrc`, so `editors/vscode/.npmrc` holds only
+npm settings.
+
+The root `package.json` sets `engines.pnpm` to `^11.25.0`. pnpm stops with
+`ERR_PNPM_UNSUPPORTED_ENGINE` when its version is older than 11.25.0 or is
+not pnpm 11. `mise install` gives pnpm 11.25.0. The root does not use the other
+two pin fields:
+
+- `packageManager`: `pnpm/action-setup` rejects a `packageManager` that
+  differs from its `version` input. The PGO and ecosystem jobs set up pnpm 12
+  for their public fixtures.
+- `devEngines.packageManager`: npm fails `npm run` when no entry names npm.
+  An entry that names npm makes `actions/setup-node` turn on npm caching, and
+  that step fails because the root has no npm lockfile. Corepack also ignores
+  an array value, so Dependabot then updates the lockfile with pnpm 10.
+
+Dependabot reads `engines.pnpm`, so it updates `pnpm-lock.yaml` with pnpm 11.
+
+The root `.npmrc` disables npm dependency lifecycle scripts by default. Keep
 `--ignore-scripts` explicit on CI installs, including installs with `--prefix`
 that load another package's configuration. Run required native builds and
 extension-host downloads through the existing explicit build and test commands.
 Do not turn install scripts back on for the whole dependency tree.
 
-A root-only `npm ci` is enough for the type-aware CLI test targets. The
-type-aware CLI tests launch the real sidecar from `tools/type-aware-sidecar/`;
-without a sidecar-local install it resolves `typescript` from ancestor
-`node_modules` directories, and the root install pins the same `typescript`
-version as the sidecar (kept in lockstep through the root `package.json`
-`overrides` entry). The sidecar's own `node --test` suite resolves
-`typescript` the same way, so it also passes after a root-only `npm ci`.
+A root-only `pnpm install` is enough for the type-aware CLI test targets. The
+type-aware CLI tests launch the real sidecar from `tools/type-aware-sidecar/`.
+Without a sidecar-local install, the sidecar resolves `typescript` from
+ancestor `node_modules` directories. The root `package.json` lists
+`typescript` as an exact devDependency at the version of the sidecar. The
+`overrides` entry in the root `pnpm-workspace.yaml` pins the same version.
+`tools/type-aware-sidecar/test/backend-preflight.test.mjs` fails when these
+versions differ. The root Dependabot entry ignores `typescript`, so change
+the three versions together by hand.
 
-The sidecar-local install is still needed in two cases:
+The sidecar-local install is still needed in these cases:
 
 ```bash
 npm ci --prefix tools/type-aware-sidecar
@@ -78,6 +124,9 @@ npm ci --prefix tools/type-aware-sidecar
 - The sidecar bench (`npm run bench --prefix tools/type-aware-sidecar`)
   imports sidecar-local devDependencies that the root install does not
   provide.
+- The sidecar's own `node --test` suite checks the experimental `tsrs`
+  backend. `tsrs` is a sidecar-local devDependency, so that test fails after
+  a root-only `pnpm install`. The other tests of the suite pass.
 - When the resolvable `typescript` is missing or too old (for example the
   root install is absent or out of lockstep), the sidecar exits with code 2
   and a stderr message naming the resolved version, its location, and the
@@ -107,7 +156,7 @@ versions from `crates/api/mutation-runner-protocol.json`, installs those exact
 versions, and runs the companion tests.
 
 The coverage producer corpus pins four JavaScript coverage producers in a
-package of its own, so the root `npm ci` every contributor and every CI job
+package of its own, so the root `pnpm install` every contributor and every CI job
 runs stays untouched:
 
 ```bash
@@ -147,7 +196,7 @@ branch under test.
 Install into the checkout you are working in:
 
 ```bash
-npm ci
+pnpm install
 npm ci --prefix tools/type-aware-sidecar
 npm ci --prefix crates/napi
 pnpm --dir editors/vscode install
@@ -216,6 +265,14 @@ Focused integration checks:
 - `cargo test -p fallow-cli --test drift -- --include-ignored` for changes to a finding that the
   CLI, MCP, and `fallow_api` all report. Build `fallow-mcp` first; see the
   [drift contract](drift-contract.md).
+- `cargo test -p fallow-cli --lib architecture_boundaries` for Rust changes
+  that add a `fallow_core::` call to an engine adapter, an `env!` macro, or a
+  new cross-crate import. These source rules are tests of the CLI crate, so a
+  test run of the changed crate does not run them.
+- `sh scripts/linux-keychain-test.sh --docker` for changes to the credential
+  store of `fallow cloud login`. In a Linux container, it runs the `0600`
+  credentials file test without D-Bus and the Secret Service test with
+  `gnome-keyring`. The `Linux keychain` CI job runs the same script.
 - `npm run check:knowledge-architecture` for docs and routing changes.
 - `npm run check:agent-adapters` for skill or adapter changes.
 - `python3 scripts/check_telemetry_doc_sync.py` when telemetry agent-source
@@ -295,21 +352,24 @@ On pull requests:
 
 - `CI` (`ci.yml`). Its jobs include the required status checks on `main`.
 - `Commitlint` (job `Commit messages`).
-- `Ecosystem CI`, when Rust sources or `tests/ecosystem/**` change.
 - `Type-aware Benchmarks`, when `tools/type-aware-sidecar/**` changes.
 - `Protocol parity`, when `crates/cli/Cargo.toml` or `Cargo.lock` changes.
 - `PGO Validate`, when `scripts/pgo-train.sh`,
   `.github/scripts/pgo-compare.mjs`, `.github/scripts/pgo-profile-match.mjs`,
   `benchmarks/download-fixtures.mjs`, `.github/actions/setup-rust/**`,
-  `.cargo/config.toml`, `release.yml`, `pgo-validate.yml`, `Cargo.toml`,
-  `Cargo.lock`, or `rust-toolchain.toml` changes. It compares a PGO build with
-  a base build of the same pull request.
+  `.cargo/config.toml`, `release.yml`, `pgo-validate.yml`, `Cargo.toml`, or
+  `rust-toolchain.toml` changes. It skips Dependabot Cargo branches. It
+  compares a PGO build with a base build of the same pull request. A weekly
+  run on `main` covers dependency changes.
 - `Test GitHub Action`, when its own paths change.
 
 On push to `main` only (each one also has `workflow_dispatch`):
 
 - `Coverage`, with the coverage floor.
 - `Cross-Architecture`.
+- `Ecosystem CI`, when Rust sources or `tests/ecosystem/**` change. It is not
+  a required check and its analysis step never fails, so it does not run on
+  pull requests.
 - `Fuzz Smoke`, which also runs every week.
 - `Scorecard`.
 - `osv-scanner ignores`, which also runs every week. It fails when an
@@ -323,12 +383,97 @@ Add the `ci:perf` label to a pull request that changes a hot path. The label eve
 without the label starts these workflows, but every job skips and uses no
 runner.
 
-On a schedule only: `Branch Coverage`, `Ecosystem (Full)`, `Hawk`, and
-`Release Validation`. `Branch Coverage` runs every week and with
+`CI` uses no macOS runner. The `VS Code target host` job runs the Linux and
+Windows legs. The darwin-x64 leg runs in `Release Validation`: every week, in
+the release pre-flight, and in each release. The release `vscode-host-smoke`
+job also loads the darwin-x64 extension before the publish jobs can start. On
+busy days, the macOS queue held a `CI` run on `main` for up to two hours.
+
+On a schedule only: `Branch Coverage`, `Ecosystem (Full)`, `Oracle Seeds`,
+and `Release Validation`. `Branch Coverage` runs every week and with
 `workflow_dispatch`. It runs `cargo llvm-cov --branch` on the pinned nightly of
 `Fuzz Smoke`, because `--branch` needs a nightly compiler. It writes line and
 branch coverage to the job summary. It has no floor and does not gate a
 release.
+
+`Oracle Seeds` runs every day and with `workflow_dispatch`. It runs the
+ignored seed sweep of the cache model tests over a wide seed range. Pull
+request CI runs the same tests with the fixed `PR_SEEDS` only. Each scheduled
+run starts at a new seed number, so the sweep searches new sequences. A
+failure writes the failing template and steps to the job summary, with the
+seed range that runs them again. Add the sequence to `REGRESSIONS` in
+`crates/engine/tests/integration/cache_model/sequences.rs` when you fix the
+cause. The sweep does not gate a release.
+
+A second job runs the seed sweep of the mutation result cache model in
+`crates/api/src/mutation/cache_model`. Each of its steps runs the real Vitest
+or `bun test` runner, so a step costs much more than an analysis run. Pull
+request CI runs its regression sequences, two fixed seeds, and the read-set
+tests in the `Test` job, which installs Node, Bun and the
+`tools/mutation-runner` packages. The scheduled job runs 100 new seeds a day.
+
+A third job runs the seed sweep of the permutation oracle in
+`crates/cli/tests/integration/permutation`. The test build of the CLI has the
+`permutation-hook` feature of `fallow-config`. With `FALLOW_PERMUTATION_SEED`
+set, the hook permutes the files and config candidates of the parallel source
+walk and the discovered workspace list. The oracle runs `dead-code`, `dupes`,
+`health`, `audit` and `trace` in each `--format` on a generated monorepo,
+with and without the seed, and the output bytes must be the same. Only the
+measured durations and the telemetry run id are removed before the compare.
+The oracle fails when a run without the seed exits 2, so a command and format
+pair that the CLI rejects cannot pass. A separate test shows that the test
+binary has the hook. Pull request CI runs one fixed project seed with two
+permutation seeds per template. The scheduled job runs 60 new project seeds a
+day.
+
+A fourth job runs the seed sweep of the platform oracle in
+`crates/cli/tests/integration/platform`. Each seed generates a project, writes
+it once with LF line endings and once with CRLF or mixed line endings, and
+compares the output of `dead-code`, `dupes`, `health` and `audit` in each
+format. It also saves a baseline in each form and applies it in the other
+form. Pull request CI runs fixed seeds and the seam property tests, which feed
+backslash and drive-root paths into the path key code. The scheduled job runs
+40 new seeds a day.
+
+A fifth job runs the seed sweep of the surface differential in
+`crates/mcp/tests/integration/surface_differential`. The oracle generates a
+monorepo and runs each surface on its real path: the `fallow` binary, the
+`fallow-mcp` binary over stdio (typed route and CLI route), the `fallow-lsp`
+binary over the Language Server Protocol, the `fallow_api` calls of the Node
+bindings, and the built Node bindings when `FALLOW_SURFACE_NODE_ADDON` names
+the `crates/napi` directory. It compares normalized facts, not wire formats:
+
+- the dead-code findings with paths, lines, columns and finding ids, and the
+  editor diagnostics at the same positions with the same ids;
+- the clone groups and families in report order, on each scope that covers
+  every file (`--changed-since`, an empty `--baseline`, and `audit`);
+- each dependency and export trace against the report;
+- the effect of `FALLOW_CACHE_DIR` and `FALLOW_CACHE_MAX_SIZE` on each
+  surface.
+
+Pull request CI runs three fixed project seeds without the Node bindings in
+the `fallow-mcp` integration tests. The scheduled job builds the Node
+bindings and runs 100 new project seeds a day.
+
+### Oracle proof
+
+An oracle is a test that compares two results that must agree, for example a
+warm cache run and a `--no-cache` run. The cache model tests in
+`crates/engine/tests/integration/cache_model` are an oracle. The result
+cache model tests in `crates/api/src/mutation/cache_model`, the permutation
+oracle in `crates/cli/tests/integration/permutation`, the platform oracle in
+`crates/cli/tests/integration/platform` and the surface differential in
+`crates/mcp/tests/integration/surface_differential` are others. Each
+oracle must fail on the parent of a named fix commit and pass on the fix
+commit, or it does not catch that bug class. `node scripts/oracle-proof.mjs <oracle>` shows this.
+It checks out `fix^` and `fix` in temporary worktrees, puts the current oracle
+on each commit, builds it, and runs it. A build failure is a tool error (exit
+2), not a failing oracle. `--list` names the oracles and their fix commits. A
+fix commit can narrow the oracle to its own tests, when the commit does not
+have a later fix that the other tests need, and it can name its own build
+command for a commit with an older test layout. To add an oracle, add a module
+under `scripts/oracle-proof/` with its fix commits, its port step and its
+commands, and register it in `ORACLES`.
 
 ### Prose-only main scheduling
 
@@ -358,8 +503,9 @@ The slowest `CI` jobs have parts that run in parallel:
 - `Check (1/2)` and `Check (2/2)` each build every test binary and run half
   of the nextest suite (`--partition hash:N/2`). The suite uses about 29
   CPU-minutes, so one 4-vCPU runner needs more than 7 minutes for it.
-  `Check (1/2)` also runs the runtime-coverage feature tests, the schema drift
-  gate and the coverage producer conformance check.
+  `Check (1/2)` also runs the schema drift gate and the coverage producer
+  conformance check. `Check (2/2)` also runs the runtime-coverage feature
+  tests. The two partitions then take about the same time.
 - `Lint and contracts` runs both Clippy passes, `cargo fmt --check`, the
   contract bundle drift gate and the staged subgenerator tests.
 - `NAPI package` runs the NAPI build and smoke test. On `main` the build uses
@@ -378,6 +524,11 @@ The slowest `CI` jobs have parts that run in parallel:
   scale gets `#[cfg_attr(miri, ignore = "too slow under Miri: ...")]`. Miri
   looks for undefined behavior, and the normal test run still covers the
   logic. One such test once took 16 minutes under Miri.
+  Before a push, run
+  `cargo +<MIRI_TOOLCHAIN> miri test -p <crate> --lib --tests -- --skip proptests`
+  when a change adds a file system call or a `par_iter` to code that the
+  Miri crates test. `MIRI_TOOLCHAIN` is set in the `miri` job of
+  `.github/workflows/ci.yml`.
 
 `Check`, `Lint and contracts` and `NAPI package` have the same trigger. Only
 `Check (1/2)` and `Lint and contracts` may use the runner that the
@@ -574,19 +725,26 @@ a speed improvement. Reservations estimate cost; they do not enforce billing.
 
 ## Cargo feature unification
 
-`npm run check:cargo-features` compares the crate features of
-`cargo build -p fallow-cli` with those of `cargo build --workspace`. Cargo
+The cargo-fallow rule `feature-unification-drift` compares the crate features
+of `cargo build -p fallow-cli` with those of `cargo build --workspace`. Cargo
 resolves features per build, so a feature that only another member enables
 makes cargo compile two variants of that crate and its dependents. After each
 edit, a switch between the two commands then compiles the fallow crates again.
 Fix a failure with the feature in `[workspace.dependencies]`, or with a
-feature-only dependency in `crates/cli/Cargo.toml`. The check runs in
-`verify:fast` and in the CI Clippy job.
+feature-only dependency in `crates/cli/Cargo.toml`. `unify-features` in
+`[workspace.metadata.fallow.deps]` names the member. The rule runs in each
+`cargo fallow check` (see [Rust structure](#rust-structure)).
 
 ## Hook parity
 
 Codex does not execute `.claude/settings.json` hooks. Mirror the repository
 hooks manually when they did not run.
+
+Claude runs `node scripts/check-comment-quality.mjs --claude-pre-tool` before
+each `Edit`, `Write`, and `MultiEdit`. The hook blocks an edit that adds a
+narration comment or a comment about the edit history. Codex does not run
+this hook, so run `node scripts/check-comment-quality.mjs --working-tree`
+before you commit.
 
 Pre-commit parity:
 
@@ -597,8 +755,10 @@ typos
 python3 scripts/scan-hidden-unicode.py --mode committed --staged
 sh scripts/check-conflict-markers.sh --staged
 node scripts/check-comment-quality.mjs --staged
-node scripts/check-miri-cfg.mjs
-node scripts/check-file-size.mjs --staged
+cargo fallow boundaries --fail-on-issues --quiet
+node scripts/check-miri-fs-tests.mjs
+cargo fallow size --staged --fail-on-growth --quiet
+sh scripts/hook-file-length.sh HEAD
 sh scripts/hook-changelog-fragments.sh
 npm run lint:js
 npm run fmt:js:check
@@ -615,7 +775,9 @@ when a staged line starts with `<<<<<<<`, `|||||||` or `>>>>>>>`; build such
 lines at runtime in tests. `cargo fmt` and Clippy run
 only when staged files include a Rust file or a Cargo, toolchain, rustfmt or
 Clippy config file. The file-size check runs only when staged files include a
-`.rs`, `.mjs` or `.ts` file. See [File size](#file-size).
+`.rs` file. The file-length check runs only when staged files include a `.mjs`
+or `.ts` file, `.fallowrc.json` or `scripts/fallow-file-length.json`. See
+[File size](#file-size).
 
 The Miri cfg check reads the crates that the CI `miri` job tests. It fails when
 code that Miri compiles names a module declared under `not(miri)`, for example
@@ -625,23 +787,34 @@ this check runs in `verify:fast`, in the pre-commit hook, and in the CI script
 tests on every pull request. Fix a failure with `#[cfg(all(test, not(miri)))]`
 on the calling module.
 
+The Miri file system test check (`npm run check:miri-fs-tests`) reads the
+same crates. It walks the modules that the Miri build compiles, from
+`src/lib.rs` and each file in `tests/`. It fails when a `#[test]` function
+calls `tempdir(`, `tempfile::`, `TempDir` or `std::fs::` and has no
+`cfg_attr(miri, ignore ...)` mark. The message gives the attribute to add.
+A test under `not(miri)` or with a plain `#[ignore]` passes. The check reads
+only the body of the test. A file system call or a rayon pool start in a
+function that a test calls needs a Miri run, as the `Miri` CI item describes.
+The check runs in `verify:fast` and in the pre-commit hook.
+
 Pre-push parity:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
-cargo shear
+cargo fallow check --baseline cargo-fallow-baseline.json --fail-on-issues --quiet
+sh scripts/hook-file-length.sh origin/main upstream/main
 ```
 
 The `cargo doc` step is the same command as the required `Documentation` CI
 job. A broken intra-doc link passes fmt and clippy, so the hook catches it
 before the push. With no change the step takes under 1 s.
 
-The `cargo shear` step is the same command as the required
-`Unused Dependencies` CI job. It catches a dependency whose last use a change
-removes. When `cargo-shear` is not installed, the hook skips the step and
-prints a hint with the version in `mise.toml`.
+The `cargo fallow check` step is the same command as the required
+`Rust Structure` CI job. See [Rust structure](#rust-structure). When
+`cargo-fallow` is not installed, the hook skips the step and prints a hint
+with the version in `mise.toml`.
 
 Recommended full local verification before review:
 
@@ -653,10 +826,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-it
 
 ## File size
 
-The `file-size` pre-commit step stops large source files from growing. It
-checks each staged `.rs`, `.mjs` and `.ts` file. The limit is 2000 lines
-(`LINE_LIMIT` in `scripts/check-file-size.mjs`). The step fails in these
-cases:
+A source file over 2000 lines must not grow. Two checks hold this limit:
+
+- `cargo fallow size` checks `.rs` files.
+- `fallow audit` checks `.mjs` and `.ts` files with `health.maxFileLines`.
+
+### Rust files
+
+The `file-size` pre-commit step runs `cargo fallow size --staged
+--fail-on-growth` on each staged `.rs` file. The limit is 2000 lines
+(`max-file-lines` in `[workspace.metadata.fallow.size]` of the root
+`Cargo.toml`). The step fails in
+these cases:
 
 - A staged file over the limit has more lines than its `HEAD` version.
 - A new staged file is over the limit.
@@ -669,39 +850,159 @@ does not ask a change to shrink a file.
 The step skips these files:
 
 - Generated files. One of the first 10 lines of a generated file is a
-  comment with one of the two exact headers that the repository generators
+  comment with one of the exact headers that the repository generators
   write: `AUTOGENERATED FILE. DO NOT EDIT.`, or `Generated from <source>. Do
-  not edit.` (`Generated by` is also valid). Other comments with the words
-  `generated` and `do not edit` do not match. An author can still add an exact
-  header by hand, so review a new generator header like any other change.
+  not edit.` (`Generated by` is also valid). cargo-fallow also accepts an
+  `@generated` comment. An author can still add a header by hand, so review a
+  new generator header like any other change.
 - Files in a `snapshots` or `__snapshots__` directory. Snapshot files
   (`.snap`) are not checked file types.
-- Test files. These are files in a `tests` or `test` directory, Rust files
-  named `tests.rs`, `*_tests.rs` or `*_test.rs`, and `*.test.mjs` or
-  `*.test.ts` files. A test file grows with each new test case.
+- Test files. These are files in a `tests` or `test` directory, and files
+  named `tests.rs`, `*_tests.rs` or `*_test.rs`. A test file grows with each
+  new test case.
 
 To fix a failure, move the new code to a new module, or remove lines from
 the file in the same change. To skip only this step for one commit, run
 `HK_SKIP_STEPS=file-size git commit`. `HK=0 git commit` skips all hooks.
 
-The `Large file growth` step of the CI `JS Lint and Format` job runs the same
-rule on pull requests. It compares `HEAD` with the merge base of the pull
-request base branch:
+The `Static checks` step of the CI `Rust Structure` job runs the same rule
+on pull requests, with `base: auto`. It compares `HEAD` with the merge base
+of the pull request base branch:
 
 ```bash
-node scripts/check-file-size.mjs --base origin/main
+cargo fallow size --base origin/main --fail-on-growth
 ```
 
 The CI step has no skip route. A pull request that must grow a large file
-needs a maintainer decision. The step is the last step of the job and runs
-after a failed step. When the step cannot read the base ref, for example
-because the ref is not fetched, it exits with 2, not 1.
+needs a maintainer decision. The step runs after a failed step. When the step
+cannot read the base ref, for example because the ref is not fetched, it exits
+with 2, not 1.
 
-`verify:fast` runs the same command as its `Large file growth` step, so a
-local run finds the failure before CI does. The step compares with the local
-`origin/main` ref, so run `git fetch origin main` first to compare with the
-current base. When `origin/main` does not exist, for example in a fork clone
-with another remote name, `verify:fast` skips the step and prints the reason.
+## Rust structure
+
+[cargo-fallow](https://github.com/fallow-rs/cargo-fallow) checks the Rust
+workspace. The configuration is in `[workspace.metadata.fallow]` of the root
+`Cargo.toml`. The required `Rust Structure` CI job, the `cargo-fallow`
+pre-push step and `npm run verify:fast` run the same command:
+
+```bash
+cargo fallow check --baseline cargo-fallow-baseline.json --fail-on-issues
+```
+
+Each gate fails the run:
+
+- `deps`: a dependency that no code uses, or that only tests use. A
+  feature-only dependency goes in `ignored` of
+  `[package.metadata.fallow.deps]`, with the reason.
+- `files`: a `.rs` file that no target compiles.
+- `visibility`: a `pub`, `pub(crate)` or `pub(super)` item that can be less
+  visible. `production` lists the release binaries. `public-crates` lists
+  the libraries that other repositories read, and their exported items are
+  entry points. Each other library gets each rule, also when crates.io
+  publishes it. Run
+  `cargo fallow fix --dry-run`, then `cargo fallow fix --yes`, then the
+  Clippy commands. Clippy can reject an edit that `fix` accepts.
+- `boundaries`: the rules in `[workspace.metadata.fallow.boundaries]`.
+  - The crate rules keep the dependency direction of
+    [Architecture invariants](../architecture-invariants.md).
+  - The source rules keep the semantic client in `fallow-api` and the
+    process-tree code in `fallow-process`. A source rule matches tokens, so a
+    pattern in a comment or a string does not match.
+  - `parse-through-parse-bounded` lists each file with production parser
+    calls and the count. A new call needs `parse_bounded` and a higher `max`.
+    An entry with fewer calls than `max` fails, so the list stays exact. An
+    entry with `require = ["parse_bounded("]` must also call `parse_bounded`.
+  - cargo-fallow counts the uses in the `fuzz/` workspace, so an item that a
+    fuzz target calls keeps its `pub`.
+  - `explicit-type-reexports` rejects a glob re-export of the internal type
+    modules from `fallow-engine` and `fallow-api`.
+  - `miri-build-compiles` finds a path from `cfg(test)` code to an item that
+    the Miri build does not compile, for example a `not(miri)` test module.
+- `complexity`: a function over the cognitive limit of 25 or the cyclomatic
+  limit of 20. With `cyclomatic-policy = "flat-match"`, a `match` with no
+  guard and no decision in an arm counts as one decision.
+  `cargo-fallow-baseline.json` holds the functions that were over
+  a limit when the gate started. A new function over a limit fails. When you
+  simplify a function in the baseline, save the baseline again with
+  `cargo fallow check --only complexity --save-baseline cargo-fallow-baseline.json`.
+- `dupes`: the duplication percentage of production code over `threshold`
+  in `[workspace.metadata.fallow.dupes]`. `production = true` leaves test
+  code out, so test duplication cannot hide a rise in production code. The
+  threshold is a ratchet just above the current percentage, so a change that
+  adds a clone can fail the gate. Remove the clone, or remove another clone in
+  the same change. The `code-duplication` rule is `off`, so the report has no
+  clone group. To list the groups, set the rule to `warn` for one local run
+of `cargo fallow dupes`. Lower
+  `threshold` when the percentage goes down.
+- `parse`: a target root file that does not parse.
+
+The cargo-fallow complexity model is not the Clippy model, so a function can
+pass `clippy::cognitive_complexity` and fail the cargo-fallow limit.
+
+To hide one finding, put `// fallow-ignore-next-line <rule> -- <reason>`
+above the line. Link the cargo-fallow issue when the finding is a cargo-fallow
+false positive. `cargo fallow explain <rule>` explains each rule.
+
+
+### JavaScript and TypeScript files
+
+The first `health.thresholdOverrides` entry in
+`scripts/fallow-file-length.json` sets
+`maxFileLines: 2000` for `**/*.mjs` and `**/*.ts`. Two later entries set
+`maxFileLines: 0` for test files and for generated files, so the check skips
+them. A later entry wins. Add a new generated `.mjs` or `.ts` file to the last
+entry. The check also skips each path in `ignorePatterns` and in
+`health.ignore`.
+
+`scripts/fallow-file-length.json` extends `.fallowrc.json` for the gate. The
+overrides are not in `.fallowrc.json`, because there they change each
+`fallow health` run in the repository. The gate config also
+turns off the cyclomatic, cognitive and CRAP rules, and it sets
+`audit.worsened` to `error`. A change then fails only on file length. The
+audit fails in these cases:
+
+- A new file is over the limit, or a file crosses the limit (`introduced`).
+- A file over the limit grew by 5 lines or more (`worsened`).
+
+A file over the limit that grew by 1 to 4 lines stays `inherited` and passes.
+This is the line-count tolerance of `fallow audit`. A comment line and a blank
+line count as lines.
+
+`scripts/hook-file-length.sh` runs the audit. It uses
+`target/debug/fallow` when it exists, else a `fallow` on the `PATH`. When it
+finds no binary or no base ref, it prints a note and passes, because CI still
+runs the check:
+
+```bash
+fallow audit --config scripts/fallow-file-length.json --base <merge-base> --no-css --quiet
+```
+
+The script gives the merge base of `HEAD` and the ref to `--base`, not the
+ref. `fallow audit` reads the base files at the commit that `--base` names.
+When the base branch removed lines from a long file after the branch started,
+a compare with the ref shows growth that the branch did not add.
+
+- The `file-length` pre-commit step compares the working tree with `HEAD`.
+  It reads the working tree, not the staged blob.
+- The `file-length` pre-push step compares the working tree with the merge
+  base of `origin/main`, or of `upstream/main` in a fork clone.
+- `npm run verify:fast` runs the script against `origin/main`.
+- The `File length` step of the CI `Fallow Self Analysis` job runs the audit
+  with the binary of the pull request against `HEAD^1`. HEAD is the merge
+  commit of the pull request, so `HEAD^1` is the tip of the base branch. The
+  job runs when a pull request changes a `.mjs` or `.ts` file or one of the
+  two config files.
+
+To fix a failure, move the new code to a new module, or remove lines from the
+file in the same change. To skip only the hook step for one commit, run
+`HK_SKIP_STEPS=file-length git commit`. The CI step has no skip route.
+
+`verify:fast` runs the two checks as its `Large file growth` and `File length`
+steps, so a local run finds the failure before CI does. The steps compare with
+the local `origin/main` ref, so run `git fetch origin main` first to compare
+with the current base. When `origin/main` does not exist, for example in a
+fork clone with another remote name, `verify:fast` skips the steps and prints
+the reason.
 
 During a merge commit, the pre-commit step compares each file with the larger
 of its `HEAD` and `MERGE_HEAD` versions. Thus growth that the merged branch
@@ -757,8 +1058,22 @@ A safety claim needs level 4 or 5. When a check fails or passes too easily,
 suspect the check first: confirm that the binary under test contains the change
 and that the cache (`.fallow/`) does not serve an older result.
 
+Do not call a local failure or warning pre-existing or a flake, and do not
+skip a hook for it, until you prove it on `origin/main`. Run the same command
+in a clean worktree of `origin/main`, without the `.fallow/` cache of your
+branch. When it does not fail the same way there, treat the failure as caused
+by the change. For a failed CI run, use the `also on main` result of the
+`ship` monitor script.
+
 ### Test evidence
 
+- Before you add a test, search for a test that already covers the behavior.
+  Extend that test. Do not add a new test with the same setup and the same
+  assertion.
+- Do not add one test for each flag alias or spelling when one shared code
+  path handles them. Test that path once, in the module that owns it. The
+  checks per surface and alias that
+  [`drift-contract.md`](drift-contract.md) requires stay.
 - Write the expected value by hand. A test that computes its expected value
   with the code under test proves nothing.
 - Give every "no finding" assertion a positive control: a second input on

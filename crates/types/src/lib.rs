@@ -21,6 +21,8 @@ pub mod audit_cache;
 /// Why a persisted cache was refused, shared by the extraction cache, the
 /// graph cache, the perf table, and `fallow doctor`.
 pub mod cache_rejection;
+/// Classification of the source file of a package manager catalog finding.
+pub mod catalog_source;
 /// Shared churn output contracts.
 pub mod churn;
 /// Cross-surface strings for the cloud runtime-coverage path, shared by the
@@ -47,6 +49,7 @@ pub mod envelope;
 pub mod envelope_sites;
 /// Module extraction types: exports, imports, re-exports, and member info.
 pub mod extract;
+mod extract_namespace_member_uses;
 pub mod flag_retirement;
 /// Guard output contracts for pre-edit architecture-rule lookup.
 pub mod guard;
@@ -95,6 +98,8 @@ pub mod path_util;
 pub mod pipeline_spans;
 /// Analysis result types: unused files, exports, dependencies, and members.
 pub mod results;
+/// Security sink names shared by the extractor and the sink catalogue.
+pub mod security_sinks;
 /// Shared TypeScript semantic identity, provenance, API surface, impact, and
 /// public-signature coupling contracts.
 pub mod semantic;

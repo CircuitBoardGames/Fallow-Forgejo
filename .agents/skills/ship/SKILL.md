@@ -22,6 +22,11 @@ description: Land completed Fallow work after review, run pre-push parity, monit
    constant. A failed manual `rebase --continue` leaves commits on a
    detached HEAD. For a stacked branch after a squash merge of its parent,
    add `--upstream` (see "Serial merge of many pull requests").
+   When GitHub rejects a push with a server error (for example HTTP 500
+   or `fatal error in commit_refs`) after the pre-push hooks passed,
+   retry once with `HK=0 git push`. The hooks already passed for the same
+   commits. Then compare `git ls-remote origin <branch>` with the local
+   head, because the first push can land in spite of the error.
 2. Re-run the required checks from `docs/development/quality-gates.md`.
 3. Verify that public contracts and generated files are pushed. Merge each
    companion change into the default branch of its repository (for example
@@ -31,8 +36,11 @@ description: Land completed Fallow work after review, run pre-push parity, monit
    after the merge. Publish its commit with the commands that it prints.
    `ship-wait-checks.mjs` prints this step for such a change.
 4. Create signed conventional commits only.
-5. Merge with pinned auto-merge. Do not wait for the checks in the
-   foreground:
+5. Merge with pinned auto-merge after steps 1 to 4. Arm it before any CI
+   wait, except in a serial merge (see "Serial merge of many pull
+   requests"). Do not keep the merge for a later step of the session: when
+   the session stops, an unarmed pull request stays open. Do not wait for
+   the checks in the foreground:
 
    ```bash
    gh pr merge <number> --auto --squash --match-head-commit <reviewed sha> --subject "<type>: <summary> (#<number>)"
@@ -79,7 +87,25 @@ description: Land completed Fallow work after review, run pre-push parity, monit
    each hunk in a file that your pull request changed. Such a merge can make
    your code, a comment or a doc wrong without a text conflict. Fix that in
    a follow-up pull request.
-8. Return every touched checkout to a clean, synchronized state.
+8. Return every touched checkout to a clean, synchronized state. When
+   the status of step 10 is `DONE` and `.plans/<task>.md` lists no open
+   item, delete `.plans/<task>.md` and `.plans/<task>/`. Keep both for a
+   `BLOCKED` or `RUNNING` status.
+9. Run the `sweep` skill as the last step of the objective. Do not wait
+   for a prompt from the maintainer, and do not end the turn before it.
+10. Start the final report with one status line:
+    - `DONE`: every pull request is merged and the merged-commit CI is green.
+    - `BLOCKED: <owner>: <next action>`: the work waits on a person or an
+      external system.
+    - `RUNNING: <what>, expected <time>`: the work continues without the
+      maintainer.
+
+    After the report, mark the thread with `t3_thread_organize` when the
+    tool is available: settle a `DONE` thread, snooze a `RUNNING` thread
+    until the expected time, and leave a `BLOCKED` thread active.
+
+Each new pull request of the objective, for example a follow-up of step 7,
+goes through `review` and `ship` too. Record its URL in `.plans/<task>.md`.
 
 Do not call work complete while required merged-commit workflows are still
 running.

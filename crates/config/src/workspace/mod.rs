@@ -1,5 +1,6 @@
 mod deno_json;
 mod diagnostics;
+mod link_dependencies;
 mod missing_pattern_dirs;
 mod nested_project;
 mod npm_overrides;
@@ -9,14 +10,13 @@ mod pnpm_catalog;
 mod pnpm_overrides;
 mod tsconfig;
 mod undeclared;
+mod workspace_config;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
+use crate::permutation::{PermutationSite, permute};
 pub use deno_json::{
     DirManifestProbe, dir_has_deno_json, dir_has_package_manifest, is_deno_without_node_modules,
     load_deno_import_map, load_dir_package_json, load_member_package_manifest,
@@ -32,10 +32,11 @@ pub use diagnostics::{
     record_source_read_failures, record_workspace_diagnostics, registry_diagnostics_to_fold,
     replace_source_discovery_diagnostics, stash_workspace_diagnostics, workspace_diagnostics_for,
 };
-use diagnostics::{emit_diagnostics, is_ignored_workspace_dir, is_skip_listed_dir};
-pub use missing_pattern_dirs::has_missing_workspace_pattern_dirs;
+use diagnostics::{emit_diagnostics, is_skip_listed_dir};
+use link_dependencies::collect_link_dependency_workspaces;
 use missing_pattern_dirs::missing_dir_patterns;
-pub use nested_project::is_independent_pnpm_project;
+pub use missing_pattern_dirs::{has_missing_workspace_pattern_dirs, nested_member_dirs_missing};
+pub use nested_project::{ManifestPatternMatcher, is_independent_pnpm_project};
 use nested_project::{NestedProjectScan, collect_nested_project_workspaces};
 pub use npm_overrides::{parse_bun_package_json_resolutions, parse_npm_package_json_overrides};
 pub use package_json::{NapiConfig, PackageJson};
@@ -55,26 +56,7 @@ pub use pnpm_overrides::{
 };
 pub use tsconfig::{TsconfigOutputMap, TsconfigOutputResolution, tsconfig_linked_files};
 pub use undeclared::{find_undeclared_workspaces, find_undeclared_workspaces_with_ignores};
-
-/// Workspace configuration for monorepo support.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct WorkspaceConfig {
-    /// Additional workspace patterns (beyond what's in root package.json).
-    ///
-    /// `packages` is accepted as a back-compat alias: an older `fallow init --toml`
-    /// wrote `[workspaces]` with a `packages` key, and reading it as `patterns`
-    /// keeps those existing configs scoping correctly. schemars omits serde
-    /// aliases, so `schema.json` documents only `patterns`.
-    #[serde(default, alias = "packages")]
-    pub patterns: Vec<String>,
-    /// Git baseline refs keyed by workspace roots, written relative to the project root as `fallow list --workspaces` prints them. Scopes `check`, `dead-code`, `dupes` and editor diagnostics; `health`, `security` and `audit` ignore it. A global changed-since request takes precedence. Unlisted workspaces and root files remain in full scope. A key that names no workspace, or a ref that Git cannot resolve, leaves every package in full scope with a warning.
-    #[serde(
-        default,
-        rename = "changedSince",
-        skip_serializing_if = "BTreeMap::is_empty"
-    )]
-    pub changed_since: BTreeMap<String, String>,
-}
+pub use workspace_config::{WorkspaceConfig, WorkspaceSettings};
 
 /// Discovered workspace info from package.json, deno.json, pnpm-workspace.yaml,
 /// or tsconfig.json references.
@@ -247,9 +229,11 @@ fn collect_workspaces_and_diagnostics(
         &mut diagnostics,
         &mut manifest_cache,
     );
+    let member_dirs: Vec<PathBuf> = workspaces.iter().map(|(ws, _)| ws.root.clone()).collect();
     workspaces.extend(collect_link_dependency_workspaces(
         root,
         &canonical_root,
+        &member_dirs,
         ignore_patterns,
         &mut diagnostics,
         &mut manifest_cache,
@@ -273,9 +257,8 @@ fn collect_workspaces_and_diagnostics(
         ));
     }
 
-    if !workspaces.is_empty() {
-        mark_internal_dependencies(&mut workspaces);
-    }
+    permute(&mut workspaces, PermutationSite::Workspaces);
+    mark_internal_dependencies(&mut workspaces);
     let workspaces = workspaces.into_iter().map(|(ws, _)| ws).collect();
     Ok((
         workspaces,
@@ -677,86 +660,6 @@ fn load_tsconfig_workspace_package(
             (dir_name(dir), Vec::new())
         }
     }
-}
-
-/// Discover workspaces from `link:` and `file:` dependency specs in the root
-/// `package.json`.
-///
-/// Older yarn monorepos (for example Kibana before its pnpm move) declare no
-/// `workspaces` field. The root lists each local package as
-/// `"@scope/pkg": "link:path/to/pkg"`, often three to five directories deep,
-/// out of reach of the shallow fallback scan. A target is a workspace only when
-/// it is a directory inside the project root that holds a package manifest.
-/// Targets outside the root, missing targets and tarballs are skipped without a
-/// diagnostic, because a dependency spec is not a workspace declaration. A
-/// target that source discovery does not walk is also skipped (see
-/// [`is_skipped_link_target`] and [`crate::source_walk::dirs_reached_by_source_walk`]). A
-/// target with a malformed `package.json` gets the same diagnostic as a
-/// declared workspace.
-fn collect_link_dependency_workspaces(
-    root: &Path,
-    canonical_root: &Path,
-    ignore_patterns: &crate::IgnorePatternSet,
-    diagnostics: &mut Vec<WorkspaceDiagnostic>,
-    manifest_cache: &mut ManifestCache,
-) -> Vec<(WorkspaceInfo, Vec<String>)> {
-    let Ok(root_pkg) = PackageJson::load(&root.join("package.json")) else {
-        return Vec::new();
-    };
-
-    let candidates: Vec<PathBuf> = root_pkg
-        .local_link_dependencies()
-        .into_iter()
-        .filter_map(|(_name, target)| dunce::canonicalize(root.join(target)).ok())
-        .filter(|canonical_dir| {
-            *canonical_dir != *canonical_root
-                && canonical_dir.starts_with(canonical_root)
-                && canonical_dir.is_dir()
-                && !is_skipped_link_target(canonical_root, canonical_dir, ignore_patterns)
-        })
-        .collect();
-    let walked = crate::source_walk::dirs_reached_by_source_walk(canonical_root, &candidates);
-
-    let mut workspaces = Vec::new();
-    for canonical_dir in candidates {
-        if !walked.contains(&canonical_dir) {
-            continue;
-        }
-        let dir = normalize_link_target(root, canonical_root, &canonical_dir);
-        register_matched_workspace(root, dir, &mut workspaces, diagnostics, manifest_cache);
-    }
-    workspaces
-}
-
-/// Whether a link target is under a path that source discovery skips by name.
-///
-/// A yalc copy (`file:.yalc/pkg`), a package under `node_modules`, a build
-/// output or a path that `ignorePatterns` matches has no discovered source
-/// files. A workspace there makes each import of the package an unresolved
-/// import, so such a target stays an external package. The skip list is the
-/// one the workspace glob expansion uses.
-fn is_skipped_link_target(
-    canonical_root: &Path,
-    canonical_dir: &Path,
-    ignore_patterns: &crate::IgnorePatternSet,
-) -> bool {
-    let Ok(relative) = canonical_dir.strip_prefix(canonical_root) else {
-        return true;
-    };
-    relative
-        .components()
-        .any(|component| is_skip_listed_dir(&component.as_os_str().to_string_lossy()))
-        || is_ignored_workspace_dir(relative, ignore_patterns)
-}
-
-/// Express a canonical link target under the caller's `root` spelling.
-///
-/// A spec such as `link:./pkg/../pkg` or a symlinked root would otherwise give
-/// a workspace root that does not prefix-match the discovered source paths.
-fn normalize_link_target(root: &Path, canonical_root: &Path, canonical_dir: &Path) -> PathBuf {
-    canonical_dir
-        .strip_prefix(canonical_root)
-        .map_or_else(|_| canonical_dir.to_path_buf(), |rel| root.join(rel))
 }
 
 /// Discover shallow package workspaces when no explicit workspace config exists.

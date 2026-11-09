@@ -216,6 +216,9 @@ struct SavedStylingFinding {
     line: u32,
     value: String,
     effective_severity: StylingFindingSeverity,
+    /// Audit flag that the audit JSON writes. Absent outside an audit.
+    #[serde(default)]
+    introduced: Option<bool>,
 }
 
 /// Rehydrate the finding-bearing portion of a saved health JSON section.
@@ -312,6 +315,7 @@ impl From<SavedRuntimeCoverage> for RuntimeCoverageReport {
 impl From<SavedRuntimeCoverageFinding> for RuntimeCoverageFinding {
     fn from(saved: SavedRuntimeCoverageFinding) -> Self {
         Self {
+            cloud_context: None,
             id: saved.id,
             stable_id: saved.stable_id,
             source_hash: saved.source_hash,
@@ -444,7 +448,11 @@ impl From<SavedStylingFinding> for StylingFinding {
             nearest_token: None,
             fix_hint: None,
             actions: Vec::new(),
-            internal: crate::StylingFindingInternal::default(),
+            internal: crate::StylingFindingInternal {
+                rule_selector: None,
+                group_paths: Vec::new(),
+                introduced: saved.introduced,
+            },
         }
     }
 }

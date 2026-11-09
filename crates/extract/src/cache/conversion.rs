@@ -150,6 +150,7 @@ fn cached_require_calls_to_module(
             span: Span::new(require_call.span_start, require_call.span_end),
             source_span: Span::new(require_call.source_span_start, require_call.source_span_end),
             destructured_names: require_call.destructured_names.clone(),
+            destructured_locals: require_call.destructured_locals.clone(),
             local_name: require_call.local_name.clone(),
             is_type_only: require_call.is_type_only,
         })
@@ -367,6 +368,7 @@ fn module_require_calls_to_cached(
             source_span_start: require_call.source_span.start,
             source_span_end: require_call.source_span.end,
             destructured_names: require_call.destructured_names.clone(),
+            destructured_locals: require_call.destructured_locals.clone(),
             local_name: require_call.local_name.clone(),
             is_type_only: require_call.is_type_only,
         })
@@ -554,6 +556,7 @@ pub fn cached_to_module_opts(
         sanitized_sink_args: cached.sanitized_sink_args.clone(),
         security_control_sites: cached.security_control_sites.clone(),
         callee_uses: cached.callee_uses.clone(),
+        command_invocations: cached.command_invocations.clone(),
         imported_call_sites: cached.imported_call_sites.clone().into(),
         import_binding_references: cached.import_binding_references.clone().into(),
         misplaced_directives: cached.misplaced_directives.clone(),
@@ -692,6 +695,7 @@ fn module_to_cached_payload(module: &crate::ModuleInfo) -> CachedModule {
         sanitized_sink_args: module.sanitized_sink_args.clone(),
         security_control_sites: module.security_control_sites.clone(),
         callee_uses: module.callee_uses.clone(),
+        command_invocations: module.command_invocations.clone(),
         imported_call_sites: module.imported_call_sites.to_vec(),
         import_binding_references: module.import_binding_references.to_vec(),
         misplaced_directives: module.misplaced_directives.clone(),

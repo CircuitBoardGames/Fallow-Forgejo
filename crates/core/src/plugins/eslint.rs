@@ -6,10 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-use rustc_hash::FxHashSet;
-
 use super::config_parser;
 use super::{Plugin, PluginResult};
+
+#[path = "eslint_extends_walk.rs"]
+mod extends_walk;
+
+use extends_walk::ExtendsWalk;
 
 pub struct EslintPlugin;
 
@@ -94,9 +97,19 @@ impl Plugin for EslintPlugin {
     }
 
     fn resolve_config(&self, config_path: &Path, source: &str, root: &Path) -> PluginResult {
+        self.resolve_config_in_project(config_path, source, root, root)
+    }
+
+    fn resolve_config_in_project(
+        &self,
+        config_path: &Path,
+        source: &str,
+        root: &Path,
+        project_root: &Path,
+    ) -> PluginResult {
         let mut result = PluginResult::default();
-        let mut visited = FxHashSet::default();
-        extract_eslint_config(config_path, source, root, &mut result, &mut visited, 0);
+        let mut walk = ExtendsWalk::new(project_root);
+        extract_eslint_config(config_path, source, root, &mut result, &mut walk, 0);
         result
     }
 }
@@ -117,14 +130,14 @@ fn extract_eslint_config(
     source: &str,
     root: &Path,
     result: &mut PluginResult,
-    visited: &mut FxHashSet<PathBuf>,
+    walk: &mut ExtendsWalk<'_>,
     depth: usize,
 ) {
     if depth >= MAX_EXTENDS_DEPTH {
         return;
     }
     let key = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    if !visited.insert(key) {
+    if !walk.visited.insert(key) {
         return;
     }
 
@@ -146,7 +159,7 @@ fn extract_eslint_config(
         parse_path,
         config_path,
         root,
-        visited,
+        walk,
         depth,
     });
     add_eslint_override_config(&mut EslintConfigInput {
@@ -155,7 +168,7 @@ fn extract_eslint_config(
         parse_path,
         config_path,
         root,
-        visited,
+        walk,
         depth,
     });
     add_eslint_resolver_dependencies(result, &parse_source, parse_path);
@@ -192,17 +205,17 @@ fn add_eslint_import_dependencies(
     }
 }
 
-struct EslintConfigInput<'a> {
+struct EslintConfigInput<'a, 'w> {
     result: &'a mut PluginResult,
     parse_source: &'a str,
     parse_path: &'a Path,
     config_path: &'a Path,
     root: &'a Path,
-    visited: &'a mut FxHashSet<PathBuf>,
+    walk: &'a mut ExtendsWalk<'w>,
     depth: usize,
 }
 
-fn add_eslint_top_level_config(input: &mut EslintConfigInput<'_>) {
+fn add_eslint_top_level_config(input: &mut EslintConfigInput<'_, '_>) {
     let plugins = config_parser::extract_config_shallow_strings(
         input.parse_source,
         input.parse_path,
@@ -226,7 +239,7 @@ fn add_eslint_top_level_config(input: &mut EslintConfigInput<'_>) {
             input.config_path,
             input.root,
             input.result,
-            input.visited,
+            input.walk,
             input.depth,
         );
     }
@@ -251,7 +264,7 @@ fn add_eslint_top_level_config(input: &mut EslintConfigInput<'_>) {
     }
 }
 
-fn add_eslint_override_config(input: &mut EslintConfigInput<'_>) {
+fn add_eslint_override_config(input: &mut EslintConfigInput<'_, '_>) {
     let override_parsers = config_parser::extract_config_array_nested_string_or_array(
         input.parse_source,
         input.parse_path,
@@ -288,7 +301,7 @@ fn add_eslint_override_config(input: &mut EslintConfigInput<'_>) {
             input.config_path,
             input.root,
             input.result,
-            input.visited,
+            input.walk,
             input.depth,
         );
     }
@@ -332,16 +345,19 @@ fn process_extends_entry(
     config_path: &Path,
     root: &Path,
     result: &mut PluginResult,
-    visited: &mut FxHashSet<PathBuf>,
+    walk: &mut ExtendsWalk<'_>,
     depth: usize,
 ) {
+    let parent = config_path.parent().unwrap_or(config_path);
     if !is_path_like_extends(name) {
         if let Some(dep) = resolve_eslint_extends_name(name) {
+            if let Some(shared) = workspace_shared_config_file(parent, name, &dep, root, walk) {
+                follow_chained_config(&shared, root, result, walk, depth);
+            }
             result.referenced_dependencies.push(dep);
         }
         return;
     }
-    let parent = config_path.parent().unwrap_or(config_path);
     let target = parent.join(name);
     let candidates: Vec<PathBuf> = if target.extension().is_some() {
         vec![target]
@@ -352,19 +368,74 @@ fn process_extends_entry(
             .collect()
     };
     for candidate in candidates {
-        if let Ok(chained_source) = std::fs::read_to_string(&candidate) {
-            push_setup_file_once(result, candidate.clone());
-            extract_eslint_config(
-                &candidate,
-                &chained_source,
-                root,
-                result,
-                visited,
-                depth + 1,
-            );
+        if follow_chained_config(&candidate, root, result, walk, depth) {
             return;
         }
     }
+}
+
+/// Mark a chained config file as used and credit what it references.
+/// Returns `false` when the file cannot be read.
+fn follow_chained_config(
+    path: &Path,
+    root: &Path,
+    result: &mut PluginResult,
+    walk: &mut ExtendsWalk<'_>,
+    depth: usize,
+) -> bool {
+    let Ok(chained_source) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    push_setup_file_once(result, path.to_path_buf());
+    extract_eslint_config(path, &chained_source, root, result, walk, depth + 1);
+    true
+}
+
+/// Find the file that a package `extends` entry loads when the package is a
+/// workspace package of the project. The package is linked into
+/// `node_modules`, or, in a project without an install, found by its name.
+///
+/// A shareable config from a registry package lives under `node_modules`, so
+/// it is not a project file and gets no file credit. The returned path uses
+/// the spelling of `root`, so it matches the discovered file.
+fn workspace_shared_config_file(
+    config_dir: &Path,
+    extends_name: &str,
+    pkg_name: &str,
+    root: &Path,
+    walk: &mut ExtendsWalk<'_>,
+) -> Option<PathBuf> {
+    let full_name = normalize_eslint_config_name(extends_name);
+    let pkg_dir =
+        find_package_dir(config_dir, pkg_name).or_else(|| walk.workspace_package_dir(pkg_name))?;
+    let pkg_json_str = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
+    let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str).ok()?;
+    let subpath = full_name.get(pkg_name.len()..).unwrap_or_default();
+    let subpath_key = format!(".{subpath}");
+    let entry_rel = required_main_entry(&pkg_json, &subpath_key)
+        .or_else(|| resolve_package_entry(&pkg_json, &subpath_key, &pkg_dir))?;
+    let entry = dunce::canonicalize(pkg_dir.join(entry_rel)).ok()?;
+    let (ancestor, rel) = root.ancestors().find_map(|ancestor| {
+        let canonical = dunce::canonicalize(ancestor).ok()?;
+        let rel = entry.strip_prefix(&canonical).ok()?.to_path_buf();
+        Some((ancestor, rel))
+    })?;
+    if rel
+        .components()
+        .any(|component| component.as_os_str() == "node_modules")
+    {
+        return None;
+    }
+    Some(ancestor.join(rel))
+}
+
+/// The `main` entry that `require` loads for a package without `exports`.
+/// The legacy `ESLint` config loader uses `require`, so `module` does not apply.
+fn required_main_entry(pkg_json: &serde_json::Value, subpath_key: &str) -> Option<String> {
+    if subpath_key != "." || pkg_json.get("exports").is_some_and(|e| !e.is_null()) {
+        return None;
+    }
+    pkg_json.get("main")?.as_str().map(str::to_string)
 }
 
 /// True when an `extends` entry references a sibling file rather than a package.
@@ -515,13 +586,12 @@ fn resolve_package_entry(
     if std::path::Path::new(bare).extension().is_some() {
         return Some(bare.to_string());
     }
-    for ext in &["js", "mjs", "cjs"] {
-        let candidate = format!("{bare}.{ext}");
-        if pkg_dir.join(&candidate).exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    let file_candidates = ["js", "mjs", "cjs"].map(|ext| format!("{bare}.{ext}"));
+    let index_candidates = ["js", "mjs", "cjs"].map(|ext| format!("{bare}/index.{ext}"));
+    file_candidates
+        .into_iter()
+        .chain(index_candidates)
+        .find(|candidate| pkg_dir.join(candidate).is_file())
 }
 
 /// Resolve a subpath key against a package's `exports` field value.
@@ -634,23 +704,49 @@ fn resolve_eslint_plugin_name(name: &str) -> String {
 
 /// Resolve `ESLint` extends name to a package dependency.
 ///
+/// Follows the shareable-config naming rules of `ESLint`, then drops any
+/// subpath, so the result is always the package name:
+///
 /// - `"airbnb"` → `"eslint-config-airbnb"`
+/// - `"airbnb/hooks"` → `"eslint-config-airbnb"`
+/// - `"eslint-config-custom/back/typescript"` → `"eslint-config-custom"`
+/// - `"@scope"` → `"@scope/eslint-config"`
+/// - `"@scope/eslint-config/base"` → `"@scope/eslint-config"`
+/// - `"@scope/strict"` → `"@scope/eslint-config-strict"`
 /// - `"plugin:react/recommended"` → `"eslint-plugin-react"`
 /// - `"eslint:recommended"` → `None` (built-in)
 fn resolve_eslint_extends_name(name: &str) -> Option<String> {
     if name.starts_with("eslint:") {
-        None
-    } else if let Some(rest) = name.strip_prefix("plugin:") {
-        let plugin_name = rest.split('/').next()?;
-        Some(resolve_eslint_plugin_name(plugin_name))
-    } else if name.starts_with("eslint-config-")
-        || name.contains("/eslint-config")
-        || name.starts_with('@')
-    {
-        Some(name.to_string())
-    } else {
-        Some(format!("eslint-config-{name}"))
+        return None;
     }
+    if let Some(rest) = name.strip_prefix("plugin:") {
+        let plugin_name = rest.split('/').next()?;
+        return Some(resolve_eslint_plugin_name(plugin_name));
+    }
+    let full_name = normalize_eslint_config_name(name);
+    Some(crate::resolve::extract_package_name(&full_name))
+}
+
+const ESLINT_CONFIG_PREFIX: &str = "eslint-config";
+
+/// Apply the `ESLint` shareable-config prefix rules to an `extends` name.
+/// The subpath after the package name stays in place.
+fn normalize_eslint_config_name(name: &str) -> String {
+    let Some(scoped) = name.strip_prefix('@') else {
+        if name.starts_with("eslint-config-") {
+            return name.to_string();
+        }
+        return format!("{ESLINT_CONFIG_PREFIX}-{name}");
+    };
+    let (scope, rest) = scoped.split_once('/').unwrap_or((scoped, ""));
+    if rest.is_empty() || rest == ESLINT_CONFIG_PREFIX {
+        return format!("@{scope}/{ESLINT_CONFIG_PREFIX}");
+    }
+    let package = rest.split('/').next().unwrap_or(rest);
+    if package == ESLINT_CONFIG_PREFIX || package.starts_with("eslint-config-") {
+        return name.to_string();
+    }
+    format!("@{scope}/{ESLINT_CONFIG_PREFIX}-{rest}")
 }
 
 /// Resolve ESLint import resolver name to a package dependency.
@@ -744,6 +840,87 @@ mod tests {
             resolve_eslint_extends_name("@vue/eslint-config-typescript"),
             Some("@vue/eslint-config-typescript".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_shared_config_uses_main_and_skips_registry_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("node_modules/checkout");
+        let shared = root.join("packages/eslint-config-shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(
+            shared.join("package.json"),
+            r#"{"name":"eslint-config-shared","main":"index.cjs","module":"index.mjs"}"#,
+        )
+        .unwrap();
+        std::fs::write(shared.join("index.cjs"), "module.exports = {};").unwrap();
+        std::fs::write(shared.join("index.mjs"), "export default {};").unwrap();
+        let registry = root.join("node_modules/eslint-config-registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(
+            registry.join("package.json"),
+            r#"{"name":"eslint-config-registry","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(registry.join("index.js"), "module.exports = {};").unwrap();
+        std::os::unix::fs::symlink(
+            "../packages/eslint-config-shared",
+            root.join("node_modules/eslint-config-shared"),
+        )
+        .unwrap();
+
+        let found = workspace_shared_config_file(
+            &root,
+            "shared",
+            "eslint-config-shared",
+            &root,
+            &mut ExtendsWalk::new(&root),
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some(
+                root.join("packages/eslint-config-shared/index.cjs")
+                    .as_path()
+            )
+        );
+        assert_eq!(
+            workspace_shared_config_file(
+                &root,
+                "registry",
+                "eslint-config-registry",
+                &root,
+                &mut ExtendsWalk::new(&root),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extends_subpath_resolves_to_the_package() {
+        let cases = [
+            (
+                "eslint-config-custom/back/typescript",
+                "eslint-config-custom",
+            ),
+            ("airbnb/hooks", "eslint-config-airbnb"),
+            ("@scope", "@scope/eslint-config"),
+            ("@scope/eslint-config", "@scope/eslint-config"),
+            ("@scope/eslint-config/back", "@scope/eslint-config"),
+            (
+                "@scope/eslint-config-strict/react",
+                "@scope/eslint-config-strict",
+            ),
+            ("@vue/prettier", "@vue/eslint-config-prettier"),
+            ("@vue/prettier/recommended", "@vue/eslint-config-prettier"),
+        ];
+        for (extends, package) in cases {
+            assert_eq!(
+                resolve_eslint_extends_name(extends).as_deref(),
+                Some(package),
+                "extends entry {extends}"
+            );
+        }
     }
 
     #[test]

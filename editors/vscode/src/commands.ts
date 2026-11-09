@@ -60,6 +60,7 @@ import { buildHealthArgs, parseUnknownHealthSubcommand } from "./health-utils.js
 import { registerChild, unregisterChild } from "./process-registry.js";
 import { buildSecurityArgs, parseUnknownSubcommand } from "./security-utils.js";
 import { appendTypeAwareArgs, TYPE_AWARE_MIN_CLI_VERSION } from "./type-aware-utils.js";
+import { fallowChildEnvironment } from "./typeAwareCompanion.js";
 import { noteTypeAwareDegradation, typeAwareDegradationWarnings } from "./typeAwareDegradation.js";
 import { getWorkspaceRoot } from "./workspaceRoot.js";
 import {
@@ -179,7 +180,7 @@ export const execFallow = (
 
     const child = child_process.spawn(binary, [...args], {
       cwd,
-      env: options.env ? { ...process.env, ...options.env } : process.env,
+      env: { ...fallowChildEnvironment(binary, getWorkspaceRoot()), ...options.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     registerChild(child);
@@ -507,6 +508,7 @@ const ISSUE_TYPE_FILTERS: ReadonlyArray<readonly [CheckFindingKey, keyof IssueTy
   ["unused_optional_dependencies", "unused-optional-dependencies"],
   ["unused_enum_members", "unused-enum-members"],
   ["unused_class_members", "unused-class-members"],
+  ["unused_namespace_members", "unused-namespace-members"],
   ["unused_store_members", "unused-store-members"],
   ["unused_server_actions", "unused-server-actions"],
   ["unused_load_data_keys", "unused-load-data-keys"],
@@ -528,7 +530,9 @@ const ISSUE_TYPE_FILTERS: ReadonlyArray<readonly [CheckFindingKey, keyof IssueTy
   ["dynamic_segment_name_conflicts", "dynamic-segment-name-conflict"],
   ["unresolved_imports", "unresolved-imports"],
   ["unlisted_dependencies", "unlisted-dependencies"],
+  ["unlisted_binaries", "unlisted-binaries"],
   ["duplicate_exports", "duplicate-exports"],
+  ["duplicate_export_aliases", "duplicate-export-aliases"],
   ["type_only_dependencies", "type-only-dependencies"],
   ["test_only_dependencies", "test-only-dependencies"],
   ["dev_dependencies_in_production", "dev-dependencies-in-production"],
@@ -574,6 +578,7 @@ const summarizeCheckResult = (
     absent_component_props: count("absent_component_props"),
     unresolved_imports: count("unresolved_imports"),
     unlisted_dependencies: count("unlisted_dependencies"),
+    unlisted_binaries: count("unlisted_binaries"),
     duplicate_exports: count("duplicate_exports"),
     type_only_dependencies: count("type_only_dependencies"),
     test_only_dependencies: count("test_only_dependencies"),

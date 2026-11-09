@@ -28,6 +28,9 @@ use fallow_types::serde_path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::exit_codes::{
+    ErrorExitCode, INVALID_INPUT, RUNTIME_COVERAGE_SIDECAR, exit_invalid_input,
+};
 use crate::health::coverage as runtime_coverage;
 use crate::license;
 
@@ -43,6 +46,7 @@ pub use upload_static_findings::UploadStaticFindingsArgs;
 mod analyze;
 mod cloud_client;
 mod cloud_reads;
+mod cloud_rows;
 mod cloud_transport;
 pub mod credentials;
 pub mod file_context;
@@ -583,7 +587,7 @@ fn run_setup(args: SetupArgs, root: &Path, json_style: crate::json_style::JsonSt
         Ok(lock) => lock,
         Err(message) => {
             eprintln!("fallow coverage setup: {message}");
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
     };
     let mut setup_state = load_setup_state(root);
@@ -607,7 +611,7 @@ fn run_setup(args: SetupArgs, root: &Path, json_style: crate::json_style::JsonSt
     mark_setup_completed(&mut setup_state);
     if let Err(message) = save_setup_state(root, &setup_state) {
         eprintln!("fallow coverage setup: {message}");
-        return ExitCode::from(2);
+        return exit_invalid_input();
     }
 
     run_setup_final_step(root, &context, &recipe_path)
@@ -631,7 +635,8 @@ fn run_setup_license_step(
     args: SetupArgs,
     setup_state: &mut CoverageSetupState,
 ) -> Result<(), ExitCode> {
-    let key = license::verifying_key().map_err(|message| setup_error_exit(&message, 2))?;
+    let key =
+        license::verifying_key().map_err(|message| setup_error_exit(&message, INVALID_INPUT))?;
     let license_state = fallow_license::load_and_verify(&key, DEFAULT_HARD_FAIL_DAYS);
     if license_state_is_current(setup_state, &license_state) {
         println!("Step 1/4: License check... ok (resumed).");
@@ -644,7 +649,8 @@ fn run_setup_license_step(
     let license_state = fallow_license::load_and_verify(&key, DEFAULT_HARD_FAIL_DAYS);
     if license_status_is_setup_acceptable(&license_state) {
         record_current_license_state(setup_state);
-        save_setup_state(root, setup_state).map_err(|message| setup_error_exit(&message, 2))?;
+        save_setup_state(root, setup_state)
+            .map_err(|message| setup_error_exit(&message, INVALID_INPUT))?;
     } else {
         setup_state.license = None;
     }
@@ -666,10 +672,10 @@ fn run_setup_sidecar_step(
         return Err(exit);
     }
     let path = runtime_coverage::discover_sidecar(Some(root))
-        .map_err(|message| setup_error_exit(&message, COVERAGE_SETUP_FAILED_EXIT_CODE))?;
+        .map_err(|message| setup_error_exit(&message, RUNTIME_COVERAGE_SIDECAR))?;
     record_sidecar_state(setup_state, path)
         .and_then(|()| save_setup_state(root, setup_state))
-        .map_err(|message| setup_error_exit(&message, 2))
+        .map_err(|message| setup_error_exit(&message, INVALID_INPUT))
 }
 
 fn print_resumed_sidecar_step(setup_state: &CoverageSetupState) {
@@ -691,9 +697,11 @@ fn run_setup_recipe_step(
         return Ok(resumed_recipe_path(root, setup_state));
     }
 
-    let path = write_recipe(root, &recipe).map_err(|message| setup_error_exit(&message, 2))?;
+    let path =
+        write_recipe(root, &recipe).map_err(|message| setup_error_exit(&message, INVALID_INPUT))?;
     record_recipe_state(setup_state, path.clone(), context, &recipe);
-    save_setup_state(root, setup_state).map_err(|message| setup_error_exit(&message, 2))?;
+    save_setup_state(root, setup_state)
+        .map_err(|message| setup_error_exit(&message, INVALID_INPUT))?;
     Ok(path)
 }
 
@@ -740,7 +748,7 @@ fn run_setup_final_step(
     ExitCode::SUCCESS
 }
 
-fn setup_error_exit(message: &str, code: u8) -> ExitCode {
+fn setup_error_exit(message: &str, code: ErrorExitCode) -> ExitCode {
     eprintln!("fallow coverage setup: {message}");
     ExitCode::from(code)
 }
@@ -758,7 +766,7 @@ fn run_setup_json(
         }
         Err(err) => {
             eprintln!("fallow coverage setup: failed to write JSON output: {err}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -1227,7 +1235,7 @@ fn offer_trial_if_needed(root: &Path, args: SetupArgs) -> Option<ExitCode> {
         Ok(accepted) => accepted,
         Err(message) => {
             eprintln!("fallow coverage setup: {message}");
-            return Some(ExitCode::from(2));
+            return Some(exit_invalid_input());
         }
     };
     if !accepted {
@@ -1242,7 +1250,7 @@ fn offer_trial_if_needed(root: &Path, args: SetupArgs) -> Option<ExitCode> {
         Ok(None) => return None,
         Err(message) => {
             eprintln!("fallow coverage setup: {message}");
-            return Some(ExitCode::from(2));
+            return Some(exit_invalid_input());
         }
     };
 
@@ -1294,7 +1302,7 @@ fn handle_sidecar_step(
                 Ok(accepted) => accepted,
                 Err(message) => {
                     eprintln!("fallow coverage setup: {message}");
-                    return Some(ExitCode::from(2));
+                    return Some(exit_invalid_input());
                 }
             };
             if !accepted {
@@ -1736,35 +1744,12 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn detect_package_manager(root: &Path) -> Option<PackageManager> {
-    detect_package_manager_from_field(root).or_else(|| {
-        if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
-            Some(PackageManager::Bun)
-        } else if root.join("pnpm-lock.yaml").exists() {
-            Some(PackageManager::Pnpm)
-        } else if root.join("yarn.lock").exists() {
-            Some(PackageManager::Yarn)
-        } else if root.join("package-lock.json").exists()
-            || root.join("npm-shrinkwrap.json").exists()
-        {
-            Some(PackageManager::Npm)
-        } else {
-            None
-        }
+    fallow_config::PackageManager::detect(root).map(|manager| match manager {
+        fallow_config::PackageManager::Npm => PackageManager::Npm,
+        fallow_config::PackageManager::Pnpm => PackageManager::Pnpm,
+        fallow_config::PackageManager::Yarn => PackageManager::Yarn,
+        fallow_config::PackageManager::Bun => PackageManager::Bun,
     })
-}
-
-fn detect_package_manager_from_field(root: &Path) -> Option<PackageManager> {
-    let content = std::fs::read_to_string(root.join("package.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let field = value.get("packageManager")?.as_str()?;
-    let name = field.split('@').next().unwrap_or(field);
-    match name {
-        "npm" => Some(PackageManager::Npm),
-        "pnpm" => Some(PackageManager::Pnpm),
-        "yarn" => Some(PackageManager::Yarn),
-        "bun" => Some(PackageManager::Bun),
-        _ => None,
-    }
 }
 
 fn recipe_path(root: &Path) -> PathBuf {
@@ -1866,7 +1851,7 @@ fn run_health_analysis(root: &Path, coverage_path: &Path) -> ExitCode {
         Ok(path) => path,
         Err(err) => {
             eprintln!("fallow coverage setup: failed to resolve current executable: {err}");
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
     };
 
@@ -1881,13 +1866,13 @@ fn run_health_analysis(root: &Path, coverage_path: &Path) -> ExitCode {
         Ok(status) => status,
         Err(err) => {
             eprintln!("fallow coverage setup: failed to run health analysis: {err}");
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
     };
 
     match status.code() {
         Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(2)),
-        None => ExitCode::from(2),
+        None => exit_invalid_input(),
     }
 }
 

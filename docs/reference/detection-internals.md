@@ -126,6 +126,35 @@ error by suppressing a downstream detector.
   a separate typed property fact that the member pass joins through named and
   re-exported imports; ordinary dotted member accesses are not treated as
   namespace constructors.
+- A member name probe (`"name" in value` or `Reflect.has(value, "name")` with
+  a static name) is a `MemberNameProbe` fact. The member pass credits class
+  members with that name only in the probe module and in its direct import
+  neighbors (the modules that it imports and the modules that import it). A
+  type-only import is not a neighbor link. A probe in an unreachable module
+  gives no credit. Probes often check common
+  names such as `message` or `type`, so a project-wide credit by name would
+  hide unused members in unrelated classes. A plain `value.name` read on an
+  untyped value gives no credit. `Object.hasOwn` and `hasOwnProperty` are not
+  probes, because they do not see a getter or a method on a class prototype.
+- A member of an exported TypeScript namespace is a `NamespaceMember` on the
+  export. A member of a nested exported namespace has the dotted path from
+  the root (`Inner.x`). A nested namespace without `export` is local to the
+  body, so its members are not recorded. The visitor records `N.a` as a
+  member access. The semantic pass (`crates/extract/src/namespace_member_uses.rs`)
+  adds a `NamespaceMemberUse` fact for each use that a member access does not
+  record: a chain of two or more links (`N.Inner.x`, the type `N.Inner.T`), a
+  value that leaves its chain (an argument, an alias, a spread), and a
+  reference inside the namespace body. Scope resolution of the semantic model
+  keeps a shadowed name from giving credit. An inline import type
+  (`import("./x").N.a`) has no local binding, so the pass keys its qualifier
+  by the source (`import(./x)`), and the member pass reads that key as a
+  namespace import of the target module. A `typeof` import type is a whole
+  use of the qualifier. The member pass stores a whole
+  use as the marker `*` or `Inner.*` in the accessed-member set, so the
+  re-export propagation carries it like any other member name. The marker
+  applies to namespace members only, so an escaping class or enum keeps its
+  member findings. A declaration file, an export of an entry point, and a
+  member of a namespace that is reported itself are never reported.
 - Keep issue identity and ordering deterministic. Baselines, audits, editor
   diagnostics, and review comments depend on stable keys.
 - A name supplied by two different `export *` sources is not exported by the
@@ -370,6 +399,14 @@ error by suppressing a downstream detector.
   path reference, because the consumer of the path can run the file, and
   stops at an asset reference. A new consumer that walks edges must pick one
   of these predicates instead of reading the variants.
+- `new URL("./x.ts", import.meta.url)` names a module that a path loader can
+  run, so the edge credits the `default` export of the target and no other
+  export. The edge credits only the file in three cases: a direct argument of
+  a `Worker` or `SharedWorker` constructor, a path without an extension, and
+  a source that `module.register()` loads (the register edge credits the hook
+  exports). Do not widen the edge to the whole namespace: a config alias
+  target (`alias: { pkg: new URL("./mock.ts", import.meta.url).pathname }`)
+  must keep its unused named exports reportable.
 - `createRequire(<this file>)` gives a `require` function of this file. The
   base is `import.meta.url`, `import.meta.filename`, `__filename` or
   `fileURLToPath(import.meta.url)` (`is_this_file_create_require_call`). The
@@ -646,6 +683,41 @@ through package-manager indirection. Projects deployed through a custom script
 name should declare the deployed file in `entry` when no manifest, framework,
 or infrastructure entry already identifies it as runtime code.
 
+The top-level `supportEntry` globs use the same mechanism without a plugin.
+Root entry discovery (`push_support_entry_matches`) adds a matching file to
+the support entries in a normal run, and to
+`EntryPointDiscovery::production_excluded` in production mode. The same final
+dedup keeps a file that another entry source seeds.
+
+`workspaces.settings` scopes `ignoreDependencies` and `includeEntryExports` to
+workspace roots. `ResolvedWorkspaceSettings::bind` maps the keys to the
+discovered workspaces at the start of each dead-code pass. A file belongs to
+its deepest bound workspace. An unused dependency uses the workspace of its
+`package.json`, and an unlisted dependency checks each import site. The global
+list runs first, so a workspace list gets credit only for a finding that the
+global list did not hide.
+
+In production mode, a file that only user entry rules with an explicit
+`"entryPointRole": "support"` match (inline `framework[]` entries and plugin
+files) takes no part in dead-code analysis (issue #4068). A plugin that sets
+no role keeps its entries: `ExternalPluginDef::has_explicit_support_role`
+reads the configured value, not the `support` default. Plugin entry matching records such a file in
+`CategorizedEntryPoints::production_excluded` instead of the entry points. A
+user plugin that has the name of a built-in plugin or of an internal script
+entry source keeps its entries, because entry rules carry only the name. The
+final entry dedup drops each path that another entry source seeds, so a config
+`entry`, runtime glob, built-in plugin entry or production script match keeps
+the file a root. `production_scope` then removes the files that a module
+outside the set imports, makes the rest inert in the resolved project before
+the graph build, skips them in the credits that read the parsed module (package
+and bin paths, Iconify names, JSX runtime packages, Module Federation runtime
+calls), and hides their source-owned findings and stale suppressions. The
+graph-cache resolver payload is written before the modules turn inert, and the
+persisted graph is keyed on the entry-point set, so a warm cache from the other
+mode gives the cold result. The files stay discovered and parsed, so `dupes`
+does not change. The production `health` vital signs that come from dead code,
+such as `dead_export_pct`, follow the new result.
+
 ### CLI flag-value crediting
 
 Some CLIs load an npm package because a flag value names it: `eslint --format
@@ -790,8 +862,9 @@ merges these sources and keeps the first entry for each canonical directory:
 1. `package.json` `workspaces`, `pnpm-workspace.yaml` `packages`, and the Deno
    `workspace` field.
 2. `tsconfig.json` `references`.
-3. `link:` and `file:` specs in the root `dependencies`, `devDependencies` and
-   `optionalDependencies`.
+3. `link:` and `file:` specs in the `dependencies`, `devDependencies` and
+   `optionalDependencies` of the root manifest and of each workspace that
+   source 1 or 2 found. A target path is relative to the declaring manifest.
 4. The shallow scan of two directory levels. This source runs only when no
    workspace pattern exists.
 5. Nested independent pnpm projects. This source runs only when a root
@@ -800,7 +873,11 @@ merges these sources and keeps the first entry for each canonical directory:
    manifest pattern declares, is registered as a workspace with a
    `nested-project-root` diagnostic (`collect_nested_project_workspaces`).
    `ignorePatterns` excludes it. The undeclared-workspace scan does not look
-   inside such a directory.
+   inside such a directory. The `packages` entries of its
+   `pnpm-workspace.yaml` declare more workspaces, read relative to the nested
+   project (`nested_member_patterns`). An entry `.`, an absolute entry, and an
+   entry with a `..` segment give no member. Only pnpm gets this source: the
+   nested `workspaces` of npm and yarn are not read.
 
 Three more rules keep the workspace diagnostics and the catalog checks
 consistent:
@@ -814,15 +891,25 @@ consistent:
   same function, and the dead-code pass then does not report
   `unused-catalog-entries`, because the packages in the missing directory can
   consume the entries. Unresolved references and empty catalog groups are
-  still reported.
+  still reported. A `packages` entry of a nested `pnpm-workspace.yaml` gets
+  the same diagnostic, anchored at the nested file, and
+  `nested_member_dirs_missing` then skips the unused-entry check of
+  that catalog only.
 - `is_independent_pnpm_project` removes a nested pnpm project from the root
   catalog consumers, also when the fallow config `workspaces.patterns` adds
   it. pnpm resolves its `catalog:` references against its own catalog.
+  `gather_pnpm_catalog_states` gives a workspace that a root manifest
+  pattern declares to the root project (`ManifestPatternMatcher`), because
+  pnpm runs from the root for that member. It gives any other workspace to
+  the nearest independent pnpm project that contains it, and builds one
+  catalog state for each project. The catalog findings of a nested project name its own
+  `pnpm-workspace.yaml` and member manifests, and `fallow fix` edits that
+  file.
 
-Source 3 is for yarn-era monorepos such as older Kibana. These repositories
+Source 3 is for older yarn monorepos. These repositories
 have no `workspaces` field. The root lists each package as
-`"@kbn/foo": "link:path/to/foo"`, often three to five levels deep, where the
-shallow scan does not go. Without the workspace, a bare `@kbn/foo` import
+`"@scope/foo": "link:path/to/foo"`, often three to five levels deep, where the
+shallow scan does not go. Without the workspace, a bare `@scope/foo` import
 resolves as an external package, and the package files become unused files.
 A target is a workspace only when it is a directory inside the project root
 that holds a package manifest. Fallow skips a target outside the root, a
@@ -845,6 +932,11 @@ scan does not read `.gitignore`. A target with a malformed
 `package.json` gets the `malformed-package-json` diagnostic, the same as a
 declared workspace. Source 3 runs in every repository, also when source 1
 exists, and discovery does not follow link specs of the linked packages.
+A target of a member manifest is a workspace with its own manifest. An import
+in that package of a dependency that only the parent member lists is thus an
+unlisted dependency, and the parent entry is an unused dependency. pnpm
+installs only the dependencies of the local manifest, so this report matches
+the pnpm install.
 
 In this layout the root `link:` entry is the declaration of the package. The
 unused-dependency pass does not report a root `link:` or `file:` entry when
@@ -934,7 +1026,13 @@ Style resolution is distinct from JavaScript resolution. Preserve scoped npm
 specifier identity, SCSS partial and directory-index lookup, configured include
 paths and installed-package fallback. The `from_style` fact on SFC imports is
 part of that routing contract. React Native platform variants must remain
-reachable alongside standard source extensions.
+reachable alongside standard source extensions. When a platform extension
+makes a specifier resolve to the importing file, for example `./Button` in
+`Button.ios.tsx`, the resolver tries the specifier again without platform
+extensions, the same as TypeScript without `moduleSuffixes`. A base file wins.
+Without a base file, the first result stays. The family edges that
+`crates/graph/src/resolve/react_native.rs` adds never point to the importing
+file.
 
 ## Framework and analysis regression boundaries
 
@@ -974,6 +1072,15 @@ Two modules that overlay each other both stay. A module that imports `X` under
 an alias and declares its own `X` without the star re-export is a wrapper.
 Importers see two `X` exports with different behavior, so the group keeps the
 wrapper.
+`duplicate-export-alias` is a different rule: it reads the export surface of one
+file, not the names of several files. It groups the `ResolvedModule` exports by
+binding: a local export by its local name and type-only flag, a named re-export
+by its source specifier, imported name and type-only flag. A group with two or
+more distinct export names is a finding. The rule skips `export *`, exports
+with an empty span, files with CommonJS exports (`export =` turns an imported
+binding into a `default` re-export, and the module object is not one binding),
+component files, and unreachable files. Entry files are reported, because the
+finding is about the export surface, not about usage.
 Dependency ignores suppress findings without fabricating resolution edges. Raw-specifier
 unresolved-import ignores are not filesystem globs. A relative import whose
 target is missing and ignored by a repository ignore file is build output, not

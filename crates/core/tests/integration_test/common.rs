@@ -22,11 +22,13 @@ pub fn create_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         minimum_version: None,
         extends: vec![],
         entry: vec![],
+        support_entry: vec![],
         ignore_patterns: vec![],
         ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_binaries: vec![],
         ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
@@ -37,6 +39,7 @@ pub fn create_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
+        effect: fallow_config::EffectConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
         mutation: fallow_config::MutationConfig::default(),
@@ -76,11 +79,13 @@ pub fn create_production_config(root: PathBuf) -> fallow_config::ResolvedConfig 
         minimum_version: None,
         extends: vec![],
         entry: vec![],
+        support_entry: vec![],
         ignore_patterns: vec![],
         ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_binaries: vec![],
         ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
@@ -91,6 +96,7 @@ pub fn create_production_config(root: PathBuf) -> fallow_config::ResolvedConfig 
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
+        effect: fallow_config::EffectConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
         mutation: fallow_config::MutationConfig::default(),
@@ -136,6 +142,21 @@ pub fn create_config_with_ignore_patterns(
     .resolve(root, OutputFormat::Human, 4, true, true, None)
 }
 
+/// A config with `ignoreDependencies` set. Everything else defaults.
+pub fn create_config_with_ignore_deps(
+    root: PathBuf,
+    ignore_dependencies: &[&str],
+) -> fallow_config::ResolvedConfig {
+    FallowConfig {
+        ignore_dependencies: ignore_dependencies
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect(),
+        ..Default::default()
+    }
+    .resolve(root, OutputFormat::Human, 4, true, true, None)
+}
+
 /// A config with `unusedComponentProps.ignorePattern` set, used to exercise the
 /// opt-in prop-exemption knob. Everything else defaults.
 pub fn create_config_with_unused_props_ignore(
@@ -161,11 +182,13 @@ pub fn create_config_with_cache(
         minimum_version: None,
         extends: vec![],
         entry: vec![],
+        support_entry: vec![],
         ignore_patterns: vec![],
         ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_binaries: vec![],
         ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
@@ -176,6 +199,7 @@ pub fn create_config_with_cache(
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
+        effect: fallow_config::EffectConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
         mutation: fallow_config::MutationConfig::default(),
@@ -220,11 +244,13 @@ where
         minimum_version: None,
         extends: vec![],
         entry: vec![],
+        support_entry: vec![],
         ignore_patterns: vec![],
         ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_binaries: vec![],
         ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
@@ -235,6 +261,7 @@ where
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
+        effect: fallow_config::EffectConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
         mutation: fallow_config::MutationConfig::default(),
@@ -282,11 +309,13 @@ pub fn create_config_with_overrides(
         minimum_version: None,
         extends: vec![],
         entry: vec![],
+        support_entry: vec![],
         ignore_patterns: vec![],
         ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_binaries: vec![],
         ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
@@ -297,6 +326,7 @@ pub fn create_config_with_overrides(
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
+        effect: fallow_config::EffectConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
         mutation: fallow_config::MutationConfig::default(),
@@ -337,11 +367,13 @@ pub fn create_config_with_ignore_decorators(
         minimum_version: None,
         extends: vec![],
         entry: vec![],
+        support_entry: vec![],
         ignore_patterns: vec![],
         ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_binaries: vec![],
         ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
@@ -352,6 +384,7 @@ pub fn create_config_with_ignore_decorators(
         ignore_decorators,
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
+        effect: fallow_config::EffectConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
         mutation: fallow_config::MutationConfig::default(),

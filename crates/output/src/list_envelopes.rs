@@ -61,6 +61,10 @@ pub struct ListEntryPointOutput {
     pub path: String,
     /// What declared the entry point, e.g. a plugin or config pattern.
     pub source: String,
+    /// The package.json script key that runs the file, e.g. `build`, when
+    /// `source` is `package.json script`. Absent for every other source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
 }
 
 /// Envelope emitted by `fallow list --boundaries --format json`. Surfaces
@@ -109,8 +113,8 @@ pub struct WorkspaceInfo {
     /// Project-root-relative path to the workspace directory, normalized to
     /// forward slashes for cross-platform JSON consumers.
     pub path: String,
-    /// Whether the package is a generated or platform-specific dependency
-    /// package rather than a hand-authored workspace.
+    /// Whether another workspace of the project lists this package as a
+    /// dependency.
     pub is_internal_dependency: bool,
 }
 

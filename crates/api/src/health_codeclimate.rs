@@ -220,7 +220,8 @@ pub fn build_health_codeclimate(report: &HealthReport, root: &Path) -> Vec<CodeC
     for finding in &report.findings {
         let mut issue = ctx.complexity_issue(finding);
         // Audit only: name the measured values that grew against the base
-        // finding. The fingerprint does not read the description.
+        // finding. An inherited finding names the base and head values of its
+        // exceeded metrics. The fingerprint does not read the description.
         if !finding.worsened_metrics.is_empty() {
             let class =
                 if finding.attribution == Some(fallow_output::AuditFindingAttribution::Worsened) {
@@ -233,15 +234,33 @@ pub fn build_health_codeclimate(report: &HealthReport, root: &Path) -> Vec<CodeC
                 issue.description,
                 fallow_output::describe_worsened_metrics(&finding.worsened_metrics)
             );
+        } else if let Some(metrics) = finding
+            .audit_base
+            .and_then(|base| base.describe_exceeded(&finding.violation))
+        {
+            issue.description =
+                format!("{} (inherited from the base: {metrics})", issue.description);
         }
         if finding.gate_exemption == Some(fallow_output::AuditGateExemption::TestFile) {
             issue.description =
                 format!("{} (test file: audit does not gate it)", issue.description);
         }
+        issue.audit = finding
+            .attribution
+            .map(|attribution| fallow_output::AuditReviewContext {
+                attribution,
+                gate_exemption: finding.gate_exemption,
+                gate: None,
+            });
         issues.push(issue);
     }
     for finding in &report.styling_findings {
-        issues.push(ctx.styling_issue(finding));
+        let mut issue = ctx.styling_issue(finding);
+        issue.audit = finding
+            .internal
+            .introduced
+            .map(crate::dead_code_codeclimate::audit_review_context);
+        issues.push(issue);
     }
 
     if let Some(ref production) = report.runtime_coverage {
@@ -468,6 +487,19 @@ mod tests {
         assert_eq!(issue.location.path, "src/styles.css");
         assert_eq!(issue.location.lines.begin, 4);
         assert_eq!(issue.severity, CodeClimateSeverity::Major);
+        assert_eq!(
+            issue.audit, None,
+            "outside an audit there is no attribution"
+        );
+
+        let mut inherited = report;
+        inherited.styling_findings[0].internal.introduced = Some(false);
+        let issues = build_health_codeclimate(&inherited, Path::new("/root"));
+        assert_eq!(
+            issues[0].audit.map(|context| context.attribution),
+            Some(fallow_output::AuditFindingAttribution::Inherited)
+        );
+        assert_eq!(issues[0].fingerprint, issue.fingerprint);
     }
 
     fn crap_violation(
@@ -624,6 +656,7 @@ mod tests {
             let report = HealthReport {
                 runtime_coverage: Some(RuntimeCoverageReport {
                     findings: vec![RuntimeCoverageFinding {
+                        cloud_context: None,
                         id: "runtime-fixture".to_string(),
                         stable_id: None,
                         source_hash: None,

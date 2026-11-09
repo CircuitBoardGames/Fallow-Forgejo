@@ -1,7 +1,3 @@
-#[allow(
-    clippy::wildcard_imports,
-    reason = "object binding helpers use AST node shapes"
-)]
 use oxc_ast::ast::*;
 use oxc_span::Span;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -316,7 +312,7 @@ impl ModuleInfoExtractor {
         self.set_direct_binding_value(path, DirectBindingValue::default());
     }
 
-    pub(super) fn record_new_binding_proof(&mut self, path: &str, expression: &NewExpression<'_>) {
+    fn record_new_binding_proof(&mut self, path: &str, expression: &NewExpression<'_>) {
         if let Expression::Identifier(reference) = &expression.callee {
             self.record_binding_class_proof(path, reference.name.as_str(), Some(reference.span));
             self.retain_new_constructor(path, reference);
@@ -1359,7 +1355,7 @@ impl ModuleInfoExtractor {
     fn fork_direct_object_binding_root(&mut self, root: &str, frame: usize, conditional: bool) {
         let owner =
             self.direct_object_binding_scope_index(DirectObjectBindingScope::BindingOwner, root);
-        if owner.is_some_and(|index| index >= frame) {
+        if !self.admit_direct_object_binding_fork(root, frame, owner) {
             return;
         }
         let (targets, paths) = owner.map_or_else(

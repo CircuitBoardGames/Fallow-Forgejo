@@ -10,6 +10,12 @@ pub use crate::complexity_contribution::{
 };
 use crate::discover::FileId;
 use crate::suppress::{Suppression, UnknownSuppressionKind};
+#[path = "extract_playwright_facts.rs"]
+mod playwright_facts;
+use playwright_facts::{
+    playwright_fixture_alias_facts, playwright_fixture_definition_facts,
+    playwright_fixture_type_facts, playwright_fixture_use_facts,
+};
 
 /// Extracted module information from a single file.
 ///
@@ -184,12 +190,16 @@ pub struct ModuleInfo {
     /// Control patterns observed in this module. Surface context only: their
     /// presence does not establish input identity, execution order, or protection.
     pub security_control_sites: Vec<SecurityControlSite>,
-    /// Statically flattenable callee paths invoked in this module, deduped per
-    /// unique path (first occurrence wins). Consumed by the
-    /// `boundaries.calls.forbidden` detector. Captured unconditionally because
-    /// extraction is config-blind; the per-module cost is bounded by the
-    /// unique-callee count.
+    /// Statically flattenable callee paths invoked in this module, one entry
+    /// per path and form with the start of every site. Consumed by
+    /// `boundaries.calls.forbidden`, `banned-call` and `banned-effect`.
+    /// Captured unconditionally because extraction is config-blind; each path
+    /// string is stored once, and each extra site costs 4 bytes.
     pub callee_uses: Vec<CalleeUse>,
+    /// Literal commands that process-spawning calls run (`spawn("git")`,
+    /// `execSync("make build")`, `` $`ffmpeg -i a` ``). Read by the
+    /// `unlisted-binaries` detector.
+    pub command_invocations: Vec<CommandInvocation>,
     /// Per-call references to actual runtime ESM import bindings.
     pub imported_call_sites: Arc<[ImportedCallSite]>,
     /// Value references to runtime ESM import bindings that are not admitted
@@ -477,6 +487,7 @@ impl ModuleInfo {
             sanitized_sink_args: Vec::new(),
             security_control_sites: Vec::new(),
             callee_uses: Vec::new(),
+            command_invocations: Vec::new(),
             imported_call_sites: Arc::default(),
             import_binding_references: Arc::default(),
             misplaced_directives: Vec::new(),
@@ -960,72 +971,12 @@ impl SinkSite {
     }
 }
 
-/// Env var-name prefixes that frameworks inline into the client bundle by
-/// convention. A read of one of these is normal and safe, so it does NOT count
-/// as a secret source (issue #890). Shared by the extract layer (so public env
-/// vars never become source signals) and the bespoke `client-server-leak` rule.
-pub const PUBLIC_ENV_PREFIXES: &[&str] = &[
-    "NEXT_PUBLIC_",
-    "VITE_",
-    "NUXT_PUBLIC_",
-    "REACT_APP_",
-    "PUBLIC_",
-    "GATSBY_",
-    "EXPO_PUBLIC_",
-    "STORYBOOK_",
-];
-
-/// Exact env var names that are public by convention (no prefix).
-pub const PUBLIC_ENV_EXACT: &[&str] = &["NODE_ENV"];
-
-/// Env var-name tokens that usually describe public build or deployment
-/// metadata rather than secrets. Secret-shaped names win over these tokens.
-pub const PUBLIC_ENV_METADATA_TOKENS: &[&str] =
-    &["BRANCH", "ENVIRONMENT", "MODE", "REF", "SHA", "TAG"];
-
-/// Env var-name tokens that should keep a variable source-backed even when the
-/// name also contains public metadata tokens such as `REF` or `SHA`.
-pub const SECRET_ENV_TOKENS: &[&str] = &[
-    "AUTH",
-    "CREDENTIAL",
-    "CREDENTIALS",
-    "KEY",
-    "PASS",
-    "PASSWORD",
-    "PRIVATE",
-    "SECRET",
-    "TOKEN",
-];
-
-fn env_name_has_token(name: &str, tokens: &[&str]) -> bool {
-    name.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .any(|part| tokens.contains(&part))
-}
-
-/// Whether an env var name is public-by-convention (build-inlined into the
-/// client bundle), and therefore not a secret.
-#[must_use]
-pub fn is_public_env_var(name: &str) -> bool {
-    if PUBLIC_ENV_EXACT.contains(&name) || PUBLIC_ENV_PREFIXES.iter().any(|p| name.starts_with(p)) {
-        return true;
-    }
-    env_name_has_token(name, PUBLIC_ENV_METADATA_TOKENS)
-        && !env_name_has_token(name, SECRET_ENV_TOKENS)
-}
-
-/// Whether a flattened member path is a PUBLIC env-secret read
-/// (`process.env.NEXT_PUBLIC_X`, `import.meta.env.VITE_Y`), which must not be
-/// recorded as a secret source. Non-env paths (`req.query.id`) are never public.
-#[must_use]
-pub fn is_public_env_path(path: &str) -> bool {
-    for object in ["process.env.", "import.meta.env."] {
-        if let Some(var) = path.strip_prefix(object) {
-            return is_public_env_var(var);
-        }
-    }
-    false
-}
+#[path = "extract_env.rs"]
+mod env;
+pub use env::{
+    PUBLIC_ENV_EXACT, PUBLIC_ENV_METADATA_TOKENS, PUBLIC_ENV_PREFIXES, SECRET_ENV_TOKENS,
+    is_public_env_path, is_public_env_var,
+};
 
 /// One alias entry tying an exported object's dotted property path to a namespace import.
 #[derive(Debug, Clone)]
@@ -1948,26 +1899,26 @@ pub struct ClassHeritageInfo {
     pub super_class: Option<String>,
     /// Interface names from the class `implements` clause.
     pub implements: Vec<String>,
-    /// Ordered class type-parameter names used to compose concrete arguments
-    /// through multi-hop inheritance.
+    /// Ordered class type-parameter names for multi-hop type arguments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_parameters: Vec<String>,
     /// Typed instance bindings used to resolve member-access chains in external templates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instance_bindings: Vec<(String, String)>,
-    /// Positional type arguments on the `extends` clause (the `<DerivedClient>`
-    /// in `extends BaseService<DerivedClient>`); an empty string marks a
-    /// positional arg that is not a plain type reference. Lets the analyze layer
-    /// substitute a base class's generic instance-binding field type with the
-    /// subclass's concrete type argument (issue #1910).
+    /// Positional type arguments on the `extends` clause, such as
+    /// `<DerivedClient>`. An empty string marks an argument that is not a
+    /// plain type reference (issue #1910).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub super_class_type_args: Vec<String>,
-    /// Instance-binding fields whose annotation is exactly a class type
-    /// parameter, as `(field_name, type_param_index)`. Lets an inherited generic
-    /// property resolve to the subclass's concrete type argument rather than the
-    /// constraint (issue #1910).
+    /// Instance-binding fields typed as exactly a class type parameter, as
+    /// `(field_name, type_param_index)` (issue #1910).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generic_instance_bindings: Vec<(String, usize)>,
+    /// The outer `extends` target and its type arguments after the fold of
+    /// unexported local bases (issue #4199). The walk for inherited bindings
+    /// reads it. `super_class` keeps the declared name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_super_class: Option<(String, Vec<String>)>,
 }
 
 /// An exported free-function factory proven to return one class instance.
@@ -2337,6 +2288,36 @@ pub enum SemanticFact {
     /// imports and exports, which have their own extraction records.
     /// Appended because bitcode encodes enum variants by ordinal.
     TopLevelRuntimeStatement,
+    /// A static member name probed with `"name" in value` or `Reflect.has(value, "name")`.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    MemberNameProbe(MemberNameProbeFact),
+    /// A use of a member of a TypeScript namespace that a plain member access
+    /// does not record: a nested chain (`N.Inner.x`), a value that leaves the
+    /// chain (`use(N)`), or a reference inside the namespace body.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    NamespaceMemberUse(NamespaceMemberUseFact),
+}
+
+/// A use of a namespace member, found by the semantic pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct NamespaceMemberUseFact {
+    /// The local name of the root binding: an import binding, or a namespace
+    /// that the module declares, or the key of an inline import type.
+    pub object: String,
+    /// The dotted member path after the root. Empty for a bare root.
+    pub path: String,
+    /// The code hands the value at `path` on (an argument, an alias, a
+    /// spread). Every member below `path` then counts as used.
+    pub whole: bool,
+}
+
+/// A static member name that a runtime probe checks on an untyped value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MemberNameProbeFact {
+    /// The probed member name.
+    pub name: String,
 }
 
 /// Deferred class provenance owned by the module declaring an object factory.
@@ -2994,58 +2975,6 @@ fn fluent_chain_new_member_access_facts(
     })
 }
 
-/// Iterate typed Playwright fixture-use facts.
-fn playwright_fixture_use_facts(
-    semantic_facts: &[SemanticFact],
-) -> impl Iterator<Item = &PlaywrightFixtureUseFact> {
-    semantic_facts.iter().filter_map(|fact| {
-        if let SemanticFact::PlaywrightFixtureUse(access) = fact {
-            Some(access)
-        } else {
-            None
-        }
-    })
-}
-
-/// Iterate typed Playwright fixture-definition facts.
-fn playwright_fixture_definition_facts(
-    semantic_facts: &[SemanticFact],
-) -> impl Iterator<Item = &PlaywrightFixtureDefinitionFact> {
-    semantic_facts.iter().filter_map(|fact| {
-        if let SemanticFact::PlaywrightFixtureDefinition(access) = fact {
-            Some(access)
-        } else {
-            None
-        }
-    })
-}
-
-/// Iterate typed Playwright fixture-alias facts.
-fn playwright_fixture_alias_facts(
-    semantic_facts: &[SemanticFact],
-) -> impl Iterator<Item = &PlaywrightFixtureAliasFact> {
-    semantic_facts.iter().filter_map(|fact| {
-        if let SemanticFact::PlaywrightFixtureAlias(access) = fact {
-            Some(access)
-        } else {
-            None
-        }
-    })
-}
-
-/// Iterate typed Playwright fixture-type facts.
-fn playwright_fixture_type_facts(
-    semantic_facts: &[SemanticFact],
-) -> impl Iterator<Item = &PlaywrightFixtureTypeFact> {
-    semantic_facts.iter().filter_map(|fact| {
-        if let SemanticFact::PlaywrightFixtureType(access) = fact {
-            Some(access)
-        } else {
-            None
-        }
-    })
-}
-
 /// A member name referenced from an Angular template surface.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -3414,82 +3343,6 @@ pub struct ClassThisWholeObjectUseFact {
     pub class_local_name: String,
     /// Dotted receiver spelling beginning with `this.`.
     pub object: String,
-}
-
-/// A flattenable callee path of a call or `new` site; one per `(callee_path, is_new)` per module.
-#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
-pub struct CalleeUse {
-    /// The dotted or bare callee path as written at the site (e.g. `cp.exec`).
-    pub callee_path: String,
-    /// Start byte offset of the first site with this path and form.
-    pub span_start: u32,
-    /// True for a `new` expression. `banned-effect` and the trace read only false entries.
-    pub is_new: bool,
-}
-
-/// A direct call whose root identifier resolves to a runtime ESM import.
-///
-/// Every occurrence is retained. Computed or optional callees and arbitrary
-/// value aliases are excluded; origin resolution through re-exports is deferred
-/// to analysis.
-#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub struct ImportedCallSite {
-    /// The local root import binding used by the callee.
-    pub local_name: String,
-    /// Dot-separated static member suffix, empty for a bare imported call.
-    pub member_path: String,
-    /// Static first string argument, or `None` for any other argument shape.
-    pub first_argument: Option<String>,
-    /// Start byte offset of this call site.
-    pub span_start: u32,
-}
-
-/// A value reference to a runtime ESM import binding that is not an admitted
-/// call site, or that initializes a top-level declarator.
-///
-/// The admission rules are the same as for [`ImportedCallSite`]: the binding
-/// has one import declaration, it is not type-only, and the reference reads a
-/// value. `fallow trace --dependency` reads these facts to count each use of
-/// an imported name that it cannot resolve to a call, and to find project
-/// wrappers such as `export const useX = useSelector.withTypes()`.
-#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub struct ImportBindingReference {
-    /// Index into `ModuleInfo.imports` of the root binding.
-    pub import_index: u32,
-    /// Static member suffix after the root, empty for a bare reference.
-    pub member_path: Box<str>,
-    /// How the code uses the reference.
-    pub kind: ImportBindingReferenceKind,
-    /// Start byte of the root identifier, or of the call for
-    /// [`ImportBindingReferenceKind::InitializerCall`].
-    pub span_start: u32,
-    /// Name of the top-level declarator that this reference initializes.
-    pub declared_name: Option<Box<str>>,
-    /// The exported top-level declarator that the reference reads, when the
-    /// reference names that declarator and not the import binding. The
-    /// declarator is initialized by a reference to the import binding at
-    /// `import_index`, so the reference is a use of the binding through a
-    /// project wrapper in its own module. `None` for a direct reference.
-    pub through: Option<Box<str>>,
-}
-
-/// How the code uses an [`ImportBindingReference`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub enum ImportBindingReferenceKind {
-    /// An admitted call that is the whole initializer of a top-level
-    /// declarator: `const x = useSelector.withTypes<T>()`.
-    InitializerCall,
-    /// The reference is the whole initializer of a declarator:
-    /// `const x = useDispatch`.
-    ValueAlias,
-    /// The reference names a JSX opening element: `<Provider>`.
-    JsxElement,
-    /// Any other value use that is not an admitted call, for example an
-    /// argument, an array element or an optional call.
-    Other,
-    /// A direct call of a wrapper declarator in its own module. Only a
-    /// reference with `through` set has this kind.
-    Call,
 }
 
 /// A `"use client"` / `"use server"` directive string written as an expression
@@ -3959,7 +3812,7 @@ const _: () = assert!(std::mem::size_of::<SemanticFact>() == 80);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SinkSite>() == 216);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 1472);
+const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 1496);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<ImportBindingReference>() == 64);
 #[cfg(target_pointer_width = "64")]
@@ -4021,14 +3874,14 @@ pub struct RequireCallInfo {
     pub source: String,
     /// Source span of the `require()` call.
     pub span: Span,
-    /// Source span of the specifier string-literal argument (including its
-    /// quotes), e.g. the `'./x'` in `require('./x')`. Used to anchor an
-    /// `unresolved-import` diagnostic squiggly under the specifier rather than
-    /// the `require` keyword. `Span::default()` when the argument is not a
-    /// plain string literal.
+    /// Span of the string-literal argument with quotes (`'./x'`), which anchors an
+    /// `unresolved-import` diagnostic. `Span::default()` for a non-literal argument.
     pub source_span: Span,
     /// Names destructured from the `require()` result.
     pub destructured_names: Vec<String>,
+    /// The `(key, local)` pair of each destructured identifier property:
+    /// `const { exec: run } = require(...)` gives `("exec", "run")`.
+    pub destructured_locals: Vec<(String, String)>,
     /// The local variable name for `const x = require(...)`.
     pub local_name: Option<String>,
     /// `true` for `import type X = require('...')`, the one require spelling
@@ -4095,6 +3948,13 @@ pub struct SourceParseDegradation {
     /// The nesting cap when the file nests too deep to parse.
     pub nesting_limit: Option<u32>,
 }
+
+#[path = "extract_effect.rs"]
+mod effect;
+pub use effect::*;
+#[path = "extract_calls.rs"]
+mod calls;
+pub use calls::*;
 
 #[cfg(test)]
 #[path = "extract_tests.rs"]
@@ -4199,65 +4059,6 @@ pub struct ComponentInvocation {
     pub unknown_props: bool,
     /// Framework syntax of this caller.
     pub framework: ComponentFramework,
-}
-
-/// Persisted syntactic Effect evidence for one module.
-///
-/// The layer keys, their `dependencies` and `layer_root_keys` use one
-/// format: a plain binding name (`FooLive`) or a class static member
-/// (`FooService.layer`). Import aliases resolve to the imported name, and a
-/// namespace member (`Ns.FooLive`) resolves to the member name.
-#[derive(Debug, Clone, Default, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub struct EffectFacts {
-    /// Module-scope classes that extend a tagged error constructor.
-    pub tagged_errors: Vec<EffectTaggedError>,
-    /// `catchTag("X")` arguments and `catchTags({ X })` keys.
-    pub caught_tags: Vec<EffectCaughtTag>,
-    /// Tags written as an object literal `_tag: "X"` property.
-    pub literal_tags: Vec<String>,
-    /// Layer definitions: module-scope consts and class static properties.
-    pub layers: Vec<EffectLayer>,
-    /// Keys that a value reference outside every layer definition reads.
-    pub layer_root_keys: Vec<String>,
-}
-
-/// A module-scope class that extends a tagged error constructor.
-#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub struct EffectTaggedError {
-    /// Class binding name.
-    pub name: String,
-    /// The `_tag` string literal.
-    pub tag: String,
-    /// Byte offset of the class name.
-    pub span_start: u32,
-    /// The class is exported from its module.
-    pub exported: bool,
-    /// The module reads the class as a value outside its own declaration.
-    pub local_value_reference: bool,
-    /// The module reads the class in a type position outside its own declaration.
-    pub local_type_reference: bool,
-}
-
-/// One tag that a `catchTag` or `catchTags` handler names.
-#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub struct EffectCaughtTag {
-    /// The handled tag.
-    pub tag: String,
-    /// Byte offset of the tag string or object key.
-    pub span_start: u32,
-}
-
-/// A layer definition and the layer keys its initializer reads.
-#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub struct EffectLayer {
-    /// `FooLive` or `FooService.layer`.
-    pub key: String,
-    /// Byte offset of the binding name or static property key.
-    pub span_start: u32,
-    /// The const, or the class of a static property, is exported.
-    pub exported: bool,
-    /// Keys that value references inside the initializer read.
-    pub dependencies: Vec<String>,
 }
 
 /// Persisted syntactic evidence for conservative component-input analysis.

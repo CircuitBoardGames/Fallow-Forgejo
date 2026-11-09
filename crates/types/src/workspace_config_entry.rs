@@ -90,6 +90,9 @@ impl WorkspaceDiagnosticKind {
             "duplicate-exports" => {
                 "project-level rule; add the file and export names to ignoreExports"
             }
+            "unlisted-binaries" => {
+                "project-level rule; add the binary to ignoreBinaries, or set the top-level rule"
+            }
             "re-export-cycle" => {
                 "project-level rule; add `// fallow-ignore-file re-export-cycle` to one file in \
                  the cycle, or set the top-level rule"
@@ -100,6 +103,16 @@ impl WorkspaceDiagnosticKind {
             }
             _ => "project-level rule; set the top-level rule",
         })
+    }
+
+    /// The rule and the selector of a `requested-rule-off` entry. `None` for
+    /// every other kind.
+    #[must_use]
+    pub fn requested_rule_off(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::RequestedRuleOff { rule, flag } => Some((rule.as_str(), flag.as_str())),
+            _ => None,
+        }
     }
 
     /// Whether this is a config entry that matched something but changed
@@ -147,6 +160,10 @@ pub(super) fn config_entry_message(kind: &WorkspaceDiagnosticKind) -> String {
             files,
             reason,
         } => ineffective_override_message(rule, files, reason),
+        WorkspaceDiagnosticKind::RequestedRuleOff { rule, flag } => format!(
+            "{rule} is off in config, so {flag} did not check it. Set the rule to \"error\" or \
+             \"warn\" to run this check."
+        ),
         _ => String::new(),
     }
 }

@@ -1,4 +1,4 @@
-use crate::report::sink::outln;
+use crate::{exit_codes::exit_invalid_input, report::sink::outln};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -53,7 +53,7 @@ pub(super) fn print_json(input: &PrintJsonInput<'_>) -> ExitCode {
         }
         Err(e) => {
             eprintln!("Error: failed to serialize results: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -133,7 +133,7 @@ pub(super) fn print_grouped_json(input: &PrintGroupedJsonInput<'_>) -> ExitCode 
         Ok(value) => value,
         Err(e) => {
             eprintln!("Error: failed to serialize grouped results: {e}");
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
     };
 
@@ -855,7 +855,7 @@ pub(super) fn print_health_json(
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize health report: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -888,7 +888,7 @@ pub(super) fn print_grouped_health_json(
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize grouped health report: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -950,7 +950,7 @@ pub(super) fn print_duplication_json(
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize duplication report: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -1020,7 +1020,7 @@ pub(super) fn print_grouped_duplication_json(
         Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize grouped duplication report: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -1040,7 +1040,7 @@ pub(super) fn print_trace_json<T: serde::Serialize>(
                 clippy::exit,
                 reason = "fatal serialization error requires immediate exit"
             )]
-            std::process::exit(2);
+            std::process::exit(i32::from(fallow_output::exit_code::EXIT_INVALID_INPUT));
         }
     };
     match json_style.serialize(&value) {
@@ -1051,7 +1051,7 @@ pub(super) fn print_trace_json<T: serde::Serialize>(
                 clippy::exit,
                 reason = "fatal serialization error requires immediate exit"
             )]
-            std::process::exit(2);
+            std::process::exit(i32::from(fallow_output::exit_code::EXIT_INVALID_INPUT));
         }
     }
 }
@@ -1072,7 +1072,7 @@ pub(super) fn print_semantic_trace_json<T: serde::Serialize>(
                 clippy::exit,
                 reason = "fatal serialization error requires immediate exit"
             )]
-            std::process::exit(2);
+            std::process::exit(i32::from(fallow_output::exit_code::EXIT_INVALID_INPUT));
         }
     };
     attach_semantic_explain_meta(&mut value, explain);
@@ -1084,7 +1084,7 @@ pub(super) fn print_semantic_trace_json<T: serde::Serialize>(
                 clippy::exit,
                 reason = "fatal serialization error requires immediate exit"
             )]
-            std::process::exit(2);
+            std::process::exit(i32::from(fallow_output::exit_code::EXIT_INVALID_INPUT));
         }
     }
 }
@@ -1102,7 +1102,7 @@ pub(super) fn print_semantic_impact_json<T: serde::Serialize>(
                 clippy::exit,
                 reason = "fatal serialization error requires immediate exit"
             )]
-            std::process::exit(2);
+            std::process::exit(i32::from(fallow_output::exit_code::EXIT_INVALID_INPUT));
         }
     };
     attach_semantic_explain_meta(&mut value, explain);
@@ -1114,7 +1114,7 @@ pub(super) fn print_semantic_impact_json<T: serde::Serialize>(
                 clippy::exit,
                 reason = "fatal serialization error requires immediate exit"
             )]
-            std::process::exit(2);
+            std::process::exit(i32::from(fallow_output::exit_code::EXIT_INVALID_INPUT));
         }
     }
 }
@@ -1355,7 +1355,6 @@ mod tests {
             runtime_coverage: Some(RuntimeCoverageReport {
                 schema_version: RuntimeCoverageSchemaVersion::V1,
                 verdict: RuntimeCoverageReportVerdict::ColdCodeDetected,
-                signals: Vec::new(),
                 summary: RuntimeCoverageSummary {
                     data_source: RuntimeCoverageDataSource::Local,
                     functions_tracked: Some(3),
@@ -1375,6 +1374,7 @@ mod tests {
                     ..Default::default()
                 },
                 findings: vec![RuntimeCoverageFinding {
+                    cloud_context: None,
                     id: "fallow:prod:deadbeef".to_owned(),
                     stable_id: None,
                     path: root.join("src/cold.ts"),
@@ -1402,6 +1402,7 @@ mod tests {
                     discriminators: None,
                 }],
                 hot_paths: vec![RuntimeCoverageHotPath {
+                    cloud_context: None,
                     id: "fallow:hot:cafebabe".to_owned(),
                     stable_id: None,
                     path: root.join("src/hot.ts"),
@@ -1413,17 +1414,13 @@ mod tests {
                     actions: vec![],
                     optimization_target: None,
                 }],
-                blast_radius: vec![],
-                importance: vec![],
                 watermark: Some(RuntimeCoverageWatermark::LicenseExpiredGrace),
                 warnings: vec![RuntimeCoverageMessage {
                     code: "partial-merge".to_owned(),
                     message: "Merged coverage omitted one chunk.".to_owned(),
                 }],
                 actionable: true,
-                actionability_reason: None,
-                actionability_verdict: None,
-                provenance: fallow_output::RuntimeCoverageProvenance::default(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3371,10 +3368,9 @@ mod tests {
 
     /// Drift guard: every action `type` value emitted by the action builder
     /// must appear in `docs/output-schema.json`'s `HealthFindingAction.type`
-    /// enum. Previously the schema listed only `[refactor-function,
-    /// suppress-line]` while the code emitted `add-tests` for CRAP findings,
-    /// silently producing schema-invalid output for any consumer using the
-    /// schema for validation.
+    /// enum. Without this guard the code can emit a type, such as `add-tests` for
+    /// CRAP findings, that the schema does not list, and every consumer that
+    /// validates against the schema silently gets schema-invalid output.
     #[test]
     fn every_emitted_health_action_type_is_in_schema_enum() {
         let cases = [

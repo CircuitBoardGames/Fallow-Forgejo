@@ -68,10 +68,13 @@ mod tests {
             "impact.rs",
             "inspect_target.rs",
             "mod.rs",
-            // `mutation_plan` is API-backed; `mutation_inspect` always runs
-            // `fallow mutation inspect`.
+            // `mutation_plan` is API-backed; `mutation_inspect` and
+            // `mutation_tasks` always run the CLI.
             "mutation.rs",
             "recommend.rs",
+            // The Rust route runs the separate `cargo-fallow` binary. fallow
+            // has no in-process API for Rust workspaces.
+            "rust.rs",
             "security.rs",
             "semantic.rs",
             "similar_code.rs",

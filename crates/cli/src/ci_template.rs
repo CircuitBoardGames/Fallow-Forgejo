@@ -1,3 +1,4 @@
+use crate::exit_codes::exit_invalid_input;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,6 +32,16 @@ const GITLAB_FILES: &[VendoredFile] = &[
         content: include_str!("../templates/ci/scripts/gitlab_common.sh"),
         executable: true,
     },
+    VendoredFile {
+        path: "ci/scripts/mutation.sh",
+        content: include_str!("../templates/ci/scripts/mutation.sh"),
+        executable: true,
+    },
+    VendoredFile {
+        path: "ci/scripts/mutation_common.sh",
+        content: include_str!("../templates/ci/scripts/mutation_common.sh"),
+        executable: true,
+    },
 ];
 
 pub struct GitlabTemplateOptions {
@@ -43,7 +54,7 @@ pub fn run_gitlab_template(opts: &GitlabTemplateOptions) -> ExitCode {
         return vendor_gitlab_files(dir, opts.force);
     }
 
-    print!("{GITLAB_TEMPLATE}");
+    crate::report::sink::write_stdout_str(GITLAB_TEMPLATE);
     ExitCode::SUCCESS
 }
 
@@ -52,11 +63,11 @@ fn vendor_gitlab_files(root: &Path, force: bool) -> ExitCode {
         let path = root.join(file.path);
         if let Err(err) = write_vendored_file(&path, file.content, file.executable, force) {
             eprintln!("Error: failed to write {}: {err}", path.display());
-            return ExitCode::from(2);
+            return exit_invalid_input();
         }
     }
 
-    println!(
+    crate::report::sink::stdoutln!(
         "Vendored GitLab CI integration to {} ({} files)",
         root.display(),
         GITLAB_FILES.len()
@@ -128,6 +139,10 @@ mod tests {
         // comment.sh and review.sh both `source` gitlab_common.sh, so a vendored
         // pipeline that omits it breaks at runtime.
         assert!(dir.path().join("ci/scripts/gitlab_common.sh").is_file());
+        // FALLOW_MUTATION runs mutation.sh, and mutation.sh and comment.sh
+        // source mutation_common.sh.
+        assert!(dir.path().join("ci/scripts/mutation.sh").is_file());
+        assert!(dir.path().join("ci/scripts/mutation_common.sh").is_file());
     }
 
     #[test]
@@ -139,7 +154,7 @@ mod tests {
 
         let code = vendor_gitlab_files(dir.path(), false);
 
-        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(code, exit_invalid_input());
         assert_eq!(std::fs::read_to_string(path).expect("read"), "custom");
     }
 

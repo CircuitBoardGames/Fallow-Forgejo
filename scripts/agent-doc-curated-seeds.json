@@ -342,7 +342,7 @@
       "section": "commands",
       "row": "mutation",
       "column": "Key Flags",
-      "seed": "`--all`, `--plan`, `--max-mutants`, `--time-budget`, `--concurrency`, `--runtime`, `--allow-dirty`, `--allow-side-effects`"
+      "seed": "`--all`, `--plan`, `--max-mutants`, `--mutants-per-line`, `--function-scope`, `--time-budget`, `--concurrency`, `--runtime`"
     },
     {
       "section": "commands",
@@ -814,6 +814,12 @@
     },
     {
       "section": "flags:dead-code-filters",
+      "row": "--duplicate-export-aliases",
+      "column": "Issue Type",
+      "seed": "One module exports one binding under two or more names"
+    },
+    {
+      "section": "flags:dead-code-filters",
       "row": "--duplicate-exports",
       "column": "Issue Type",
       "seed": "Export name appears in multiple modules"
@@ -859,6 +865,12 @@
       "row": "--stale-suppressions",
       "column": "Issue Type",
       "seed": "Suppression comment or tag no longer matches any issue; Suppression comment omits a required reason"
+    },
+    {
+      "section": "flags:dead-code-filters",
+      "row": "--unlisted-binaries",
+      "column": "Issue Type",
+      "seed": "Binary used but provided by no installed package"
     },
     {
       "section": "flags:dead-code-filters",
@@ -973,6 +985,12 @@
       "row": "--unused-load-data-keys",
       "column": "Issue Type",
       "seed": "A SvelteKit load() return-object key is read by no consumer"
+    },
+    {
+      "section": "flags:dead-code-filters",
+      "row": "--unused-namespace-members",
+      "column": "Issue Type",
+      "seed": "Namespace member is never referenced"
     },
     {
       "section": "flags:dead-code-filters",
@@ -2224,6 +2242,12 @@
     },
     {
       "section": "issue-types",
+      "row": "duplicate-export-alias",
+      "column": "Description",
+      "seed": "One module exports one binding under two or more names"
+    },
+    {
+      "section": "issue-types",
       "row": "duplicate-prop-shape",
       "column": "Description",
       "seed": "Three or more React/Preact components across two or more files declare an identical prop-name set (a missing shared Props type); Opt-in: set rules.duplicate-prop-shape to warn or error to enable. Defaults to off."
@@ -2398,6 +2422,12 @@
     },
     {
       "section": "issue-types",
+      "row": "unlisted-binary",
+      "column": "Description",
+      "seed": "Binary used but provided by no installed package; Needs installed dependencies; a project without a root node_modules reports none"
+    },
+    {
+      "section": "issue-types",
       "row": "unlisted-dependency",
       "column": "Description",
       "seed": "Dependency used but not in package.json"
@@ -2484,7 +2514,7 @@
       "section": "issue-types",
       "row": "unused-dependency",
       "column": "Description",
-      "seed": "Dependency listed but never imported; --unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, and test-only-dependency"
+      "seed": "Dependency listed but never imported; --unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, test-only-dependency, and dev-dependency-in-production"
     },
     {
       "section": "issue-types",
@@ -2496,7 +2526,7 @@
       "section": "issue-types",
       "row": "unused-dev-dependency",
       "column": "Description",
-      "seed": "Dev dependency listed but never imported; --unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, and test-only-dependency"
+      "seed": "Dev dependency listed but never imported; --unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, test-only-dependency, and dev-dependency-in-production"
     },
     {
       "section": "issue-types",
@@ -2530,9 +2560,15 @@
     },
     {
       "section": "issue-types",
+      "row": "unused-namespace-member",
+      "column": "Description",
+      "seed": "Namespace member is never referenced"
+    },
+    {
+      "section": "issue-types",
       "row": "unused-optional-dependency",
       "column": "Description",
-      "seed": "Optional dependency listed but never imported; --unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, and test-only-dependency"
+      "seed": "Optional dependency listed but never imported; --unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, test-only-dependency, and dev-dependency-in-production"
     },
     {
       "section": "issue-types",
@@ -2821,6 +2857,12 @@
       "row": "mutation_plan",
       "column": "Description",
       "seed": "Static mutation plan for changed code: mutant ids, operators, dispositions, and static test files; runs no tests"
+    },
+    {
+      "section": "mcp-tools",
+      "row": "mutation_tasks",
+      "column": "Description",
+      "seed": "The open tasks of a saved mutation report (default: the last run report) as one batch: each survived or uncovered mutant with its source lines before and after the change; runs no tests"
     },
     {
       "section": "mcp-tools",

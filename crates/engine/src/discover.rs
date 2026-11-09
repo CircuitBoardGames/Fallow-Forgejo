@@ -130,7 +130,7 @@ pub fn discover_workspace_packages_for_config(
 /// Mirrors `fallow_core::discover::HiddenDirMatch`; the two are kept in step
 /// by the conversion in `core_backend`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HiddenDirMatch {
+pub(crate) enum HiddenDirMatch {
     /// Match by directory NAME at any depth beneath the scope root.
     AnyDepth,
     /// Match the exact root-relative directory PATH (issue #461).
@@ -248,7 +248,7 @@ impl AnalysisDiscovery {
 
     /// Consume this discovery prelude and return its source file registry.
     #[must_use]
-    pub fn into_files(self) -> Vec<DiscoveredFile> {
+    pub(crate) fn into_files(self) -> Vec<DiscoveredFile> {
         self.files
     }
 }
@@ -412,29 +412,6 @@ pub fn is_allowed_hidden_dir(name: &OsStr) -> bool {
         .any(|&dir| OsStr::new(dir) == name)
 }
 
-/// Collect plugin-derived hidden directory scopes.
-#[must_use]
-pub fn collect_plugin_hidden_dir_scopes(
-    config: &ResolvedConfig,
-    root_pkg: Option<&PackageJson>,
-    workspaces: &[WorkspaceInfo],
-) -> Vec<HiddenDirScope> {
-    let registry = PluginRegistry::new(config.external_plugins.clone());
-    let mut scopes = Vec::new();
-
-    if let Some(pkg) = root_pkg {
-        push_plugin_hidden_dir_scope(&mut scopes, &registry, pkg, &config.root);
-    }
-
-    for ws in workspaces {
-        if let Some(pkg) = fallow_config::load_dir_package_json(&ws.root) {
-            push_plugin_hidden_dir_scope(&mut scopes, &registry, &pkg, &ws.root);
-        }
-    }
-
-    scopes
-}
-
 fn push_plugin_hidden_dir_scope(
     scopes: &mut Vec<HiddenDirScope>,
     registry: &PluginRegistry,
@@ -449,7 +426,7 @@ fn push_plugin_hidden_dir_scope(
 
 /// Collect plugin and script-derived hidden directory scopes.
 #[must_use]
-pub(crate) fn collect_hidden_dir_scopes(
+fn collect_hidden_dir_scopes(
     config: &ResolvedConfig,
     root_pkg: Option<&PackageJson>,
     workspaces: &[WorkspaceInfo],
@@ -889,7 +866,7 @@ pub fn discover_files_and_config_candidates(
 
 /// The same traversal, keeping the source-discovery diagnostics it produced.
 #[must_use]
-pub(crate) fn discover_files_config_candidates_and_diagnostics(
+fn discover_files_config_candidates_and_diagnostics(
     config: &ResolvedConfig,
     additional_hidden_dir_scopes: &[HiddenDirScope],
 ) -> crate::core_backend::DiscoveredSources {
@@ -927,8 +904,8 @@ mod tests {
     use fallow_config::PackageJson;
 
     use super::{
-        ALLOWED_HIDDEN_DIRS, HiddenDirScope, collect_hidden_dir_scopes,
-        collect_plugin_hidden_dir_scopes, extract_hidden_dir_paths, is_allowed_hidden_dir,
+        ALLOWED_HIDDEN_DIRS, HiddenDirScope, collect_hidden_dir_scopes, extract_hidden_dir_paths,
+        is_allowed_hidden_dir,
     };
 
     #[test]
@@ -965,7 +942,7 @@ mod tests {
         }))
         .expect("valid package fixture");
 
-        let scopes = collect_plugin_hidden_dir_scopes(&config, Some(&pkg), &[]);
+        let scopes = collect_hidden_dir_scopes(&config, Some(&pkg), &[]);
 
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].root(), dir.path());

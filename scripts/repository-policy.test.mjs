@@ -19,7 +19,7 @@ import { releasedSkillNames } from "./released-skills.mjs";
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 
 /** The published release this branch evolves from. */
-const RELEASED_TAG = "v3.38.1";
+const RELEASED_TAG = "v3.41.0";
 
 const markdownFilesUnder = (root) =>
   readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
@@ -36,7 +36,7 @@ const dependabotUpdate = (config, ecosystem, directory) => {
     .find(
       (candidate) =>
         candidate.includes(`package-ecosystem: ${ecosystem}`) &&
-        candidate.includes(`directory: ${directory}`),
+        candidate.split("\n").some((line) => line.trim() === `directory: ${directory}`),
     );
   assert.ok(update, `missing Dependabot update for ${ecosystem} in ${directory}`);
   return update;
@@ -97,6 +97,16 @@ test("isolated publishers and the mutation runner receive dependency updates", (
     assert.match(update, /interval: weekly/u, directory);
     assert.match(update, /default-days: 7/u, directory);
   }
+});
+
+test("root Dependabot updates skip the typescript that the sidecar pins in lockstep", () => {
+  const config = readFileSync(".github/dependabot.yml", "utf8");
+  const update = dependabotUpdate(config, "npm", "/");
+  const ignoredDependencies = [...update.matchAll(/^\s+- dependency-name: ([^\s]+)$/gmu)].map(
+    (match) => match[1],
+  );
+
+  assert.ok(ignoredDependencies.includes("typescript"), update);
 });
 
 test("fuzz Dependabot updates stay scoped to its registry dependency", () => {
@@ -406,7 +416,7 @@ test("similar-code sidecar links Accelerate only on macOS", () => {
   // Only candle-core gets the feature: that is the measured configuration.
   assert.match(
     macos,
-    /^candle = \{ package = "candle-core", version = "=0\.11\.0", features = \["accelerate"\] \}$/mu,
+    /^candle = \{ package = "candle-core", version = "=0\.11\.1", features = \["accelerate"\] \}$/mu,
   );
   assert.doesNotMatch(macos, /candle-nn|candle-transformers/u);
   for (const [name, lines] of sections) {
@@ -447,12 +457,12 @@ test("published Node packages and Action smoke tests use Node 22", () => {
 
 test("root repository tooling declares its exact Node floor", () => {
   const rootPackage = readJson("package.json");
-  const rootLock = readJson("package-lock.json");
   const contributing = readFileSync("CONTRIBUTING.md", "utf8");
+  const bootstrap = readFileSync("scripts/bootstrap.mjs", "utf8");
 
-  assert.equal(rootPackage.engines.node, ">=22.12.0");
-  assert.equal(rootLock.packages[""].engines.node, ">=22.12.0");
-  assert.match(contributing, /Repository tooling requires Node\.js 22\.12\.0 or later\./);
+  assert.equal(rootPackage.engines.node, ">=22.13.0");
+  assert.match(bootstrap, /^export const MIN_NODE = "22\.13\.0";$/mu);
+  assert.match(contributing, /Repository tooling requires Node\.js 22\.13\.0 or later,/);
 });
 
 test("type-aware manifest keeps every runtime and package surface in parity", () => {
@@ -695,37 +705,88 @@ test("the analysis clock env var is documented where users look for it", () => {
   );
 });
 
-test("narrator comment guard runs for commits, Claude, and CI", () => {
+test("comment quality guard runs for commits, Claude edits, and CI", () => {
   const preCommit = readFileSync("hk.pkl", "utf8");
   const claudeSettings = readFileSync(".claude/settings.json", "utf8");
   const ci = readFileSync(".github/workflows/ci.yml", "utf8");
 
   assert.match(preCommit, /check-comment-quality\.mjs --staged/u);
   assert.match(claudeSettings, /check-comment-quality\.mjs.*--working-tree.*--claude-hook/u);
+  assert.match(claudeSettings, /"matcher": "Edit\|Write\|MultiEdit"/u);
+  assert.match(claudeSettings, /check-comment-quality\.mjs\\" --claude-pre-tool/u);
   assert.match(ci, /node scripts\/check-comment-quality\.mjs --all/u);
 });
 
 test("Miri cfg guard runs for commits and on every pull request", () => {
   const preCommit = readFileSync("hk.pkl", "utf8");
   const ci = readFileSync(".github/workflows/ci.yml", "utf8");
-  const jsLint = /\n  js-lint:\n[\s\S]*?(?=\n  [\w-]+:\n)/u.exec(ci)?.[0] ?? "";
+  const manifest = readFileSync("Cargo.toml", "utf8");
+  const job = /\n  cargo-fallow:\n[\s\S]*?(?=\n  [\w-]+:\n)/u.exec(ci)?.[0] ?? "";
 
-  assert.match(preCommit, /node scripts\/check-miri-cfg\.mjs/u);
-  // The Miri job is path-filtered. The script tests hold the repository-level
-  // Miri cfg test, so they must stay in a job with no path filter.
-  assert.doesNotMatch(jsLint.split("steps:")[0], /^\s+if:/mu);
-  assert.match(jsLint, /node --test scripts\/\*\.test\.mjs/u);
+  assert.match(preCommit, /cargo fallow boundaries --fail-on-issues/u);
+  assert.match(
+    manifest,
+    /rule = "miri-build-compiles"\nbuilds = \[\["test"\], \["test", "miri"\]\]/u,
+  );
+  // The Miri job is path-filtered, so the cfg rule must run in a job with no
+  // path filter.
+  assert.doesNotMatch(job.split("steps:")[0], /^\s+if:/mu);
 });
 
 test("file-size guard runs for commits and on every pull request", () => {
   const preCommit = readFileSync("hk.pkl", "utf8");
   const ci = readFileSync(".github/workflows/ci.yml", "utf8");
-  const jsLint = /\n  js-lint:\n[\s\S]*?(?=\n  [\w-]+:\n)/u.exec(ci)?.[0] ?? "";
+  const job = /\n  cargo-fallow:\n[\s\S]*?(?=\n  [\w-]+:\n)/u.exec(ci)?.[0] ?? "";
 
-  assert.match(preCommit, /node scripts\/check-file-size\.mjs --staged/u);
+  assert.match(preCommit, /cargo fallow size --staged --fail-on-growth/u);
   // A path filter on the job would let a pull request skip the step.
-  assert.doesNotMatch(jsLint.split("steps:")[0], /^\s+if:/mu);
-  assert.match(jsLint, /node scripts\/check-file-size\.mjs --base "origin\/\$BASE_REF"/u);
+  assert.doesNotMatch(job.split("steps:")[0], /^\s+if:/mu);
+  // `base: auto` gives the check step the merge base, so `check` enforces
+  // the file-growth gate.
+  assert.match(job, /baseline: cargo-fallow-baseline\.json\n\s+base: auto/u);
+});
+
+test("fallow audit holds the file-length rule for .mjs and .ts files", () => {
+  const hooks = readFileSync("hk.pkl", "utf8");
+  const ci = readFileSync(".github/workflows/ci.yml", "utf8");
+  const config = readJson(".fallowrc.json");
+  const gate = readJson("scripts/fallow-file-length.json");
+  const selfAnalyze = /\n  fallow-self-analyze:\n[\s\S]*?(?=\n  [\w-]+:\n)/u.exec(ci)?.[0] ?? "";
+  const filter = /\n {12}self-analyze:\n((?: {14}- .*\n)+)/u.exec(ci)?.[1] ?? "";
+
+  // The overrides live in the gate config only. In .fallowrc.json they would
+  // change each `fallow health` run in the repository, also the snapshot
+  // tests of fixtures that read the root config.
+  assert.equal(config.health?.thresholdOverrides, undefined);
+  const [limit] = gate.health.thresholdOverrides;
+  assert.deepEqual(limit.files, ["**/*.mjs", "**/*.ts"]);
+  assert.equal(limit.maxFileLines, 2000);
+  assert.equal(gate.extends, "../.fallowrc.json");
+  assert.equal(gate.audit.worsened, "error");
+
+  const preCommit = /\["pre-commit"\][\s\S]*?(?=\n  \["commit-msg"\])/u.exec(hooks)?.[0] ?? "";
+  const prePush = /\["pre-push"\][\s\S]*$/u.exec(hooks)?.[0] ?? "";
+  assert.match(preCommit, /sh scripts\/hook-file-length\.sh HEAD/u);
+  assert.match(prePush, /sh scripts\/hook-file-length\.sh origin\/main upstream\/main/u);
+
+  // The job has a path filter, so the filter must hold each file type that
+  // the rule checks and the two config files.
+  for (const pattern of [
+    "'**/*.mjs'",
+    "'**/*.ts'",
+    "'.fallowrc.json'",
+    "'scripts/fallow-file-length.json'",
+  ]) {
+    assert.ok(filter.includes(pattern), `self-analyze filter misses ${pattern}`);
+  }
+  assert.match(
+    selfAnalyze,
+    /audit --config scripts\/fallow-file-length\.json --base HEAD\^1 --no-css/u,
+  );
+  // A partial clone with full history makes the git churn of
+  // `health --targets` fetch blobs one at a time.
+  assert.match(selfAnalyze, /fetch-depth: 2/u);
+  assert.doesNotMatch(selfAnalyze, /filter: blob:none/u);
 });
 
 /**
@@ -834,7 +895,20 @@ test("a required output field cannot be dropped at a frozen schema_version", (t)
  * may carry `reachability_caveats[]`. The count drifted once already: a commit
  * added the ninth array and updated only the compatibility doc, leaving the
  * changelog telling readers that eight carry it and that the ninth stays out.
+ * The newest changelog statement must match: an unreleased fragment in
+ * `changelog.d/` comes before `CHANGELOG.md`, so a released entry keeps the
+ * count of its own release.
  */
+/** The unreleased changelog fragments, sorted by name, then `CHANGELOG.md`. */
+const newestChangelogText = () =>
+  [
+    ...readdirSync("changelog.d")
+      .filter((name) => name.endsWith(".md"))
+      .toSorted()
+      .map((name) => readFileSync(join("changelog.d", name), "utf8")),
+    readFileSync("CHANGELOG.md", "utf8"),
+  ].join("\n");
+
 test("the caveat array count in the docs matches the findings that carry one", () => {
   const findings = readFileSync("crates/types/src/output_dead_code.rs", "utf8");
   const carriers = [...findings.matchAll(/pub reachability_caveats: Vec<ReachabilityCaveat>,/gu)]
@@ -865,7 +939,7 @@ test("the caveat array count in the docs matches the findings that carry one", (
     carriers,
   );
   assert.equal(
-    counted(readFileSync("CHANGELOG.md", "utf8"), /(\w+) arrays carry it:/u, "CHANGELOG.md"),
+    counted(newestChangelogText(), /(\w+) arrays carry it:/u, "the newest changelog entry"),
     carriers,
   );
 });
@@ -921,5 +995,45 @@ test("fallow-setup skill keeps its trigger and the responsibility split", () => 
     "parity check",
   ]) {
     assert.ok(skill.includes(required), `fallow-setup SKILL.md is missing: ${required}`);
+  }
+});
+
+test("the fallow crate is published in lockstep with fallow-cli", () => {
+  const workspace = readFileSync("Cargo.toml", "utf8");
+  const version = /^\[workspace\.package\]\nversion = "([^"]+)"/mu.exec(workspace)?.[1];
+  assert.ok(version, "the workspace has a version");
+  const manifest = readFileSync("packaging/crates-io/fallow/Cargo.toml", "utf8");
+  // An installed version blocks a second `cargo install`, so the wrapper must move
+  // with each release and pin the matching fallow-cli.
+  assert.match(manifest, new RegExp(`^name = "fallow"\\nversion = "${version}"$`, "mu"));
+  assert.match(manifest, new RegExp(`^fallow-cli = "=${version}"$`, "mu"));
+
+  const release = readFileSync(".github/workflows/release.yml", "utf8");
+  const cli = release.indexOf("fallow-cli fallow-mcp; do");
+  const wrapper = release.indexOf("--manifest-path packaging/crates-io/fallow/Cargo.toml");
+  assert.ok(cli > 0, "the release publishes fallow-cli");
+  assert.ok(wrapper > cli, "the release publishes the fallow crate after fallow-cli");
+
+  const sync = readFileSync("scripts/sync-npm-versions.sh", "utf8");
+  assert.match(sync, /packaging\/crates-io\/fallow\/Cargo\.toml/u);
+});
+
+test("the extension pnpm project enforces the 7-day minimum release age", () => {
+  // pnpm 11 ignores pnpm keys in `.npmrc`, so the age limit must be in
+  // `pnpm-workspace.yaml` of the extension.
+  const settings = readFileSync("editors/vscode/pnpm-workspace.yaml", "utf8");
+  assert.match(settings, /^minimumReleaseAge: 10080$/mu);
+});
+
+test("no tracked .npmrc holds the pnpm minimum-release-age key", () => {
+  // pnpm 11 ignores pnpm keys in `.npmrc`. A key there gives a false sense
+  // of protection, so the age limit belongs in `pnpm-workspace.yaml`.
+  const listed = spawnSync("git", ["ls-files", "*.npmrc", ".npmrc"], { encoding: "utf8" });
+  assert.equal(listed.status, 0, listed.stderr);
+  const files = listed.stdout.split("\n").filter(Boolean);
+  assert.ok(files.includes("editors/vscode/.npmrc"));
+  for (const file of files) {
+    const npmrc = readFileSync(file, "utf8");
+    assert.doesNotMatch(npmrc, /^minimum-release-age=/mu, `${file}: pnpm 11 ignores this key`);
   }
 });

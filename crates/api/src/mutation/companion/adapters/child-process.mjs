@@ -16,6 +16,7 @@ import {
   runResult,
   testErrorText,
   toPosix,
+  repeatedNameFlags,
   uniqueNames,
   validateDryRun,
   validateRun,
@@ -130,15 +131,22 @@ export const createWorkDir = (prefix, overlay) => {
 };
 
 /**
- * Gives each test of one file its name and test id, in report order. The
+ * Gives each test of one file its name and test id, in report order. A test
+ * whose full name another test that ran repeats has `repeated` set. The
  * name joins the names of the suites and the test with ` > `. Each test is
  * `{ parts, ... }`.
  */
 export const withTestIds = (file, tests) => {
-  const names = uniqueNames(tests.map((test) => test.parts.join(NAME_SEPARATOR)));
+  const fullNames = tests.map((test) => test.parts.join(NAME_SEPARATOR));
+  const names = uniqueNames(fullNames);
+  const repeated = repeatedNameFlags(
+    fullNames,
+    tests.map((test) => hasRun(test.status)),
+  );
   return tests.map((test, index) => ({
     ...test,
     name: names[index],
+    repeated: repeated[index],
     testId: `${file}${TEST_ID_SEPARATOR}${names[index]}`,
   }));
 };
@@ -150,7 +158,26 @@ export const withTestIds = (file, tests) => {
  * pattern that selects more tests than requested costs time only: the run
  * drops each result that it did not request.
  */
-const namePatternText = (parts) => parts.map(escapeRegExp).join(" ").replace(/\s+/gu, "\\s*");
+const namePatternText = (parts) =>
+  parts
+    .map(escapeRegExp)
+    .join(" ")
+    .replace(/\s+/gu, "\\s*")
+    .replace(LONE_SURROGATE, escapeSurrogate);
+
+/**
+ * A lone UTF-16 surrogate. With the `u` flag, a surrogate pair is one code
+ * point, so only a lone surrogate matches.
+ */
+const LONE_SURROGATE = /[\uD800-\uDFFF]/gu;
+
+/**
+ * Writes a lone surrogate as a `\uXXXX` escape. A Node test process does not
+ * match a test name with a lone surrogate against a pattern that holds the
+ * surrogate itself, but it matches the escape.
+ */
+const escapeSurrogate = (surrogate) =>
+  `\\u${surrogate.charCodeAt(0).toString(16).padStart(4, "0")}`;
 
 /** The source of the name pattern that selects the tests of `entries`. */
 const namePatternSource = (entries) =>
@@ -229,6 +256,7 @@ const setupMs = (result) => {
 const recordDryRunFile = (file, result, summary, directories) => {
   const entries = result.tests.map((test) => dryRunEntry(file, test, result.shared, directories));
   summary.tests.push(...entries.map((entry) => entry.report));
+  for (const test of result.tests) if (test.repeated) summary.duplicates.add(test.testId);
   addAll(summary.staticHits, result.staticHits);
   addAll(summary.loaded, result.loaded);
   Object.assign(summary.hits, Object.fromEntries(attributeHits(entries)));
@@ -240,6 +268,7 @@ const emptySummary = () => ({
   tests: [],
   hits: {},
   staticHits: new Set(),
+  duplicates: new Set(),
   loaded: new Set(),
   setup: {},
   errors: [],

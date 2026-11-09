@@ -8,11 +8,9 @@ use std::{collections::BTreeMap, fs};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fallow_config::OutputFormat;
 use fallow_cov_protocol::{
-    BlastRadiusEntry as ProtocolBlastRadiusEntry, CaptureQuality, Confidence, CoverageSource,
-    Evidence, Finding as ProtocolFinding, FunctionIdentity, HotPath as ProtocolHotPath,
-    IdentityResolution, ImportanceEntry as ProtocolImportanceEntry, PROTOCOL_VERSION,
-    ReportVerdict, Request, Response, RiskBand, StaticFile, StaticFindings, StaticFunction,
-    Verdict, Watermark, function_identity_id,
+    CaptureQuality, Confidence, CoverageSource, Evidence, Finding as ProtocolFinding,
+    FunctionIdentity, IdentityResolution, PROTOCOL_VERSION, ReportVerdict, Request, Response,
+    StaticFile, StaticFindings, StaticFunction, Verdict, Watermark, function_identity_id,
 };
 use fallow_license::{
     DEFAULT_HARD_FAIL_DAYS, Feature, LicenseStatus, load_and_verify, load_raw_jwt,
@@ -28,8 +26,10 @@ use url::Url;
 
 use crate::error::emit_error;
 use crate::exit_codes::{
-    RESOURCE_UNAVAILABLE_EXIT_CODE, RUNTIME_COVERAGE_INPUT_EXIT_CODE,
-    RUNTIME_COVERAGE_INTERNAL_EXIT_CODE, RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+    ErrorExitCode, INVALID_INPUT, RESOURCE_UNAVAILABLE, RUNTIME_COVERAGE_INPUT,
+    RUNTIME_COVERAGE_INPUT_EXIT_CODE, RUNTIME_COVERAGE_INTERNAL,
+    RUNTIME_COVERAGE_INTERNAL_EXIT_CODE, RUNTIME_COVERAGE_SIDECAR,
+    RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
 };
 use crate::health::optimization_target::{
     FunctionStart, InnerIterationIndex, InnerIterations, StaticCost, StaticTarget,
@@ -42,10 +42,9 @@ use fallow_engine::health::RuntimeCoverageOptions;
 use fallow_output::{
     RUNTIME_STALE_AFTER_DAYS, RuntimeCoverageAction, RuntimeCoverageConfidence,
     RuntimeCoverageDataSource, RuntimeCoverageDiscriminators, RuntimeCoverageEvidence,
-    RuntimeCoverageFinding, RuntimeCoverageHotPath, RuntimeCoverageMessage,
-    RuntimeCoverageProvenance, RuntimeCoverageReport, RuntimeCoverageReportVerdict,
-    RuntimeCoverageRiskBand, RuntimeCoverageSchemaVersion, RuntimeCoverageSummary,
-    RuntimeCoverageVerdict, RuntimeCoverageWatermark,
+    RuntimeCoverageFinding, RuntimeCoverageMessage, RuntimeCoverageProvenance,
+    RuntimeCoverageReport, RuntimeCoverageReportVerdict, RuntimeCoverageSchemaVersion,
+    RuntimeCoverageSummary, RuntimeCoverageVerdict, RuntimeCoverageWatermark,
 };
 
 /// Ed25519 public key that verifies the `fallow-cov` sidecar binary at every
@@ -226,7 +225,7 @@ pub fn prepare_options(
         Err(err) => {
             return Err(emit_error(
                 &format!("license: {err}"),
-                RESOURCE_UNAVAILABLE_EXIT_CODE,
+                RESOURCE_UNAVAILABLE,
                 output,
             ));
         }
@@ -235,7 +234,7 @@ pub fn prepare_options(
     let key = match verifying_key() {
         Ok(key) => key,
         Err(message) => {
-            return Err(emit_error(&message, RESOURCE_UNAVAILABLE_EXIT_CODE, output));
+            return Err(emit_error(&message, RESOURCE_UNAVAILABLE, output));
         }
     };
     let status = match load_and_verify(&key, DEFAULT_HARD_FAIL_DAYS) {
@@ -243,7 +242,7 @@ pub fn prepare_options(
         Err(err) => {
             return Err(emit_error(
                 &format!("license: {err}"),
-                RESOURCE_UNAVAILABLE_EXIT_CODE,
+                RESOURCE_UNAVAILABLE,
                 output,
             ));
         }
@@ -285,18 +284,17 @@ pub(super) struct RuntimeCoverageAnalysisInput<'a> {
 /// Emit the CLI error document (byte-identical to [`emit_error`]) and return the
 /// raw exit code so the engine can wrap it in `HealthError::Printed` without
 /// re-printing at the CLI boundary.
-fn emit_printed(message: &str, code: u8, output: OutputFormat) -> u8 {
+fn emit_printed(message: &str, code: ErrorExitCode, output: OutputFormat) -> u8 {
     emit_error(message, code, output);
-    code
+    code.get()
 }
 
 pub(super) fn analyze(
     options: &RuntimeCoverageOptions,
     input: &RuntimeCoverageAnalysisInput<'_>,
 ) -> Result<RuntimeCoverageReport, u8> {
-    let sidecar = discover_sidecar(Some(input.root)).map_err(|message| {
-        emit_printed(&message, RUNTIME_COVERAGE_SIDECAR_EXIT_CODE, input.output)
-    })?;
+    let sidecar = discover_sidecar(Some(input.root))
+        .map_err(|message| emit_printed(&message, RUNTIME_COVERAGE_SIDECAR, input.output))?;
     analyze_with_transport(options, input, |request, quiet, output| {
         run_sidecar(&sidecar, request, quiet, output)
     })
@@ -307,16 +305,15 @@ pub(super) fn analyze_with_transport(
     input: &RuntimeCoverageAnalysisInput<'_>,
     transport: impl FnOnce(&Request, bool, OutputFormat) -> Result<Response, u8>,
 ) -> Result<RuntimeCoverageReport, u8> {
-    let prepared_sources = prepare_coverage_sources(&options.path).map_err(|message| {
-        emit_printed(&message, RUNTIME_COVERAGE_INPUT_EXIT_CODE, input.output)
-    })?;
+    let prepared_sources = prepare_coverage_sources(&options.path)
+        .map_err(|message| emit_printed(&message, RUNTIME_COVERAGE_INPUT, input.output))?;
     let static_signals = build_static_signal_index(
         input.modules,
         input.analysis_output,
         input.file_paths,
         input.test_reach,
     )
-    .map_err(|message| emit_printed(&message, 2, input.output))?;
+    .map_err(|message| emit_printed(&message, INVALID_INPUT, input.output))?;
     let (request, locations) =
         build_request(options, input, &static_signals, prepared_sources.sources);
     let response = transport(&request, input.quiet, input.output)?;
@@ -350,7 +347,7 @@ fn validate_license_status(
     match status {
         LicenseStatus::Missing => Err(emit_error(
             "Continuous runtime monitoring requires a valid license or trial. Run: fallow license activate --trial --email you@company.com",
-            RESOURCE_UNAVAILABLE_EXIT_CODE,
+            RESOURCE_UNAVAILABLE,
             output,
         )),
         LicenseStatus::HardFail {
@@ -359,12 +356,12 @@ fn validate_license_status(
             &format!(
                 "license expired {days_since_expiry} days ago. Refresh with: fallow license refresh"
             ),
-            RESOURCE_UNAVAILABLE_EXIT_CODE,
+            RESOURCE_UNAVAILABLE,
             output,
         )),
         _ if !status.permits(&Feature::RuntimeCoverage) => Err(emit_error(
             "License is valid but does not include continuous runtime monitoring. Upgrade at fallow.tools/upgrade.",
-            RESOURCE_UNAVAILABLE_EXIT_CODE,
+            RESOURCE_UNAVAILABLE,
             output,
         )),
         _ => Ok(()),
@@ -585,35 +582,12 @@ fn find_package_manager_sidecar(root: &Path) -> Option<PathBuf> {
 }
 
 fn detect_package_manager(root: &Path) -> Option<LocalPackageManager> {
-    detect_package_manager_from_field(root).or_else(|| {
-        if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
-            Some(LocalPackageManager::Bun)
-        } else if root.join("pnpm-lock.yaml").exists() {
-            Some(LocalPackageManager::Pnpm)
-        } else if root.join("yarn.lock").exists() {
-            Some(LocalPackageManager::Yarn)
-        } else if root.join("package-lock.json").exists()
-            || root.join("npm-shrinkwrap.json").exists()
-        {
-            Some(LocalPackageManager::Npm)
-        } else {
-            None
-        }
+    fallow_config::PackageManager::detect(root).map(|manager| match manager {
+        fallow_config::PackageManager::Npm => LocalPackageManager::Npm,
+        fallow_config::PackageManager::Pnpm => LocalPackageManager::Pnpm,
+        fallow_config::PackageManager::Yarn => LocalPackageManager::Yarn,
+        fallow_config::PackageManager::Bun => LocalPackageManager::Bun,
     })
-}
-
-fn detect_package_manager_from_field(root: &Path) -> Option<LocalPackageManager> {
-    let content = fs::read_to_string(root.join("package.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let field = value.get("packageManager")?.as_str()?;
-    let name = field.split('@').next().unwrap_or(field);
-    match name {
-        "npm" => Some(LocalPackageManager::Npm),
-        "pnpm" => Some(LocalPackageManager::Pnpm),
-        "yarn" => Some(LocalPackageManager::Yarn),
-        "bun" => Some(LocalPackageManager::Bun),
-        _ => None,
-    }
 }
 
 impl LocalPackageManager {
@@ -1826,7 +1800,7 @@ fn run_sidecar(
     output: OutputFormat,
 ) -> Result<Response, u8> {
     verify_sidecar_signature(sidecar)
-        .map_err(|message| emit_printed(&message, RUNTIME_COVERAGE_SIDECAR_EXIT_CODE, output))?;
+        .map_err(|message| emit_printed(&message, RUNTIME_COVERAGE_SIDECAR, output))?;
 
     let mut command = Command::new(sidecar);
     command
@@ -1836,7 +1810,7 @@ fn run_sidecar(
     let mut child = crate::signal::ScopedChild::spawn(&mut command).map_err(|err| {
         emit_printed(
             &format!("failed to spawn {}: {err}", sidecar.display()),
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+            RUNTIME_COVERAGE_SIDECAR,
             output,
         )
     })?;
@@ -1848,7 +1822,7 @@ fn run_sidecar(
     let output_data = child.wait_with_output().map_err(|err| {
         emit_printed(
             &format!("failed to wait for sidecar: {err}"),
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+            RUNTIME_COVERAGE_SIDECAR,
             output,
         )
     })?;
@@ -1867,7 +1841,7 @@ fn decode_sidecar_response(bytes: &[u8], output: OutputFormat) -> Result<Respons
     let response: Response = serde_json::from_slice(bytes).map_err(|err| {
         emit_printed(
             &format!("failed to parse sidecar response: {err}"),
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+            RUNTIME_COVERAGE_SIDECAR,
             output,
         )
     })?;
@@ -1898,14 +1872,14 @@ fn write_sidecar_request(
     if let Err(err) = serde_json::to_writer(&mut stdin, request) {
         return Err(emit_printed(
             &format!("failed to serialize sidecar request: {err}"),
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+            RUNTIME_COVERAGE_SIDECAR,
             output,
         ));
     }
     if let Err(err) = stdin.flush() {
         return Err(emit_printed(
             &format!("failed to flush sidecar request: {err}"),
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+            RUNTIME_COVERAGE_SIDECAR,
             output,
         ));
     }
@@ -1921,7 +1895,7 @@ fn check_sidecar_exit_status(
         Some(0) => Ok(()),
         Some(code) if code == i32::from(RUNTIME_COVERAGE_SIDECAR_EXIT_CODE) => Err(emit_printed(
             &stderr_message(&output_data.stderr, "sidecar protocol mismatch"),
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+            RUNTIME_COVERAGE_SIDECAR,
             output,
         )),
         Some(code) if code == i32::from(RUNTIME_COVERAGE_INPUT_EXIT_CODE) => Err(emit_printed(
@@ -1929,22 +1903,24 @@ fn check_sidecar_exit_status(
                 &output_data.stderr,
                 "failed to parse runtime coverage input",
             ),
-            RUNTIME_COVERAGE_INPUT_EXIT_CODE,
+            RUNTIME_COVERAGE_INPUT,
             output,
         )),
         Some(code) if code == i32::from(RUNTIME_COVERAGE_INTERNAL_EXIT_CODE) => Err(emit_printed(
             &stderr_message(&output_data.stderr, "sidecar internal error"),
-            RUNTIME_COVERAGE_INTERNAL_EXIT_CODE,
+            RUNTIME_COVERAGE_INTERNAL,
             output,
         )),
         Some(code) => Err(emit_printed(
             &stderr_message(&output_data.stderr, "sidecar execution failed"),
-            u8::try_from(code).unwrap_or(RUNTIME_COVERAGE_SIDECAR_EXIT_CODE),
+            ErrorExitCode::passthrough(
+                u8::try_from(code).unwrap_or(RUNTIME_COVERAGE_SIDECAR_EXIT_CODE),
+            ),
             output,
         )),
         None => Err(emit_printed(
             "sidecar terminated by signal",
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
+            RUNTIME_COVERAGE_SIDECAR,
             output,
         )),
     }
@@ -1966,11 +1942,7 @@ fn check_response_protocol(response: &Response, output: OutputFormat) -> Result<
                 response.protocol_version, PROTOCOL_VERSION
             )
         };
-        return Err(emit_printed(
-            &message,
-            RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
-            output,
-        ));
+        return Err(emit_printed(&message, RUNTIME_COVERAGE_SIDECAR, output));
     }
     Ok(())
 }
@@ -1997,9 +1969,9 @@ fn convert_response(
         min_observation_volume,
         low_traffic_threshold,
     );
-    let hot_paths = map_runtime_hot_paths(response.hot_paths);
-    let blast_radius = map_runtime_blast_radius(response.blast_radius);
-    let importance = map_runtime_importance(response.importance);
+    let hot_paths = super::coverage_rows::map_runtime_hot_paths(response.hot_paths);
+    let blast_radius = super::coverage_rows::map_runtime_blast_radius(response.blast_radius);
+    let importance = super::coverage_rows::map_runtime_importance(response.importance);
 
     let coverage_percent = response.summary.coverage_percent;
     let clamped_percent = if coverage_percent.is_finite() {
@@ -2050,6 +2022,7 @@ fn convert_response(
         actionability_reason: trust_output.actionability_reason,
         actionability_verdict: trust_output.actionability_verdict,
         provenance: trust_output.provenance,
+        cloud_context: None,
     }
 }
 
@@ -2181,6 +2154,7 @@ fn map_runtime_finding(
         meets_observation_volume,
     };
     Some(RuntimeCoverageFinding {
+        cloud_context: None,
         id: finding.id,
         stable_id,
         source_hash,
@@ -2202,93 +2176,6 @@ fn map_runtime_finding(
             .collect(),
         discriminators: Some(discriminators),
     })
-}
-
-fn map_runtime_hot_paths(entries: Vec<ProtocolHotPath>) -> Vec<RuntimeCoverageHotPath> {
-    let mut hot_paths = entries
-        .into_iter()
-        .map(|entry| RuntimeCoverageHotPath {
-            id: entry.id,
-            stable_id: entry.identity.map(|identity| identity.stable_id),
-            path: PathBuf::from(entry.file),
-            function: entry.function,
-            line: entry.line,
-            end_line: entry.end_line,
-            invocations: entry.invocations,
-            percentile: entry.percentile,
-            actions: Vec::new(),
-            optimization_target: None,
-        })
-        .collect::<Vec<_>>();
-    hot_paths.sort_by(|left, right| {
-        right
-            .invocations
-            .cmp(&left.invocations)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.function.cmp(&right.function))
-    });
-    hot_paths
-}
-
-fn map_runtime_blast_radius(
-    entries: Vec<ProtocolBlastRadiusEntry>,
-) -> Vec<fallow_output::RuntimeCoverageBlastRadiusEntry> {
-    let mut blast_radius = entries
-        .into_iter()
-        .map(|entry| fallow_output::RuntimeCoverageBlastRadiusEntry {
-            id: entry.id,
-            stable_id: entry.identity.map(|identity| identity.stable_id),
-            file: PathBuf::from(entry.file),
-            function: entry.function,
-            line: entry.line,
-            caller_count: entry.caller_count,
-            caller_count_weighted_by_traffic: entry.caller_count_weighted_by_traffic,
-            deploys_touched: entry.deploys_touched,
-            risk_band: map_risk_band(entry.risk_band),
-        })
-        .collect::<Vec<_>>();
-    blast_radius.sort_by(|left, right| {
-        risk_band_rank(right.risk_band)
-            .cmp(&risk_band_rank(left.risk_band))
-            .then_with(|| {
-                right
-                    .caller_count_weighted_by_traffic
-                    .cmp(&left.caller_count_weighted_by_traffic)
-            })
-            .then_with(|| right.caller_count.cmp(&left.caller_count))
-            .then_with(|| left.file.cmp(&right.file))
-            .then_with(|| left.function.cmp(&right.function))
-    });
-    blast_radius
-}
-
-fn map_runtime_importance(
-    entries: Vec<ProtocolImportanceEntry>,
-) -> Vec<fallow_output::RuntimeCoverageImportanceEntry> {
-    let mut importance = entries
-        .into_iter()
-        .map(|entry| fallow_output::RuntimeCoverageImportanceEntry {
-            id: entry.id,
-            stable_id: entry.identity.map(|identity| identity.stable_id),
-            file: PathBuf::from(entry.file),
-            function: entry.function,
-            line: entry.line,
-            invocations: entry.invocations,
-            cyclomatic: entry.cyclomatic,
-            owner_count: entry.owner_count,
-            importance_score: entry.importance_score,
-            reason: entry.reason,
-        })
-        .collect::<Vec<_>>();
-    importance.sort_by(|left, right| {
-        right
-            .importance_score
-            .total_cmp(&left.importance_score)
-            .then_with(|| right.invocations.cmp(&left.invocations))
-            .then_with(|| left.file.cmp(&right.file))
-            .then_with(|| left.function.cmp(&right.function))
-    });
-    importance
 }
 
 /// Join each hot path with its static function and the V8 block totals, and
@@ -2362,22 +2249,6 @@ fn apply_top_limit(report: &mut RuntimeCoverageReport, top: Option<usize>) {
     report.hot_paths.truncate(top);
     report.blast_radius.truncate(top);
     report.importance.truncate(top);
-}
-
-const fn map_risk_band(risk_band: RiskBand) -> RuntimeCoverageRiskBand {
-    match risk_band {
-        RiskBand::Low => RuntimeCoverageRiskBand::Low,
-        RiskBand::High => RuntimeCoverageRiskBand::High,
-        RiskBand::Medium | RiskBand::Unknown => RuntimeCoverageRiskBand::Medium,
-    }
-}
-
-const fn risk_band_rank(risk_band: RuntimeCoverageRiskBand) -> u8 {
-    match risk_band {
-        RuntimeCoverageRiskBand::Low => 0,
-        RuntimeCoverageRiskBand::Medium => 1,
-        RuntimeCoverageRiskBand::High => 2,
-    }
 }
 
 const fn map_verdict(verdict: Verdict) -> RuntimeCoverageVerdict {

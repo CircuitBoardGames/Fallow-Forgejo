@@ -1937,6 +1937,32 @@ fn audit_human_splits_styling_by_confidence_budget() {
 }
 
 #[test]
+fn audit_human_shows_unchecked_sass_keyframes() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("package.json"), r#"{"name":"audit-keyframes"}"#).unwrap();
+    fs::write(root.join("src/index.ts"), "export const ok = true;\n").unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    fs::write(
+        root.join("src/styles.scss"),
+        ".a { animation: #{$prefix}-in 1s; }\n@keyframes fade-in { to { opacity: 1; } }\n",
+    )
+    .unwrap();
+
+    let output = run_fallow_raw(&["audit", "--root", root.to_str().unwrap(), "--base", "HEAD"]);
+    assert!(
+        output
+            .stdout
+            .contains("@keyframes: 1 not checked (a Sass/Less animation value uses a variable or an interpolation)"),
+        "audit should say that the keyframes check skipped a block. stdout: {}",
+        output.stdout
+    );
+}
+
+#[test]
 fn audit_css_deep_surfaces_cross_file_styling_findings() {
     let dir = create_audit_css_deep_fixture();
     let root = dir.path();
@@ -7819,6 +7845,125 @@ fn review_brief_weakening_reports_skip_removed_suppression_and_threshold() {
     );
 }
 
+/// Base files of the sink substitution test.
+const SINK_SUBSTITUTION_BASE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{"name": "sink-substitution", "main": "src/index.ts"}"#,
+    ),
+    (
+        "src/index.ts",
+        "export { evalValue } from './eval';\nexport { render } from './render';\nexport { Html } from './html';\nexport { moved } from './moved';\n",
+    ),
+    (
+        "src/eval.ts",
+        "export const evalValue = (raw: string): unknown => {\n  const fn = new Function(`return ${raw}`);\n  return fn();\n};\n",
+    ),
+    (
+        "src/render.ts",
+        "export const render = (frame: HTMLIFrameElement, html: string): void => {\n  frame.innerHTML = html;\n};\n",
+    ),
+    (
+        "src/html.tsx",
+        "export const Html = ({ html }: { html: string }) => <div dangerouslySetInnerHTML={{ __html: html }} />;\n",
+    ),
+    (
+        "src/moved.ts",
+        "export const moved = (el: HTMLElement, html: string): void => {\n  el.innerHTML = html;\n};\n",
+    ),
+];
+
+/// Head files of the sink substitution test: three substitutions and one
+/// sink that only moves.
+const SINK_SUBSTITUTION_HEAD: &[(&str, &str)] = &[
+    (
+        "src/eval.ts",
+        "import vm from 'node:vm';\nexport const evalValue = (raw: string): unknown => vm.runInNewContext(`(${raw})`);\n",
+    ),
+    (
+        "src/render.ts",
+        "export const render = (frame: HTMLIFrameElement, html: string): void => {\n  frame.srcdoc = html;\n};\n",
+    ),
+    (
+        "src/html.tsx",
+        "export const Html = ({ html }: { html: string }) => <div {...{ dangerouslySetInnerHTML: { __html: html } }} />;\n",
+    ),
+    (
+        "src/moved.ts",
+        "export const moved = (el: HTMLElement, html: string): void => {\n  const target = el;\n  target.innerHTML = html;\n};\n",
+    ),
+];
+
+/// The review brief reports a security sink that a change swaps for another
+/// sink of the same class, or moves out of the static sink view. A rule that
+/// flags `new Function` does not flag `vm.runInNewContext`, so the swap
+/// silences the rule and keeps the risk. A sink that only moves keeps its
+/// name and gives no signal.
+#[test]
+fn review_brief_weakening_reports_security_sink_substitution() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    let write = |files: &[(&str, &str)]| {
+        for (path, content) in files {
+            fs::write(dir.join(path), content).unwrap();
+        }
+    };
+    write(SINK_SUBSTITUTION_BASE);
+    git(dir, &["init", "-b", "main"]);
+    commit_all(dir, "base");
+
+    write(SINK_SUBSTITUTION_HEAD);
+    commit_all(dir, "head");
+
+    let output = run_fallow_raw(&[
+        "review",
+        "--root",
+        dir.to_str().unwrap(),
+        "--base",
+        "main~1",
+        "--brief",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert_eq!(
+        output.code, 0,
+        "the brief always exits 0. stderr: {}",
+        output.stderr
+    );
+    let brief = parse_json(&output);
+    let weakening = brief["weakening"]
+        .as_array()
+        .expect("brief JSON carries a weakening array");
+    let evidence_for = |file: &str| -> Vec<String> {
+        weakening
+            .iter()
+            .filter(|signal| signal["kind"] == "security-check-removed" && signal["file"] == file)
+            .filter_map(|signal| signal["evidence"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        evidence_for("src/eval.ts"),
+        vec!["new Function sink replaced by runInNewContext".to_owned()],
+        "code execution swap: {weakening:?}"
+    );
+    assert_eq!(
+        evidence_for("src/render.ts"),
+        vec!["innerHTML sink replaced by srcdoc".to_owned()],
+        "HTML swap: {weakening:?}"
+    );
+    assert_eq!(
+        evidence_for("src/html.tsx"),
+        vec!["dangerouslySetInnerHTML sink moved into an object key".to_owned()],
+        "spread hides the JSX sink: {weakening:?}"
+    );
+    assert!(
+        evidence_for("src/moved.ts").is_empty(),
+        "a sink that only moves gives no signal: {weakening:?}"
+    );
+}
+
 /// Write a git repository whose `bun.lockb` blocks override resolution, with
 /// one uncommitted file so the audit family has a changeset to report on.
 fn bun_lockb_audit_repo(tmp: &TempDir) -> &std::path::Path {
@@ -8471,10 +8616,10 @@ fn audit_publishes_staleness_for_every_baseline_it_loaded() {
 }
 
 /// An audit reports every baseline that is not the section's own, not the first
-/// one it finds. Its health note used to be missing entirely: the standalone
-/// command prints it at a site audit never reaches, so an audit pointed at
-/// another command's health baseline was silent about it while the dead-code and
-/// duplication baselines beside it said so (issue #2735).
+/// one it finds. The standalone command prints the health note at a site audit
+/// never reaches, so without this check an audit pointed at another command's
+/// health baseline is silent about it while the dead-code and
+/// duplication baselines beside it say so (issue #2735).
 #[test]
 fn audit_reports_every_baseline_that_is_another_commands() {
     let fixture = create_audit_fixture("baseline-kinds");
@@ -8765,7 +8910,7 @@ fn audit_cache_prune_reports_and_removes_aged_snapshot_files() {
     let root = fixture.path();
     let scan = TempDir::new().expect("scan root should be created");
     // The current `AUDIT_BASE_SNAPSHOT_CACHE_VERSION` directory.
-    let snapshot_dir = root.join(".fallow/cache/audit-base-v19");
+    let snapshot_dir = root.join(".fallow/cache/audit-base-v21");
     fs::create_dir_all(&snapshot_dir).unwrap();
     let aged = snapshot_dir.join("00000000000000aa.bin");
     let fresh = snapshot_dir.join("00000000000000bb.bin");
@@ -9008,4 +9153,249 @@ fn audit_keeps_code_from_a_merged_unreviewed_branch_introduced() {
         "code from a branch that main does not contain stays introduced: {}",
         output.stdout
     );
+}
+
+/// Issue #4344: a line shift in a later occurrence of a duplicate declaration
+/// block must not turn the finding into an introduced finding. The group, its
+/// files and its count are the same as in the base.
+#[test]
+fn audit_css_duplicate_block_survives_line_shift_of_a_later_occurrence() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-duplicate-shift"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/index.ts"),
+        "import './a.css';\nimport './b.css';\n",
+    )
+    .unwrap();
+    let block =
+        ".header {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex-shrink: 0;\n}\n";
+    fs::write(root.join("src/a.css"), block).unwrap();
+    fs::write(root.join("src/b.css"), format!("/* note */\n{block}")).unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    let audit = |extra: &[&str]| {
+        let mut args = vec![
+            "audit",
+            "--root",
+            root.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--no-cache",
+            "--quiet",
+        ];
+        args.extend_from_slice(extra);
+        run_fallow_raw(&args)
+    };
+    let assert_inherited = |label: &str| {
+        let output = audit(&["--format", "json"]);
+        let json = parse_json(&output);
+        let findings = json["complexity"]["styling_findings"]
+            .as_array()
+            .expect("styling findings should be present");
+        assert_eq!(findings.len(), 1, "{label}: {findings:#?}");
+        assert_eq!(
+            findings[0]["introduced"], false,
+            "{label}: a shifted later occurrence stays inherited: {findings:#?}"
+        );
+        assert_eq!(json["attribution"]["styling_introduced"], 0, "{label}");
+        assert_eq!(json["attribution"]["styling_inherited"], 1, "{label}");
+        let human = audit(&[]);
+        assert!(
+            human.stdout.contains("inherited styling debt"),
+            "{label}: {}",
+            human.stdout
+        );
+    };
+
+    // The second file moves down by one line.
+    fs::write(
+        root.join("src/b.css"),
+        format!("/* note */\n/* added */\n{block}"),
+    )
+    .unwrap();
+    assert_inherited("shift down");
+
+    // The second file moves up by one line.
+    fs::write(root.join("src/b.css"), block).unwrap();
+    assert_inherited("shift up");
+}
+
+/// Issue #4344: a new occurrence of a duplicate block in a changed file is
+/// still an introduced finding, because the group count grows.
+#[test]
+fn audit_css_duplicate_block_new_occurrence_stays_introduced() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-duplicate-new"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/index.ts"),
+        "import './a.css';\nimport './b.css';\nimport './c.css';\n",
+    )
+    .unwrap();
+    let block =
+        ".header {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex-shrink: 0;\n}\n";
+    fs::write(root.join("src/a.css"), block).unwrap();
+    fs::write(root.join("src/b.css"), block).unwrap();
+    fs::write(root.join("src/c.css"), ".other { color: red; }\n").unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    fs::write(root.join("src/c.css"), block).unwrap();
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        root.to_str().unwrap(),
+        "--base",
+        "HEAD",
+        "--no-cache",
+        "--quiet",
+        "--format",
+        "json",
+    ]);
+    let json = parse_json(&output);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(
+        findings[0]["introduced"], true,
+        "a third copy grows the group: {findings:#?}"
+    );
+    assert_eq!(json["attribution"]["styling_introduced"], 1);
+}
+
+/// Issue #4344: a line shift in the later file of a CVA duplicate variant
+/// block group keeps the finding inherited.
+#[test]
+fn audit_cva_duplicate_variant_block_survives_line_shift_of_a_later_occurrence() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-cva-shift","dependencies":{"class-variance-authority":"^0.7.0","tailwindcss":"^4.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/index.ts"),
+        "import './a';\nimport './b';\nexport const ok = true;\n",
+    )
+    .unwrap();
+    let cva = |name: &str| {
+        format!(
+            "import {{ cva }} from 'class-variance-authority';\n\
+             export const {name} = cva('inline-flex', {{\n\
+               variants: {{\n\
+                 tone: {{\n\
+                   primary: 'px-3 py-2 text-sm font-medium',\n\
+                   secondary: 'px-3 py-2 text-sm font-medium',\n\
+                 }},\n\
+               }},\n\
+             }});\n"
+        )
+    };
+    fs::write(root.join("src/a.ts"), cva("first")).unwrap();
+    fs::write(root.join("src/b.ts"), cva("second")).unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    fs::write(
+        root.join("src/b.ts"),
+        format!("// added\n// added\n{}", cva("second")),
+    )
+    .unwrap();
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        root.to_str().unwrap(),
+        "--base",
+        "HEAD",
+        "--no-cache",
+        "--quiet",
+        "--format",
+        "json",
+    ]);
+    let json = parse_json(&output);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    let cva_findings: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding["sub_kind"] == "cva-duplicate-variant-block")
+        .collect();
+    assert!(!cva_findings.is_empty(), "{findings:#?}");
+    assert!(
+        cva_findings
+            .iter()
+            .all(|finding| finding["introduced"] == false),
+        "a shifted later occurrence stays inherited: {cva_findings:#?}"
+    );
+}
+
+/// Issue #4344: a rename of one file of a duplicate block group keeps the
+/// finding inherited. The audit key lists the paths of the group, and the
+/// rename remap must find the renamed path inside that list.
+#[test]
+fn audit_css_duplicate_block_survives_rename_of_a_group_file() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-duplicate-rename"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/index.ts"),
+        "import './a.css';\nimport './b.css';\n",
+    )
+    .unwrap();
+    let block =
+        ".header {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex-shrink: 0;\n}\n";
+    fs::write(root.join("src/a.css"), block).unwrap();
+    fs::write(root.join("src/b.css"), block).unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    git(root, &["mv", "src/a.css", "src/a2.css"]);
+    fs::write(
+        root.join("src/index.ts"),
+        "import './a2.css';\nimport './b.css';\n",
+    )
+    .unwrap();
+    commit_all(root, "rename a.css to a2.css");
+
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        root.to_str().unwrap(),
+        "--base",
+        "HEAD~1",
+        "--no-cache",
+        "--quiet",
+        "--format",
+        "json",
+    ]);
+    let json = parse_json(&output);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(
+        findings[0]["introduced"], false,
+        "a renamed group file keeps the finding inherited: {findings:#?}"
+    );
+    assert_eq!(json["attribution"]["styling_introduced"], 0);
 }

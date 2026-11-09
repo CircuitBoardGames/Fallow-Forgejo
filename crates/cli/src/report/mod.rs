@@ -36,12 +36,8 @@ use fallow_types::trace::{
     CloneTrace, DependencyTrace, ExportTrace, FileTrace, ImpactClosureTrace, PipelineTimings,
 };
 
-use crate::report::sink::outln;
+use crate::{exit_codes::exit_invalid_input, report::sink::outln};
 
-#[allow(
-    unused_imports,
-    reason = "used by binary crate modules (combined.rs, audit.rs)"
-)]
 pub use fallow_output::strip_root_prefix;
 pub use grouping::OwnershipResolver;
 pub(crate) use human::dupes::MAX_CLONE_GROUPS;
@@ -299,7 +295,7 @@ pub(crate) fn emit_json(value: &serde_json::Value, kind: &str) -> ExitCode {
         }
         Err(e) => {
             eprintln!("Error: failed to serialize {kind} output: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -318,7 +314,7 @@ pub(crate) fn emit_report_json(
         }
         Err(e) => {
             eprintln!("Error: failed to serialize {kind} output: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -599,7 +595,7 @@ fn print_check_github_format(
         ),
         Err(e) => {
             eprintln!("Error: failed to serialize results: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -687,7 +683,7 @@ fn print_results_ci_comment(
     )
     .unwrap_or_else(|| {
         eprintln!("Error: badge format is only supported for the health command");
-        ExitCode::from(2)
+        exit_invalid_input()
     })
 }
 
@@ -875,7 +871,7 @@ fn print_dupes_github_format(
         ),
         Err(e) => {
             eprintln!("Error: failed to serialize duplication report: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -912,7 +908,7 @@ fn print_duplication_ci_comment(
     )
     .unwrap_or_else(|| {
         eprintln!("Error: badge format is only supported for the health command");
-        ExitCode::from(2)
+        exit_invalid_input()
     })
 }
 
@@ -992,7 +988,7 @@ fn print_grouped_duplication_report(
         }
         OutputFormat::Badge => {
             eprintln!("Error: badge format is only supported for the health command");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -1227,7 +1223,7 @@ fn print_health_github_format(
         ),
         Err(e) => {
             eprintln!("Error: failed to serialize health report: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -1296,7 +1292,7 @@ fn print_health_ci_comment(
     )
     .unwrap_or_else(|| {
         eprintln!("Error: badge format is only supported for the health command");
-        ExitCode::from(2)
+        exit_invalid_input()
     })
 }
 
@@ -1521,53 +1517,13 @@ pub(crate) fn print_health_performance(
     }
 }
 
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
 pub use fallow_api::build_compact_lines;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
 pub use fallow_api::build_duplication_markdown;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
 pub use fallow_api::build_health_markdown;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
 pub use fallow_api::build_markdown;
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "target-dependent: report is public in lib, private in bin, but this adapter remains crate-internal"
-)]
 pub(crate) use json::api_check_json_payload_with_config_fixable;
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "target-dependent: report is public in lib, private in bin, but these adapters remain crate-internal"
-)]
 pub(crate) use json::{build_baseline_deltas_output, check_json_extras};
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "target-dependent: report is public in lib, private in bin, but this adapter remains crate-internal"
-)]
 pub(crate) use sarif::api_health_sarif_document;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "target-dependent: report is public in lib, private in bin, but this adapter remains crate-internal"
-)]
 pub(crate) use sarif::api_sarif_document;
 
 #[cfg(test)]
@@ -1894,7 +1850,7 @@ mod tests {
 
         let code = print_results(&AnalysisResults::default(), &ctx, OutputFormat::Badge, None);
 
-        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(code, exit_invalid_input());
     }
 
     #[test]
@@ -1906,7 +1862,7 @@ mod tests {
         let code =
             print_duplication_report(&DuplicationReport::default(), &ctx, OutputFormat::Badge);
 
-        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(code, exit_invalid_input());
     }
 
     #[test]

@@ -17,6 +17,7 @@ doctest = false
 
 [dependencies]
 fallow-config = { workspace = true }
+# fallow-ignore-next-line only-engine-depends-on-core -- fallow-engine is the one backend adapter of fallow-core
 fallow-core = { workspace = true }
 fallow-extract = { workspace = true }
 fallow-graph = { workspace = true }
@@ -40,7 +41,7 @@ oxc_coverage_instrument = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 sha2 = { workspace = true }
-srcmap-sourcemap = "0.3.9"
+srcmap-sourcemap = "0.4.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -60,6 +61,7 @@ codspeed = []
 schema = ["fallow-output/schema", "fallow-types/schema"]
 
 [dev-dependencies]
+fallow-graph = { workspace = true, features = ["read-trace"] }
 criterion = { workspace = true }
 insta = { workspace = true }
 proptest = { workspace = true }

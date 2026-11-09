@@ -111,7 +111,7 @@ where
 /// from the environment the server inherited, so a bad file stands down with a
 /// `not-applied` outcome, as it does on the CLI route, instead of failing the
 /// call (issue #2799).
-pub(super) fn env_diff_file() -> Option<PathBuf> {
+fn env_diff_file() -> Option<PathBuf> {
     env_path("FALLOW_DIFF_FILE")
 }
 
@@ -188,7 +188,7 @@ fn changed_since_from_lookup(lookup: impl Fn(&str) -> Option<OsString>) -> Optio
 /// `--changed-since` does on the CLI, instead of failing the call. A tool's own
 /// `changed_since` or `since` argument goes into `changed_since` and keeps the
 /// hard error, and it takes precedence over this value.
-pub(super) fn env_changed_since() -> Option<String> {
+fn env_changed_since() -> Option<String> {
     changed_since_from_lookup(|name| std::env::var_os(name))
 }
 

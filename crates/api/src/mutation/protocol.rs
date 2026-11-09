@@ -44,6 +44,12 @@ pub struct RunRequest {
     pub mutant_id: Option<String>,
     pub test_ids: Vec<String>,
     pub timeout_ms: u64,
+    /// The test CPU time in ms after which the companion ends a test that
+    /// still evaluates instrumented code, and reports it as a timeout. It
+    /// stops a synchronous endless loop that blocks the test worker before
+    /// the watchdog fires. `None` sends no field: the run has no loop check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_budget_ms: Option<u64>,
     pub bail: bool,
 }
 
@@ -174,6 +180,12 @@ pub struct DryRunResult {
     /// module load and suite hooks such as `beforeAll` (section 8).
     #[serde(default)]
     pub file_setup_ms: BTreeMap<String, f64>,
+    /// The ids of tests that share a full name with another test of the same
+    /// file, in sorted order. The companion keeps the first id as it is and
+    /// numbers the others (`name (2)`) in report order, so the evidence of
+    /// these ids is not reliable. An older companion leaves it out.
+    #[serde(default)]
+    pub duplicate_test_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -214,6 +226,11 @@ pub struct RunResult {
     pub tests: Vec<RunTest>,
     #[serde(default)]
     pub unhandled_errors: Vec<UnhandledError>,
+    /// True when the loop budget of the request decided a `timeout` status:
+    /// the first failing test still evaluated instrumented code after the
+    /// budget.
+    #[serde(default)]
+    pub loop_timeout: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -508,17 +525,19 @@ mod tests {
             mutant_id: Some("m1".to_owned()),
             test_ids: vec!["t::a".to_owned()],
             timeout_ms: 6500,
+            loop_budget_ms: Some(650),
             bail: true,
         })
         .to_line(1, 3);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&line).unwrap(),
-            serde_json::json!({"v":1,"id":3,"type":"run","mutant_id":"m1","test_ids":["t::a"],"timeout_ms":6500,"bail":true})
+            serde_json::json!({"v":1,"id":3,"type":"run","mutant_id":"m1","test_ids":["t::a"],"timeout_ms":6500,"loop_budget_ms":650,"bail":true})
         );
         let control = Request::Run(RunRequest {
             mutant_id: None,
             test_ids: vec!["t::a".to_owned()],
             timeout_ms: 6500,
+            loop_budget_ms: None,
             bail: true,
         })
         .to_line(1, 4);

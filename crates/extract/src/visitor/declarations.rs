@@ -5,8 +5,9 @@
 
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, ArrayPattern, BindingPattern, CallExpression, Declaration,
-    Expression, IdentifierReference, Statement, TSEnumMemberName, TSImportEqualsDeclaration,
-    TSModuleReference, TSNamespaceDeclaration, TSNamespaceDeclarationBody, VariableDeclarator,
+    Expression, IdentifierReference, ObjectPattern, Statement, TSEnumMemberName,
+    TSImportEqualsDeclaration, TSModuleReference, TSNamespaceDeclaration,
+    TSNamespaceDeclarationBody, VariableDeclarator,
 };
 
 use crate::js_text::JsText;
@@ -183,7 +184,7 @@ impl ModuleInfoExtractor {
         };
         let is_angular = has_angular_class_decorator(class);
         self.record_angular_inputs_outputs(class, is_angular);
-        let members = extract_class_members(class, is_angular);
+        let members = extract_class_members(class, is_angular, self.heritage_objects());
         let super_class = extract_super_class_name(class);
         let implemented_interfaces = extract_implemented_interface_names(class);
         let instance_bindings =
@@ -202,6 +203,7 @@ impl ModuleInfoExtractor {
                 instance_bindings,
                 super_class_type_args: extract_super_class_type_args(class),
                 generic_instance_bindings: extract_class_generic_instance_bindings(class),
+                binding_super_class: None,
             });
         }
         self.exports.push(ExportInfo {
@@ -407,7 +409,14 @@ impl ModuleInfoExtractor {
 
     /// Push a single namespace-member entry with the shared `NamespaceMember`
     /// defaults (no decorator / static / self-return signals).
-    fn push_namespace_member(&mut self, name: String, span: oxc_span::Span) {
+    /// A member of a nested namespace gets the dotted path from the exported
+    /// root namespace (`Inner.x`).
+    pub(super) fn push_namespace_member(&mut self, name: String, span: oxc_span::Span) {
+        let name = if self.namespace_member_path.is_empty() {
+            name
+        } else {
+            format!("{}.{name}", self.namespace_member_path.join("."))
+        };
         self.pending_namespace_members.push(MemberInfo {
             name,
             kind: MemberKind::NamespaceMember,
@@ -443,6 +452,7 @@ impl ModuleInfoExtractor {
                     span: call.span,
                     source_span,
                     destructured_names: names,
+                    destructured_locals: extract_destructured_locals(obj_pat),
                     local_name: None,
                     is_type_only: false,
                 });
@@ -456,6 +466,7 @@ impl ModuleInfoExtractor {
                     span: call.span,
                     source_span,
                     destructured_names: Vec::new(),
+                    destructured_locals: Vec::new(),
                     local_name: Some(local),
                     is_type_only: false,
                 });
@@ -507,6 +518,7 @@ impl ModuleInfoExtractor {
             span: reference.span,
             source_span: reference.expression.span,
             destructured_names: Vec::new(),
+            destructured_locals: Vec::new(),
             local_name: Some(local),
             is_type_only: decl.import_kind.is_type(),
         });
@@ -684,7 +696,7 @@ impl ModuleInfoExtractor {
             return;
         };
         let mut sources = Vec::new();
-        super::collect_static_import_specifiers(&import_expr.source, &mut sources);
+        self.collect_dynamic_import_specifiers(&import_expr.source, &mut sources);
         if sources.is_empty() {
             return;
         }
@@ -707,7 +719,7 @@ impl ModuleInfoExtractor {
 /// exists only in type space. Any other statement, exported or not, makes the
 /// namespace a runtime object. A `const enum` and a non-type import alias count
 /// as values here, which keeps the classification conservative.
-pub(super) fn namespace_is_instantiated(namespace: &TSNamespaceDeclaration<'_>) -> bool {
+fn namespace_is_instantiated(namespace: &TSNamespaceDeclaration<'_>) -> bool {
     if namespace.declare {
         return false;
     }
@@ -750,4 +762,27 @@ fn declaration_is_instantiated(declaration: &Declaration<'_>) -> bool {
             !import_equals.import_kind.is_type()
         }
     }
+}
+
+/// The `(property key, local name)` pair of each statically named property
+/// of a destructuring pattern whose value is a plain identifier, with or
+/// without a default (`{ exec: run }` and `{ exec: run = noop }` give
+/// `("exec", "run")`). A rest element does not hide the named properties, so
+/// this function keeps them.
+fn extract_destructured_locals(obj_pat: &ObjectPattern<'_>) -> Vec<(String, String)> {
+    obj_pat
+        .properties
+        .iter()
+        .filter_map(|prop| {
+            let target = match &prop.value {
+                BindingPattern::AssignmentPattern(assign) => &assign.left,
+                value => value,
+            };
+            let BindingPattern::BindingIdentifier(local) = target else {
+                return None;
+            };
+            let key = prop.key.static_name()?;
+            Some((key.text().into_owned(), local.name.to_string()))
+        })
+        .collect()
 }

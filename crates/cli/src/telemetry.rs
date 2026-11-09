@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api::{api_url, try_api_agent_with_timeout};
-use crate::json_style::JsonStyle;
+use crate::{exit_codes, json_style::JsonStyle};
 
 const CONFIG_SCHEMA_VERSION: u8 = 2;
 const TELEMETRY_SCHEMA_VERSION: u8 = 2;
@@ -1222,14 +1222,13 @@ fn print_status_human(status: TelemetryStatus) -> ExitCode {
 
 fn set_enabled(enabled: bool, output: OutputFormat, json_style: JsonStyle) -> ExitCode {
     if admin_disabled() && enabled {
-        return crate::error::emit_error(
+        return crate::error::emit_input_error(
             "telemetry is disabled by DO_NOT_TRACK or FALLOW_TELEMETRY_DISABLED",
-            2,
             output,
         );
     }
     let Some(path) = config_path() else {
-        return crate::error::emit_error("could not determine user config directory", 2, output);
+        return crate::error::emit_input_error("could not determine user config directory", output);
     };
     let mut config = read_config_from(&path).unwrap_or_default();
     config.enabled = enabled;
@@ -1245,9 +1244,8 @@ fn set_enabled(enabled: bool, output: OutputFormat, json_style: JsonStyle) -> Ex
         config.install_id = None;
     }
     if let Err(err) = write_config_to(&path, &config) {
-        return crate::error::emit_error(
+        return crate::error::emit_input_error(
             &format!("failed to write telemetry config: {err}"),
-            2,
             output,
         );
     }
@@ -2376,9 +2374,9 @@ fn duration_bucket(duration: Duration) -> &'static str {
 fn exit_code_bucket(code: ExitCode) -> &'static str {
     if code == ExitCode::SUCCESS {
         "0"
-    } else if code == ExitCode::from(1) {
+    } else if code == exit_codes::exit_gate_failed() {
         "1"
-    } else if code == ExitCode::from(2) {
+    } else if code == exit_codes::exit_invalid_input() {
         "2"
     } else {
         "3-7"
@@ -2388,7 +2386,7 @@ fn exit_code_bucket(code: ExitCode) -> &'static str {
 fn outcome(code: ExitCode) -> &'static str {
     if code == ExitCode::SUCCESS {
         "success"
-    } else if code == ExitCode::from(1) {
+    } else if code == exit_codes::exit_gate_failed() {
         "issues_found"
     } else {
         "failed"
@@ -2464,7 +2462,7 @@ fn sanitize_parent_run(value: &str) -> Option<String> {
 }
 
 fn is_failed(code: ExitCode) -> bool {
-    code != ExitCode::SUCCESS && code != ExitCode::from(1)
+    code != ExitCode::SUCCESS && code != exit_codes::exit_gate_failed()
 }
 
 fn mode_label(mode: EffectiveMode) -> &'static str {
@@ -2581,7 +2579,7 @@ mod tests {
             output: OutputFormat::Json,
             quiet: true,
             elapsed: Duration::from_millis(750),
-            exit_code: ExitCode::from(1),
+            exit_code: exit_codes::exit_gate_failed(),
             failure_reason: None,
             parent_run: Some("tmp_123"),
             context: WorkflowContext {
@@ -2617,7 +2615,7 @@ mod tests {
             output: OutputFormat::Json,
             quiet: true,
             elapsed: Duration::from_millis(750),
-            exit_code: ExitCode::from(2),
+            exit_code: exit_codes::exit_invalid_input(),
             failure_reason: None,
             parent_run: None,
             context: WorkflowContext {
@@ -2640,7 +2638,7 @@ mod tests {
             output: OutputFormat::Json,
             quiet: true,
             elapsed: Duration::from_millis(750),
-            exit_code: ExitCode::from(2),
+            exit_code: exit_codes::exit_invalid_input(),
             failure_reason: Some(FailureReason::Diff),
             parent_run: None,
             context: WorkflowContext {
@@ -3395,7 +3393,7 @@ mod tests {
         // was simply still held).
         //
         // Retrying is honest rather than a mask because production never needs
-        // the guarantee this used to assert. Both callers of `try_acquire`
+        // an immediate release. Both callers of `try_acquire`
         // (`trim_spool_if_oversized` and the drain) treat contention as "skip,
         // the next run picks it up", so a release that becomes visible a
         // moment later costs nothing. What still matters, and is still
@@ -4546,7 +4544,7 @@ mod tests {
             output: OutputFormat::Json,
             quiet: true,
             elapsed: Duration::from_millis(100),
-            exit_code: ExitCode::from(2),
+            exit_code: exit_codes::exit_invalid_input(),
             failure_reason: None,
             parent_run: None,
             context: WorkflowContext {
@@ -4595,8 +4593,8 @@ mod tests {
     #[test]
     fn exit_code_bucket_covers_expected_codes() {
         assert_eq!(exit_code_bucket(ExitCode::SUCCESS), "0");
-        assert_eq!(exit_code_bucket(ExitCode::from(1)), "1");
-        assert_eq!(exit_code_bucket(ExitCode::from(2)), "2");
+        assert_eq!(exit_code_bucket(exit_codes::exit_gate_failed()), "1");
+        assert_eq!(exit_code_bucket(exit_codes::exit_invalid_input()), "2");
         // Any code >= 3 falls into the catch-all bucket.
         assert_eq!(exit_code_bucket(ExitCode::from(3)), "3-7");
         assert_eq!(exit_code_bucket(ExitCode::from(7)), "3-7");
@@ -4607,8 +4605,8 @@ mod tests {
     #[test]
     fn outcome_maps_exit_codes_to_labels() {
         assert_eq!(outcome(ExitCode::SUCCESS), "success");
-        assert_eq!(outcome(ExitCode::from(1)), "issues_found");
-        assert_eq!(outcome(ExitCode::from(2)), "failed");
+        assert_eq!(outcome(exit_codes::exit_gate_failed()), "issues_found");
+        assert_eq!(outcome(exit_codes::exit_invalid_input()), "failed");
         assert_eq!(outcome(ExitCode::from(7)), "failed");
     }
 
@@ -4617,12 +4615,12 @@ mod tests {
     #[test]
     fn is_failed_returns_false_for_success_and_issues_found() {
         assert!(!is_failed(ExitCode::SUCCESS));
-        assert!(!is_failed(ExitCode::from(1)));
+        assert!(!is_failed(exit_codes::exit_gate_failed()));
     }
 
     #[test]
     fn is_failed_returns_true_for_error_codes() {
-        assert!(is_failed(ExitCode::from(2)));
+        assert!(is_failed(exit_codes::exit_invalid_input()));
         assert!(is_failed(ExitCode::from(7)));
     }
 

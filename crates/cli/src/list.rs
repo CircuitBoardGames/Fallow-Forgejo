@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use fallow_config::OutputFormat;
 
+use crate::exit_codes::{exit_gate_failed, exit_invalid_input};
 use crate::report::format_display_path;
 use crate::runtime_support::{LoadConfigArgs, load_config};
 use fallow_api::{BoundaryData, ListJsonEnvelope, ListJsonOutputInput};
@@ -180,7 +181,7 @@ pub fn benchmark_list_boundaries_json(
     };
     let (data, rendered_bytes) = benchmark_list_data_json(&opts)?;
     let Some(boundary_data) = data.boundary_data else {
-        return Err(ExitCode::from(2));
+        return Err(exit_invalid_input());
     };
     let matched_file_count = boundary_data.zones.iter().map(|zone| zone.file_count).sum();
     Ok((
@@ -216,9 +217,8 @@ fn benchmark_list_data_json(opts: &ListOptions<'_>) -> Result<(ListData, usize),
         workspace_data: data.workspace_data.as_ref(),
     })
     .map_err(|err| {
-        crate::error::emit_error(
+        crate::error::emit_input_error(
             &format!("failed to serialize list output: {err}"),
-            2,
             OutputFormat::Json,
         )
     })?;
@@ -239,7 +239,7 @@ fn collect_list_data(
     let session = if need_files || need_plugin_result {
         match fallow_engine::session::AnalysisSession::from_resolved_config(config.clone()) {
             Ok(session) => Some(session),
-            Err(err) => return Err(crate::error::emit_error(err.message(), 2, opts.output)),
+            Err(err) => return Err(crate::error::emit_input_error(err.message(), opts.output)),
         }
     } else {
         None
@@ -314,7 +314,7 @@ fn collect_entry_weight(
 ) -> Result<fallow_output::EntryWeightListing, ExitCode> {
     let mut listing = fallow_engine::entry_weight::compute_entry_weight(session, entry_points)
         .map_err(|err| {
-            crate::error::emit_error(&format!("Analysis error: {err}"), 2, opts.output)
+            crate::error::emit_input_error(&format!("Analysis error: {err}"), opts.output)
         })?;
     if let Some(scope) = opts.scope.as_deref() {
         listing
@@ -373,7 +373,7 @@ fn collect_list_workspace_data(
                 diagnostics,
             }))
         }
-        Err(err) => Err(crate::error::emit_error(err.message(), 2, opts.output)),
+        Err(err) => Err(crate::error::emit_input_error(err.message(), opts.output)),
     }
 }
 
@@ -446,7 +446,7 @@ fn collect_inventory(
         opts.entry_points || opts.entry_weight || show_all,
     )
     .map(Some)
-    .map_err(|err| crate::error::emit_error(err.message(), 2, opts.output))
+    .map_err(|err| crate::error::emit_input_error(err.message(), opts.output))
 }
 
 /// Print list results as JSON and return the appropriate exit code.
@@ -469,7 +469,7 @@ fn print_list_json(input: &ListJsonInput<'_>) -> Result<(), ExitCode> {
         }
         Err(err) => {
             eprintln!("Error: failed to serialize list output: {err}");
-            Err(ExitCode::from(2))
+            Err(exit_invalid_input())
         }
     }
 }
@@ -478,7 +478,7 @@ fn print_list_json(input: &ListJsonInput<'_>) -> Result<(), ExitCode> {
 /// more than the tolerance allows.
 fn gate_exit(gate_failed: bool) -> ExitCode {
     if gate_failed {
-        ExitCode::from(1)
+        exit_gate_failed()
     } else {
         ExitCode::SUCCESS
     }
@@ -491,10 +491,9 @@ fn validate_entry_weight_gate(
 ) -> Result<(), ExitCode> {
     gate.validate(opts.output)?;
     if gate.save_file.is_some() && opts.scope.is_some() {
-        return Err(crate::error::emit_error(
+        return Err(crate::error::emit_input_error(
             "list --entry-weight --save-regression-baseline saves every entry; drop the PATH \
              scope to save a baseline",
-            2,
             opts.output,
         ));
     }
@@ -595,6 +594,7 @@ fn build_list_json_output_input(
             .map(|entry| fallow_api::ListEntryPointOutput {
                 path: format_display_path(&entry.path, opts.root),
                 source: entry.source.to_string(),
+                script: entry.source.script().map(str::to_string),
             })
             .collect()
     });
@@ -697,11 +697,13 @@ fn print_list_human(input: &ListHumanInput<'_>) {
     if let Some(entries) = entry_points {
         eprintln!("Found {} entry points", entries.len());
         for ep in entries {
-            crate::report::sink::stdoutln!(
-                "{} ({})",
-                format_display_path(&ep.path, opts.root),
-                ep.source
-            );
+            let path = format_display_path(&ep.path, opts.root);
+            match ep.source.script() {
+                Some(script) => {
+                    crate::report::sink::stdoutln!("{path} ({} `{script}`)", ep.source);
+                }
+                None => crate::report::sink::stdoutln!("{path} ({})", ep.source),
+            }
         }
     }
 

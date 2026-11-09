@@ -3,8 +3,7 @@ use std::process::ExitCode;
 
 use colored::Colorize;
 use fallow_api::{
-    AuditCodeClimateOutputInput, AuditJsonHeaderInput, AuditJsonOutputInput, AuditSarifOutputInput,
-    DupesReportPayload,
+    AuditJsonHeaderInput, AuditJsonOutputInput, AuditSarifOutputInput, DupesReportPayload,
 };
 use fallow_config::{AuditGate, AuditWorsened, OutputFormat, RulesConfig, Severity};
 use fallow_output::{
@@ -14,7 +13,8 @@ use fallow_output::{
 use fallow_types::envelope::{ElapsedMs, SchemaVersion, ToolVersion};
 use fallow_types::results::AnalysisResults;
 
-use crate::error::emit_error;
+use crate::error::emit_input_error;
+use crate::exit_codes::exit_invalid_input;
 use crate::report;
 use crate::report::plural;
 use crate::report::sink::outln;
@@ -26,8 +26,13 @@ use super::keys::{
 use super::{AuditResult, AuditSummary, AuditVerdict, DupeDemotionDiffSource};
 use complexity_notes::worsened_class_label;
 
+#[path = "audit_output_codeclimate.rs"]
+mod codeclimate;
 #[path = "audit_complexity_notes.rs"]
 mod complexity_notes;
+#[cfg(test)]
+use codeclimate::build_audit_codeclimate;
+use codeclimate::{build_audit_codeclimate_issues, print_audit_codeclimate};
 
 /// Print audit results and return the appropriate exit code.
 #[must_use]
@@ -188,7 +193,7 @@ fn print_audit_format(
         }
         OutputFormat::Badge => {
             eprintln!("Error: badge format is not supported for the audit command");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -310,6 +315,10 @@ fn print_audit_review(
         report::ci::review::ReviewSummaryNotes {
             message: note.as_deref(),
             config_patterns: audit_config_patterns(result),
+            audit_gate: Some(report::ci::review::AuditGatePolicy {
+                new_only: matches!(result.attribution.gate, AuditGate::NewOnly),
+                worsened: result.attribution.worsened,
+            }),
         },
     )
 }
@@ -407,10 +416,10 @@ fn print_audit_human(result: &AuditResult, quiet: bool, explain: bool, output: O
     // candidates), else the styling summary is invisible on the common case.
     let has_styling = result.health.as_ref().is_some_and(|h| {
         !h.report.styling_findings.is_empty()
-            || h.report
-                .css_analytics
-                .as_ref()
-                .is_some_and(|c| fallow_output::styling_candidate_count(&c.summary) > 0)
+            || h.report.css_analytics.as_ref().is_some_and(|c| {
+                fallow_output::styling_candidate_count(&c.summary) > 0
+                    || c.summary.keyframes_unchecked > 0
+            })
     });
 
     let has_diff_risk = !result.diff_risk.is_empty();
@@ -683,13 +692,24 @@ fn print_audit_styling_summary(result: &AuditResult, show_headers: bool) {
     let descriptive = health.report.css_analytics.as_ref().map_or(0, |css| {
         fallow_output::styling_candidate_count(&css.summary)
     });
-    if findings.is_empty() && descriptive == 0 {
+    let unchecked_keyframes = health
+        .report
+        .css_analytics
+        .as_ref()
+        .and_then(|css| fallow_output::keyframes_unchecked_clause(&css.summary));
+    if findings.is_empty() && descriptive == 0 && unchecked_keyframes.is_none() {
         return;
     }
     print_audit_section_header(
         show_headers,
         "── Styling ────────────────────────────────────────",
     );
+    if let Some(clause) = unchecked_keyframes {
+        outln!("  @keyframes: {clause}");
+    }
+    if findings.is_empty() && descriptive == 0 {
+        return;
+    }
     if findings.is_empty() {
         // Only not-yet-graduated descriptive candidates (dead surface, etc.).
         let noun = if descriptive == 1 {
@@ -1223,9 +1243,8 @@ pub(super) fn build_audit_json_output(result: &AuditResult) -> Result<serde_json
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .map_err(|err| {
-        emit_error(
+        emit_input_error(
             &format!("JSON serialization error: {err}"),
-            2,
             OutputFormat::Json,
         )
     })
@@ -1308,9 +1327,8 @@ fn build_audit_dead_code_json_with_results(
             }
             Ok(json)
         }
-        Err(e) => Err(emit_error(
+        Err(e) => Err(emit_input_error(
             &format!("JSON serialization error: {e}"),
-            2,
             OutputFormat::Json,
         )),
     }
@@ -1351,9 +1369,8 @@ fn build_audit_duplication_json(
             }
             Ok(json)
         }
-        Err(e) => Err(emit_error(
+        Err(e) => Err(emit_input_error(
             &format!("JSON serialization error: {e}"),
-            2,
             OutputFormat::Json,
         )),
     }
@@ -1418,9 +1435,8 @@ fn build_audit_health_json_with_report(
             }
             Ok(json)
         }
-        Err(e) => Err(emit_error(
+        Err(e) => Err(emit_input_error(
             &format!("JSON serialization error: {e}"),
-            2,
             OutputFormat::Json,
         )),
     }
@@ -1460,32 +1476,6 @@ fn print_audit_sarif(result: &AuditResult) -> ExitCode {
     report::emit_json(&combined, "SARIF audit")
 }
 
-fn print_audit_codeclimate(result: &AuditResult) -> ExitCode {
-    let value = build_audit_codeclimate(result);
-    report::emit_json(&value, "CodeClimate audit")
-}
-
-fn build_audit_codeclimate(result: &AuditResult) -> serde_json::Value {
-    fallow_output::codeclimate_issues_to_value(&build_audit_codeclimate_issues(result))
-}
-
-/// Typed audit CodeClimate issues. The CI comment and review renderers take
-/// these, so the legacy fingerprint of a dead-code issue reaches them.
-fn build_audit_codeclimate_issues(result: &AuditResult) -> Vec<fallow_output::CodeClimateIssue> {
-    fallow_api::build_audit_codeclimate_issues(AuditCodeClimateOutputInput {
-        dead_code: result.check.as_ref().map_or_else(Vec::new, |check| {
-            fallow_api::build_codeclimate(&check.results, &check.config.root, &check.config.rules)
-        }),
-        duplication: result.dupes.as_ref().map_or_else(Vec::new, |dupes| {
-            fallow_api::build_duplication_codeclimate(&dupes.report, &dupes.config.root)
-        }),
-        health: result.health.as_ref().map_or_else(Vec::new, |health| {
-            fallow_api::build_health_codeclimate(&health.report, &health.config.root)
-        }),
-        diff_risk: fallow_api::build_diff_risk_codeclimate(&result.diff_risk),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::process::ExitCode;
@@ -1495,6 +1485,7 @@ mod tests {
     use fallow_output::PrDecisionConclusion;
 
     use crate::audit::{AuditAttribution, AuditResult, AuditSummary, AuditVerdict};
+    use crate::exit_codes::{exit_gate_failed, exit_invalid_input};
 
     use super::{
         audit_decision_conclusion, build_audit_codeclimate, build_audit_json_output,
@@ -1675,6 +1666,7 @@ mod tests {
             introduced: true,
             related: Vec::new(),
             actions: Vec::new(),
+            suppression: None,
         };
         let one = fallow_output::DiffRiskReport {
             findings: vec![finding.clone()],
@@ -1780,14 +1772,17 @@ mod tests {
     fn print_audit_result_rejects_badge_format() {
         let result = audit_result(AuditVerdict::Pass, OutputFormat::Badge);
 
-        assert_eq!(print_audit_result(&result, true, false), ExitCode::from(2));
+        assert_eq!(
+            print_audit_result(&result, true, false),
+            exit_invalid_input()
+        );
     }
 
     #[test]
     fn print_audit_result_maps_fail_verdict_to_error_exit() {
         let result = audit_result(AuditVerdict::Fail, OutputFormat::Human);
 
-        assert_eq!(print_audit_result(&result, true, false), ExitCode::from(1));
+        assert_eq!(print_audit_result(&result, true, false), exit_gate_failed());
     }
 
     #[test]
@@ -1925,7 +1920,10 @@ mod tests {
         let result = audit_result_with_findings(AuditVerdict::Fail, OutputFormat::Human);
 
         // Fail maps to exit 1 and renders the red status line via build_status_parts.
-        assert_eq!(print_audit_result(&result, false, false), ExitCode::from(1));
+        assert_eq!(
+            print_audit_result(&result, false, false),
+            exit_gate_failed()
+        );
     }
 
     #[test]
@@ -1943,6 +1941,7 @@ mod tests {
                     introduced: true,
                     related: Vec::new(),
                     actions: Vec::new(),
+                    suppression: None,
                 },
                 fallow_output::DiffRiskFinding {
                     rule: fallow_output::DiffRiskRule::AddedSuppression,
@@ -1955,6 +1954,7 @@ mod tests {
                     introduced: true,
                     related: Vec::new(),
                     actions: Vec::new(),
+                    suppression: None,
                 },
             ],
         };

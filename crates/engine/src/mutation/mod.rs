@@ -18,9 +18,12 @@
 //! - `pruned`: a static rule removes the mutant (see [`PruneReason`](crate::mutation::PruneReason)).
 
 mod database_write;
+mod function_scope;
 mod layout;
 mod plan;
 mod reach;
+mod sampling;
+mod skipped_tests;
 #[cfg(test)]
 mod tests;
 
@@ -35,6 +38,7 @@ pub use fallow_mutation::{
 };
 pub use fallow_output::DiffIndex;
 pub use layout::{instrument_source, is_component_file};
+pub use skipped_tests::{SkipKind, SkippedTest};
 
 use crate::EngineError;
 use crate::module_graph::{ExportTestReach, RetainedModuleGraph};
@@ -95,10 +99,23 @@ pub struct MutationPlanRequest {
     /// The maximum number of planned mutants. The mutants after this limit,
     /// in rank order, become `pending`.
     pub max_mutants: Option<usize>,
+    /// The maximum number of planned mutants on one source line. The plan
+    /// keeps the most productive mutants of the line and marks the others
+    /// [`MutantDisposition::SampledOut`]. `None` keeps each mutant.
+    pub mutants_per_line: Option<usize>,
+    /// Widen each changed line of [`MutationScope::ChangedSinceBase`] to the
+    /// whole innermost function that holds it, so that a change to a
+    /// parameter or a signature selects the mutants of the function. The
+    /// other scopes ignore it.
+    pub function_scope: bool,
     /// Leave each Vue, Svelte and Astro component file out of the plan,
     /// with the skip reason [`SkipReason::RunnerCannotLoad`]. Set it when
     /// the test runner has no loader for a component file.
     pub skip_component_files: bool,
+    /// Run only the mutants with these ids. Each other mutant is pruned with
+    /// [`PruneReason::NotSelected`]. It stays in the plan, because the
+    /// instrumented file still holds its switch. `None` selects each mutant.
+    pub mutant_ids: Option<BTreeSet<String>>,
 }
 
 impl MutationPlanRequest {
@@ -110,7 +127,10 @@ impl MutationPlanRequest {
             operators: None,
             allow_side_effects: false,
             max_mutants: None,
+            mutants_per_line: None,
+            function_scope: false,
             skip_component_files: false,
+            mutant_ids: None,
         }
     }
 }
@@ -139,7 +159,7 @@ impl FrameworkConfigExports {
     /// Records that the root-relative `file` is a tool config file. The tool
     /// reads its default export, and a top-level `module.exports = ...`
     /// statement counts as that default export.
-    pub fn insert_config_file(&mut self, file: impl Into<String>) {
+    fn insert_config_file(&mut self, file: impl Into<String>) {
         let file = file.into();
         self.insert(file.clone(), DEFAULT_EXPORT);
         self.config_files.insert(file);
@@ -148,13 +168,13 @@ impl FrameworkConfigExports {
     /// True when [`Self::insert_config_file`] recorded the root-relative
     /// `file`.
     #[must_use]
-    pub fn is_config_file(&self, file: &str) -> bool {
+    fn is_config_file(&self, file: &str) -> bool {
         self.config_files.contains(file)
     }
 
     /// The framework config export names of one root-relative file.
     #[must_use]
-    pub fn exports_for(&self, file: &str) -> Option<&BTreeSet<String>> {
+    fn exports_for(&self, file: &str) -> Option<&BTreeSet<String>> {
         self.files.get(file)
     }
 }
@@ -198,6 +218,9 @@ pub enum PruneReason {
     SideEffectSink,
     /// The mutant is in an export that a framework reads as config.
     FrameworkConfig,
+    /// The request selects other mutants by id
+    /// ([`MutationPlanRequest::mutant_ids`]).
+    NotSelected,
 }
 
 /// The status of a mutant in a plan.
@@ -208,6 +231,9 @@ pub enum MutantDisposition {
     Planned,
     /// A planned mutant after the `max_mutants` limit.
     Pending,
+    /// A planned mutant that the `mutants_per_line` limit left out. It has
+    /// no rank, and the scheduler never runs it.
+    SampledOut,
     /// No test file reaches the file of the mutant.
     NoCoverage,
     /// A static rule removes the mutant.
@@ -333,6 +359,10 @@ pub struct PruneCounts {
     pub side_effect_sink: usize,
     /// Mutants in framework config exports.
     pub framework_config: usize,
+    /// Mutants that the request did not select by id. A plan document never
+    /// selects by id, so its output has no such count.
+    #[serde(skip)]
+    pub not_selected: usize,
 }
 
 /// The number of mutants for each disposition.
@@ -344,6 +374,9 @@ pub struct MutationPlanCounts {
     pub planned: usize,
     /// Planned mutants after the `max_mutants` limit.
     pub pending: usize,
+    /// Planned mutants that the `mutants_per_line` limit left out. They are
+    /// not part of `pending`.
+    pub sampled_out: usize,
     /// Mutants that no test file reaches.
     pub no_coverage: usize,
     /// Pruned mutants, by reason.
@@ -360,6 +393,13 @@ pub struct MutationPlan {
     pub mutants: Vec<PlannedMutant>,
     /// The union of the static test files of `files`, sorted.
     pub test_files: Vec<String>,
+    /// The skipped and todo tests in the runner test files that the diff of a
+    /// changed-code scope changes, sorted by file and line. A test file
+    /// counts when the diff adds, removes or changes a line in it, also when
+    /// it reaches no changed source. A scan of the syntax tree finds the
+    /// tests, so no runner starts. Empty for the other scopes.
+    #[serde(skip)]
+    pub skipped_tests: Vec<SkippedTest>,
     /// The files that the test files reach through static imports, sorted.
     /// [`MutationPlan::test_file_reach`] indexes into this list.
     #[serde(skip)]
@@ -396,10 +436,11 @@ pub struct MutationPlan {
     pub unmatched_paths: Vec<String>,
 }
 
+#[cfg(test)]
 impl MutationPlan {
     /// The files that `test_file` reaches through static imports, sorted.
     /// Empty for a file that is not a test file of the plan.
-    pub fn test_file_reach_paths<'a>(&'a self, test_file: &str) -> impl Iterator<Item = &'a str> {
+    fn test_file_reach_paths<'a>(&'a self, test_file: &str) -> impl Iterator<Item = &'a str> {
         self.test_file_reach
             .get(test_file)
             .into_iter()
@@ -446,10 +487,7 @@ impl From<EngineError> for MutationPlanError {
 
 /// Builds the mutation plan from the facts of one analysis.
 #[must_use]
-pub fn plan_mutations(
-    inputs: &MutationPlanInputs<'_>,
-    request: &MutationPlanRequest,
-) -> MutationPlan {
+fn plan_mutations(inputs: &MutationPlanInputs<'_>, request: &MutationPlanRequest) -> MutationPlan {
     plan::build(inputs, request)
 }
 
@@ -497,7 +535,8 @@ pub fn plan_mutations_for_session_with(
     let inventory = crate::list_inventory::collect_listing_inventory(session, false)
         .map_err(|error| MutationPlanError::Plugins(error.message().to_owned()))?;
     let framework_config_exports = framework_config_exports(session, graph, &inventory);
-    let setup_files = inventory.plugins.backend().setup_files();
+    let mut setup_files = inventory.plugins.backend().setup_files();
+    setup_files.extend(crate::core_backend::bun_preload_files(session.root()));
     let inputs = MutationPlanInputs {
         root: session.root(),
         graph,

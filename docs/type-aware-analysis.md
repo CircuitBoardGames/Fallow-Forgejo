@@ -115,9 +115,12 @@ FALLOW_TYPE_AWARE_BACKEND=tsrs node --test tools/type-aware-sidecar/test/*.test.
 
 tsrs has no Windows or macOS x64 binaries, and the backend stays opt-in while
 tsrs is a 0.x release. The VS Code extension bundles only the default backend,
-so the tsrs backend needs an npm or CLI install. Fallow reads the selection
-once per process and rejects an unknown or non-Unicode value before it starts
-the companion.
+so the tsrs backend needs an npm or CLI install. When the extension runs Fallow
+from the project `node_modules`, it uses the `fallow-type-aware` package of the
+same install (also from the pnpm store) when its version equals the Fallow
+version. Fallow reads the
+selection once per process and rejects an unknown or non-Unicode value before
+it starts the companion.
 
 ## Ownership boundary with tsc and Oxlint
 
@@ -137,7 +140,10 @@ never forwards a compiler diagnostic as a Fallow issue.
 `fallow mutation --typecheck` uses the same companion with the one-shot
 `mutant-typecheck` operation. It compares the error diagnostics of a mutated
 file with the original file and returns only the diagnostic codes of new
-errors. See [`mutation-testing.md`](mutation-testing.md).
+errors. For a mutant that removes an optional-chaining link, it adds the
+advisory hint `type-non-nullish` to a `compiles` result when the declared type
+of the receiver is never nullish. The hint never changes the status. See
+[`mutation-testing.md`](mutation-testing.md).
 
 ## Five semantic capabilities
 
@@ -190,6 +196,23 @@ A type-coupling result is one report for the whole project, so it can carry up
 to 10,000 evidence items. Symbol, impact, and API-surface results keep the
 limit of 40 items. Above the limit, the report is `partial` with the
 `evidence-limit` reason, and `--type-aware-require complete` fails the run.
+`symbol-use` has a different rule for a `confirmed-used` result, as the next
+paragraph tells.
+
+A `symbol-use` result keeps one evidence item for each file that references the
+symbol, up to the limit of 40 items. In each file, Fallow keeps a read before a
+re-export. `total_evidence_count` gives the number of exact references, and
+`truncated` is `true` when the result returns fewer items than that number. A
+`confirmed-used` result with truncated evidence stays `complete`, because the
+`evidence-limit` reason does not apply to it. Other gaps, for example
+`dynamic-member-access`, still make the result `partial`. A negative assertion,
+for example `confirmed-no-static-references`, still needs complete evidence.
+
+Fallow credits a use only when a returned evidence item is a read in a reachable
+file. When every returned item is in an unreachable file or is a re-export, the
+candidate is `retained-abstained` and `partial`. When the evidence limit also
+dropped references, the result has the `evidence-limit` reason, because a
+dropped reference can be a reachable read.
 
 Preview and apply class-member cleanup only when Fallow has complete
 closed-world evidence and an exact declaration guard:
@@ -297,12 +320,13 @@ fallow dead-code --root packages/app --unused-class-members --type-aware \
 
 Fallow never searches project `node_modules/.bin` or `PATH` for this executable.
 It accepts an explicit `FALLOW_TYPE_AWARE_BIN` path, or a regular non-symlinked
-sidecar next to the active Fallow executable. The `fallow` npm launcher and the
-Node-API loader resolve a version-matched `fallow-type-aware` npm package
-themselves and wire it through `FALLOW_TYPE_AWARE_BIN`, marked as
-wrapper-provided. `type-aware status` reports the resolution path as
+sidecar next to the active Fallow executable. The `fallow` npm launcher, the
+Node-API loader, and the VS Code extension resolve a version-matched
+`fallow-type-aware` npm package themselves and wire it through
+`FALLOW_TYPE_AWARE_BIN`, marked as wrapper-provided. `type-aware status`
+reports the resolution path as
 `discovery_source`: `environment-override` (user-set `FALLOW_TYPE_AWARE_BIN`),
-`npm-wrapper` (companion resolved from `node_modules` by a fallow npm wrapper),
+`npm-wrapper` (companion resolved from `node_modules` by a fallow launcher),
 or `installed-sibling` (found next to the active executable). Requests, responses, warnings,
 candidate counts, project counts, and execution time are bounded. The child
 process receives a minimal environment. Relative, missing, and project-local
@@ -354,7 +378,9 @@ identity or a bounded provenance summary.
 
 Combined analysis, audit, MCP, LSP, VS Code, the Rust API, and Node bindings use
 the same exact-version protocol. The VS Code package bundles the companion and
-its TypeScript runtime. CI integrations install the matching optional package.
+its TypeScript runtime, and passes it to each Fallow child process. A
+version-matched project companion takes its place for a project-local Fallow.
+CI integrations install the matching optional package.
 Baseline and regression comparisons include semantic mode identity so a
 syntactic run is never silently compared with a type-aware run.
 
@@ -438,14 +464,14 @@ record the buckets that genuinely apply to each candidate in
 
 The corpus uses clean worktrees at exact public refs and does not create or
 reuse fixture-local `node_modules`. TypeScript dependency resolution is pinned
-to the Fallow workspace ancestor, recorded with hashes of its `package-lock.json`
+to the Fallow workspace ancestor, recorded with hashes of its `pnpm-lock.yaml`
 and installed package manifests and type declarations. Any other ancestor
 dependency root is rejected. The real path of the artifact directory and of
 each prepared fixture must be inside the Fallow workspace. A symlinked `target`
 directory, for example from a build cache wrapper, is rejected: replace it with
 a real directory before the run. The supplemental Vitest fixture always uses
 `target/type-aware-corpus`, so `--out-dir` does not avoid this check. A
-workspace without installed dependencies also fails: run `npm ci` first.
+workspace without installed dependencies also fails: run `pnpm install` first.
 Published dependency paths explicitly use the Fallow workspace root as their
 base. Discovery records the
 manifest, release binary, full sidecar runtime, TypeScript installation,

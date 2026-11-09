@@ -13,7 +13,6 @@
 //! value of the local.
 
 use oxc_allocator::{Allocator, CloneIn};
-#[allow(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -108,12 +107,20 @@ fn callback_locals<'a>(
     .into_iter()
     .map(str::to_string)
     .collect();
-    Some(
-        candidates
-            .into_iter()
-            .filter(|(name, _)| stable.contains(name))
-            .collect(),
-    )
+    Some(keep_stable(candidates, &stable))
+}
+
+/// The candidates whose name is in `stable`. A config callback can declare
+/// many thousands of locals, so the lookup must be a hash lookup: a search
+/// of a list compares each local with each stable name.
+fn keep_stable<N: Eq + std::hash::Hash, V>(
+    candidates: Vec<(N, V)>,
+    stable: &FxHashSet<N>,
+) -> FxHashMap<N, V> {
+    candidates
+        .into_iter()
+        .filter(|(name, _)| stable.contains(name))
+        .collect()
 }
 
 /// The body of a config callback: a function body, or the expression body of
@@ -372,8 +379,13 @@ fn collect_branch_returns<'p, 'a>(
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use oxc_ast::ast::Program;
+
+    use super::super::const_inline::{MAX_ALIAS_STEPS, take_alias_steps, take_name_visits};
     use super::super::{
-        extract_config_path_aliases, extract_config_string, extract_config_string_or_array,
+        PathScope, extract_config_path_aliases, extract_config_string,
+        extract_config_string_or_array, get_nested_string_from_object, get_nested_string_or_array,
+        read_each_config, read_last_config,
     };
 
     fn js() -> &'static Path {
@@ -432,25 +444,106 @@ mod tests {
         );
     }
 
-    #[test]
-    fn many_callback_locals_stay_linear() {
-        // The stable filter must not compare each local with each other one.
-        let count = 60_000;
+    /// The work counts of one parse of `source`, with the value that `read`
+    /// gets from the inlined program.
+    struct Work<T> {
+        value: T,
+        name_visits: usize,
+        alias_steps: usize,
+    }
+
+    /// Parse `source`, run both inline passes and `read` the program, and
+    /// count the work. The counters are thread-local. A large source can
+    /// parse on a new thread with a larger stack, so `read` takes the counts
+    /// on the thread that ran the passes.
+    fn count_work<T: Send>(source: &str, read: impl FnOnce(&Program<'_>) -> T + Send) -> Work<T> {
+        take_name_visits();
+        take_alias_steps();
+        super::super::extract_from_source(source, js(), |program| {
+            let value = read(program);
+            Some(Work {
+                value,
+                name_visits: take_name_visits(),
+                alias_steps: take_alias_steps(),
+            })
+        })
+        .expect("source parses")
+    }
+
+    /// The number of identifiers that the stable filter reads for a config
+    /// callback with `count` string locals.
+    fn name_visits_for_callback_locals(count: usize) -> usize {
         let locals = (0..count)
             .map(|i| format!("const l{i} = \"x\";"))
             .collect::<Vec<_>>()
             .join("\n");
         let source = format!("module.exports = () => {{\n{locals}return {{ entry: l0 }};\n}};\n");
-        let start = std::time::Instant::now();
-        assert_eq!(
-            extract_config_string(&source, js(), &["entry"]),
-            Some("x".to_string())
-        );
-        let elapsed = start.elapsed();
+        let work = count_work(&source, |program| {
+            read_last_config(program, &["entry"], get_nested_string_from_object)
+        });
+        assert_eq!(work.value, Some("x".to_string()));
+        work.name_visits
+    }
+
+    #[test]
+    fn many_callback_locals_stay_linear() {
+        // The stable filter must not compare each local with each other one.
+        // Linear work reads about twice the identifiers for twice the
+        // locals. Work that compares each pair of locals reads four times.
+        let small = name_visits_for_callback_locals(2_000);
+        let large = name_visits_for_callback_locals(4_000);
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "{count} locals took {elapsed:?}"
+            large <= small * 5 / 2,
+            "2000 locals read {small} identifiers, 4000 locals read {large}"
         );
+    }
+
+    thread_local! {
+        static COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A name that counts each equality comparison in [`COMPARISONS`].
+    struct CountedName(String);
+
+    impl std::hash::Hash for CountedName {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for CountedName {
+        fn eq(&self, other: &Self) -> bool {
+            COMPARISONS.set(COMPARISONS.get() + 1);
+            self.0 == other.0
+        }
+    }
+
+    impl Eq for CountedName {}
+
+    /// The number of name comparisons that the stable filter makes for
+    /// `count` candidates, of which every second one is stable.
+    fn stable_filter_comparisons(count: usize) -> usize {
+        let name = |i: usize| CountedName(format!("l{i}"));
+        let candidates = (0..count).map(|i| (name(i), i)).collect();
+        let stable = (0..count).step_by(2).map(name).collect();
+        COMPARISONS.set(0);
+        let kept = super::keep_stable(candidates, &stable);
+        assert_eq!(kept.len(), count.div_ceil(2));
+        COMPARISONS.get()
+    }
+
+    #[test]
+    fn stable_filter_compares_each_local_a_bounded_number_of_times() {
+        // The identifier count of `many_callback_locals_stay_linear` does not
+        // see the filter: a filter that searches a list of the stable names
+        // reads no identifiers, but compares each local with each name.
+        for count in [1_000, 8_000, 64_000] {
+            let comparisons = stable_filter_comparisons(count);
+            assert!(
+                comparisons <= 2 * count,
+                "{count} locals took {comparisons} comparisons"
+            );
+        }
     }
 
     /// A config whose array `h.k` holds `OPTS` `copies` times, with one
@@ -467,17 +560,23 @@ mod tests {
     }
 
     #[test]
-    fn too_many_alias_edges_or_steps_end_fast_and_read_the_literal_value() {
-        let limit = std::time::Duration::from_secs(5);
+    fn too_many_alias_edges_or_steps_stop_and_read_the_literal_value() {
         // More aliases than the edge limit.
         // More steps than the step limit: each write follows each alias.
         for source in [many_alias_edges(25_000, 1), many_alias_edges(10_000, 30)] {
-            let start = std::time::Instant::now();
-            assert_eq!(
-                extract_config_string_or_array(&source, js(), &["x", "files"]),
-                vec!["./a.ts"]
+            let work = count_work(&source, |program| {
+                read_each_config(program, |obj| {
+                    get_nested_string_or_array(obj, &["x", "files"], PathScope::Program(program))
+                })
+            });
+            assert_eq!(work.value, Some(vec!["./a.ts".to_string()]));
+            // The parse runs the alias analysis one time, and the analysis
+            // stops at its limits.
+            assert!(
+                work.alias_steps <= MAX_ALIAS_STEPS,
+                "{} alias steps, the limit of one analysis is {MAX_ALIAS_STEPS}",
+                work.alias_steps
             );
-            assert!(start.elapsed() < limit, "took {:?}", start.elapsed());
         }
         // Below both limits, the change counts.
         let source = many_alias_edges(10_000, 5);

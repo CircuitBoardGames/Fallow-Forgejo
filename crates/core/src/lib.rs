@@ -25,9 +25,11 @@ pub mod discover;
 pub(crate) mod errors;
 mod external_style_usage;
 pub mod extract;
-pub mod git_env;
+mod graph_cache_key;
 mod package_assets;
+mod package_credits;
 pub mod plugins;
+mod production_scope;
 pub(crate) mod progress;
 mod resolution_inputs;
 pub mod results;
@@ -52,120 +54,15 @@ use fallow_config::{
 };
 use fallow_types::cache_rejection::CacheRejection;
 use fallow_types::trace::{EntryPointSpans, PipelineCounters, PipelineTimings};
+use package_credits::{
+    credit_bin_path_references, credit_package_path_references, credit_workspace_package_usage,
+};
 use rayon::prelude::*;
 use results::AnalysisResults;
 use rustc_hash::FxHashSet;
 
 const UNDECLARED_WORKSPACE_WARNING_PREVIEW: usize = 5;
 type LoadedWorkspacePackage = (fallow_config::WorkspaceInfo, PackageJson);
-
-fn record_graph_package_usage(
-    graph: &mut graph::ModuleGraph,
-    package_name: &str,
-    file_id: discover::FileId,
-    is_type_only: bool,
-) {
-    graph
-        .package_usage
-        .entry(package_name.to_owned())
-        .or_default()
-        .push(file_id);
-    if is_type_only {
-        graph
-            .type_only_package_usage
-            .entry(package_name.to_owned())
-            .or_default()
-            .push(file_id);
-    }
-}
-
-fn workspace_package_name<'a>(
-    source: &str,
-    workspace_names: &FxHashSet<&'a str>,
-) -> Option<&'a str> {
-    if !resolve::is_bare_specifier(source) {
-        return None;
-    }
-    let package_name = resolve::extract_package_name(source);
-    workspace_names.get(package_name.as_str()).copied()
-}
-
-fn credit_workspace_package_usage(
-    graph: &mut graph::ModuleGraph,
-    resolved: &[resolve::ResolvedModule],
-    workspaces: &[fallow_config::WorkspaceInfo],
-) {
-    if workspaces.is_empty() {
-        return;
-    }
-
-    let workspace_names: FxHashSet<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
-    for module in resolved {
-        for import in module.all_resolved_imports() {
-            if matches!(
-                import.target,
-                resolve::ResolveResult::InternalModule(_)
-                    | resolve::ResolveResult::CommonJsInternalModule(_)
-            ) && let Some(package_name) =
-                workspace_package_name(&import.info.source, &workspace_names)
-            {
-                record_graph_package_usage(
-                    graph,
-                    package_name,
-                    module.file_id,
-                    import.info.is_type_only,
-                );
-            }
-        }
-
-        for re_export in &module.re_exports {
-            if matches!(re_export.target, resolve::ResolveResult::InternalModule(_))
-                && let Some(package_name) =
-                    workspace_package_name(&re_export.info.source, &workspace_names)
-            {
-                record_graph_package_usage(
-                    graph,
-                    package_name,
-                    module.file_id,
-                    re_export.info.is_type_only,
-                );
-            }
-        }
-    }
-}
-
-fn credit_package_path_references(graph: &mut graph::ModuleGraph, modules: &[extract::ModuleInfo]) {
-    for module in modules {
-        for package_name in &module.package_path_references {
-            record_graph_package_usage(graph, package_name, module.file_id, false);
-        }
-        // A module augmentation credits the package as a type-only use. The
-        // unlisted-dependency check reports a package only at a resolved
-        // import site, so an undeclared augmented package stays unreported.
-        for package_name in &module.type_package_references {
-            record_graph_package_usage(graph, package_name, module.file_id, true);
-        }
-    }
-}
-
-/// Credit the package behind each `node_modules/.bin/<name>` path in source.
-///
-/// The persisted graph cache does not hold these credits: the bin map comes
-/// from `node_modules`, which the cache manifest does not track. Each run
-/// applies them to a built or a loaded graph.
-fn credit_bin_path_references(
-    graph: &mut graph::ModuleGraph,
-    modules: &[extract::ModuleInfo],
-    binaries: &scripts::DependencyBinaries,
-) {
-    for module in modules {
-        for binary in &module.bin_path_references {
-            if let Some(package_name) = binaries.package_for(binary) {
-                record_graph_package_usage(graph, &package_name, module.file_id, false);
-            }
-        }
-    }
-}
 
 /// Result of the full analysis pipeline, including optional performance timings.
 #[doc(hidden)]
@@ -675,10 +572,10 @@ impl<'a> AnalysisSession<'a> {
                 ),
                 Err(rejection) => {
                     graph_cache_rejection = rejection;
-                    let resolved = resolve_analysis_imports_timed(&shared, &modules);
+                    let mut resolved = resolve_analysis_imports_timed(&shared, &modules);
                     let graph = build_analysis_graph_timed(
                         &shared,
-                        &resolved.project,
+                        &mut resolved.project,
                         &entry_points,
                         &modules,
                     );
@@ -692,7 +589,7 @@ impl<'a> AnalysisSession<'a> {
             &resolved.project.modules,
             &modules,
             collect_usages,
-            entry_points.summary,
+            &entry_points,
         );
 
         OwnedAnalysisCore {
@@ -735,7 +632,7 @@ impl<'a> AnalysisSession<'a> {
         );
         trace_pipeline_profile(&profile);
 
-        let trace_provenance = plugins::build_trace_provenance(
+        let trace_provenance = plugins::trace_provenance::build_trace_provenance(
             &self.config.root,
             self.files(),
             self.workspaces(),
@@ -880,7 +777,7 @@ impl DeadCodeBackendPrelude<'_> {
         modules: &[extract::ModuleInfo],
         retain_graph: bool,
     ) -> fallow_types::trace::TraceProvenance {
-        plugins::build_trace_provenance(
+        plugins::trace_provenance::build_trace_provenance(
             &self.config.root,
             self.discovery.files(),
             self.discovery.workspaces(),
@@ -1045,7 +942,7 @@ pub fn resolve_dead_code_imports(
 #[must_use]
 pub fn build_dead_code_graph(
     prelude: &DeadCodeBackendPrelude<'_>,
-    project: &resolve::ResolvedProject,
+    project: &mut resolve::ResolvedProject,
     entry_points: &DeadCodeEntryPoints,
     modules: &[extract::ModuleInfo],
 ) -> DeadCodeGraphRun {
@@ -1074,7 +971,7 @@ pub fn run_dead_code_detectors(
         resolved,
         modules,
         collect_usages,
-        entry_points.inner.summary.clone(),
+        &entry_points.inner,
     );
     DeadCodeDetectorRun {
         results: analysis.result,
@@ -1246,14 +1143,17 @@ fn try_load_analysis_graph_cache(
     });
     let store = graph_cache::GraphCacheStore::load(&input.config.cache_dir).map_err(Some)?;
     if store.manifest.matches_inputs(&current) {
-        let project = restore_cached_resolved_project(input, modules, &store.resolved_project)?;
+        let mut project = restore_cached_resolved_project(input, modules, &store.resolved_project)?;
         tracing::debug!("Graph cache hit: skipping import resolution and graph build");
-        let mut graph = store.graph;
-        credit_bin_path_references(
-            &mut graph,
-            modules,
-            &input.plugin_result.dependency_binaries,
+        let excluded = production_scope::excluded_file_ids(
+            &entry_points.entry_points,
+            input.files,
+            &project.modules,
         );
+        production_scope::neutralize(&mut project.modules, &excluded);
+        let mut graph = store.graph;
+        let bins = &input.plugin_result.dependency_binaries;
+        credit_bin_path_references(&mut graph, modules, bins, &excluded);
 
         return Ok(GraphCacheHit {
             graph,
@@ -1281,9 +1181,9 @@ fn try_load_analysis_graph_cache(
         return Err(Some(rejection));
     }
 
-    let project = restore_cached_resolved_project(input, modules, &store.resolved_project)?;
+    let mut project = restore_cached_resolved_project(input, modules, &store.resolved_project)?;
     tracing::debug!("Graph resolver cache hit: skipping import resolution and rebuilding graph");
-    let graph = build_analysis_graph_timed(input, &project, entry_points, modules);
+    let graph = build_analysis_graph_timed(input, &mut project, entry_points, modules);
 
     Ok(GraphCacheHit {
         graph: graph.graph,
@@ -1321,7 +1221,7 @@ fn restore_cached_resolved_project(
         // debug for the reason `CacheRejection::discarded_existing_work`
         // documents.
         tracing::debug!(
-            "Graph cache decoded but its resolver payload no longer maps to the discovered files"
+            "Graph cache decoded but its resolver payload no longer maps to the project files"
         );
         Some(CacheRejection::FileSetChanged)
     })
@@ -1348,14 +1248,19 @@ fn resolve_analysis_imports_timed(
 
 fn build_analysis_graph_timed(
     input: &AnalysisCoreSharedInput<'_>,
-    project: &resolve::ResolvedProject,
+    project: &mut resolve::ResolvedProject,
     entry_points: &TimedEntryPoints,
     modules: &[extract::ModuleInfo],
 ) -> TimedGraph {
     let t = Instant::now();
     input.progress.set_stage("building module graph...");
     let unseeded_declaration_files = orphan_module_declaration_files(input, modules);
-    let mut graph = build_analysis_graph(&BuildAnalysisGraphInput {
+    let excluded = production_scope::excluded_file_ids(
+        &entry_points.entry_points,
+        input.files,
+        &project.modules,
+    );
+    let mut graph = build_analysis_graph(&mut BuildAnalysisGraphInput {
         config: input.config,
         plugin_result: input.plugin_result,
         project,
@@ -1364,12 +1269,10 @@ fn build_analysis_graph_timed(
         modules,
         workspaces: input.workspaces,
         unseeded_declaration_files: &unseeded_declaration_files,
+        excluded: &excluded,
     });
-    credit_bin_path_references(
-        &mut graph,
-        modules,
-        &input.plugin_result.dependency_binaries,
-    );
+    let bins = &input.plugin_result.dependency_binaries;
+    credit_bin_path_references(&mut graph, modules, bins, &excluded);
     TimedGraph {
         graph,
         elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
@@ -1397,10 +1300,12 @@ fn analyze_dead_code_timed(
     resolved: &[resolve::ResolvedModule],
     modules: &[extract::ModuleInfo],
     collect_usages: bool,
-    entry_point_summary: results::EntryPointSummary,
+    entry_points: &TimedEntryPoints,
 ) -> TimedAnalysis {
     let t = Instant::now();
     input.progress.set_stage("analyzing...");
+    let excluded =
+        production_scope::excluded_file_ids(&entry_points.entry_points, input.files, resolved);
     let mut result = analyze::find_dead_code_full(
         graph,
         input.config,
@@ -1409,8 +1314,10 @@ fn analyze_dead_code_timed(
         input.workspaces,
         modules,
         collect_usages,
+        &excluded,
     );
-    result.entry_point_summary = Some(entry_point_summary);
+    production_scope::hide_findings(&mut result, input.files, &excluded);
+    result.entry_point_summary = Some(entry_points.summary.clone());
     TimedAnalysis {
         result,
         elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
@@ -1737,15 +1644,11 @@ fn resolve_analysis_imports(
         modules,
         files,
         workspaces,
-        active_plugins: &plugin_result.active_plugins,
-        path_aliases: &plugin_result.path_aliases,
-        auto_imports: &plugin_result.auto_imports,
-        jsx_import_sources: &plugin_result.jsx_import_sources,
-        scss_include_paths: &plugin_result.scss_include_paths,
-        static_dir_mappings: &plugin_result.static_dir_mappings,
-        framework_static_dir_mappings: &plugin_result.framework_static_dir_mappings,
-        root: &config.root,
-        extra_conditions: &config.resolve.conditions,
+        ..graph_cache_key::plugin_resolve_input(
+            plugin_result,
+            &config.root,
+            &config.resolve.conditions,
+        )
     });
     external_style_usage::augment_external_style_package_usage(
         &mut project.modules,
@@ -1803,12 +1706,15 @@ fn record_unreadable_auto_import_reads(
 struct BuildAnalysisGraphInput<'a> {
     config: &'a ResolvedConfig,
     plugin_result: &'a plugins::AggregatedPluginResult,
-    project: &'a resolve::ResolvedProject,
+    project: &'a mut resolve::ResolvedProject,
     entry_points: &'a discover::CategorizedEntryPoints,
     files: &'a [discover::DiscoveredFile],
     modules: &'a [extract::ModuleInfo],
     workspaces: &'a [fallow_config::WorkspaceInfo],
     unseeded_declaration_files: &'a FxHashSet<discover::FileId>,
+    /// See [`production_scope`]. The cached resolver payload keeps these
+    /// modules intact; the graph and the detectors see them inert.
+    excluded: &'a FxHashSet<discover::FileId>,
 }
 
 /// Build the analysis graph and persist it for the next identical run.
@@ -1818,7 +1724,7 @@ struct BuildAnalysisGraphInput<'a> {
 /// both credit steps, and persists the graph plus resolver outputs for next
 /// time. The cache is gated on `config.no_cache` and is a strict performance
 /// optimization: a cache hit produces identical analysis results.
-fn build_analysis_graph(input: &BuildAnalysisGraphInput<'_>) -> graph::ModuleGraph {
+fn build_analysis_graph(input: &mut BuildAnalysisGraphInput<'_>) -> graph::ModuleGraph {
     let caching_enabled = !input.config.no_cache;
     let current_manifest = caching_enabled.then(|| {
         build_graph_cache_manifest(&GraphCacheManifestInput {
@@ -1831,6 +1737,10 @@ fn build_analysis_graph(input: &BuildAnalysisGraphInput<'_>) -> graph::ModuleGra
             unseeded_declaration_files: input.unseeded_declaration_files,
         })
     });
+    let resolved_payload = current_manifest.as_ref().and_then(|_| {
+        graph_cache::cache_resolved_project(&input.config.root, input.files, input.project)
+    });
+    production_scope::neutralize(&mut input.project.modules, input.excluded);
 
     let mut graph = graph::ModuleGraph::build_with_declaration_seeding(
         &input.project.modules,
@@ -1843,13 +1753,11 @@ fn build_analysis_graph(input: &BuildAnalysisGraphInput<'_>) -> graph::ModuleGra
         input.files,
         input.unseeded_declaration_files,
     );
-    credit_package_path_references(&mut graph, input.modules);
+    credit_package_path_references(&mut graph, input.modules, input.excluded);
     credit_workspace_package_usage(&mut graph, &input.project.modules, input.workspaces);
 
     if let Some(manifest) = current_manifest {
-        let Some(resolved_project) =
-            graph_cache::cache_resolved_project(&input.config.root, input.files, input.project)
-        else {
+        let Some(resolved_project) = resolved_payload else {
             return graph;
         };
         let store = graph_cache::GraphCacheStore {
@@ -1895,14 +1803,14 @@ fn build_graph_cache_manifest(
         unseeded_declaration_files,
     } = *input;
     let mode = graph_cache::GraphCacheMode::new(
-        resolver_options_hash(config, workspaces, files),
-        entry_points_hash(
+        graph_cache_key::resolver_options_hash(config, workspaces, files),
+        graph_cache_key::entry_points_hash(
             entry_points,
             files,
             unseeded_declaration_files,
             &config.root,
         ),
-        plugin_config_hash(plugin_result, &config.root),
+        graph_cache_key::plugin_config_hash(plugin_result, &config.root),
     );
     // The parse stage already hashed every file it read, so keying the manifest
     // on content costs nothing and does not inherit mtime's blind spot for a
@@ -1920,245 +1828,6 @@ fn build_graph_cache_manifest(
             .copied()
             .unwrap_or_default()
     })
-}
-
-/// Hash the resolver-affecting options: the extraction config hash, the
-/// user-supplied resolve `conditions`, and the resolver input files and
-/// workspace names (see [`resolution_inputs::resolution_inputs_hash`]).
-///
-/// The source manifest fingerprints source files only. A `package.json`
-/// `imports` map, a workspace rename, a Deno import map or a discovered
-/// `tsconfig.json` can move an import target without a source edit, so their
-/// content keys the mode too. A config above the root is keyed with `../`
-/// steps, so its path does not bring the absolute root back into the hash.
-///
-/// The project root is deliberately NOT hashed. It is not a resolver option:
-/// it is where the project happens to sit, and hashing it meant a container
-/// job, a matrix over roots, or a copied worktree could never reuse a cache it
-/// had fully decoded. Every path this mode covers is hashed root-relative
-/// instead.
-///
-/// `cache_config_hash` does NOT fold tsconfig `paths`, despite what this
-/// comment used to claim: it hashes extraction-affecting config plus external
-/// plugin names. tsconfig-derived aliases reach the mode through
-/// [`hash_path_aliases`].
-///
-/// `production` and `ignore_patterns` intentionally stay out of this hash:
-/// they shape discovery, so changed file sets already miss through stable file
-/// keys and source fingerprints in the manifest.
-fn resolver_options_hash(
-    config: &ResolvedConfig,
-    workspaces: &[fallow_config::WorkspaceInfo],
-    files: &[discover::DiscoveredFile],
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    config.cache_config_hash.hash(&mut hasher);
-    config.resolve.conditions.hash(&mut hasher);
-    resolution_inputs::resolution_inputs_hash(&config.root, workspaces, files).hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Render `path` the way every graph-cache mode hash spells a path: relative to
-/// the project root where possible, with forward slashes, so an identical
-/// project under a different absolute path hashes identically.
-fn root_relative_key(root: &std::path::Path, path: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-/// Hash the entry-point set (sorted root-relative paths per role) so any change
-/// in reachability roots misses the cache. The declaration files the graph
-/// does not seed are reachability roots too: they depend on package.json,
-/// tsconfig and sibling files the manifest does not track.
-fn entry_points_hash(
-    entry_points: &discover::CategorizedEntryPoints,
-    files: &[discover::DiscoveredFile],
-    unseeded_declaration_files: &FxHashSet<discover::FileId>,
-    root: &std::path::Path,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    for role in [&entry_points.all, &entry_points.runtime, &entry_points.test] {
-        let mut keys: Vec<String> = role
-            .iter()
-            .map(|ep| root_relative_key(root, &ep.path))
-            .collect();
-        keys.sort_unstable();
-        keys.len().hash(&mut hasher);
-        for key in keys {
-            key.hash(&mut hasher);
-        }
-    }
-    let mut unseeded: Vec<String> = files
-        .iter()
-        .filter(|file| unseeded_declaration_files.contains(&file.id))
-        .map(|file| root_relative_key(root, &file.path))
-        .collect();
-    unseeded.sort_unstable();
-    unseeded.len().hash(&mut hasher);
-    for key in unseeded {
-        key.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Hash the plugin-derived graph-affecting configuration, with every path
-/// spelled root-relative.
-fn plugin_config_hash(
-    plugin_result: &plugins::AggregatedPluginResult,
-    root: &std::path::Path,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-
-    hash_active_plugins(plugin_result, &mut hasher);
-    hash_path_aliases(plugin_result, root, &mut hasher);
-
-    let mut auto_imports: Vec<AutoImportHashKey<'_>> = plugin_result
-        .auto_imports
-        .iter()
-        .map(|rule| {
-            let mut scope: Vec<String> = rule
-                .scope
-                .iter()
-                .map(|scope_root| root_relative_key(root, scope_root))
-                .collect();
-            scope.sort_unstable();
-            (
-                rule.name.as_str(),
-                root_relative_key(root, &rule.source),
-                auto_import_kind_rank(rule.kind),
-                scope,
-            )
-        })
-        .collect();
-    auto_imports.sort_unstable();
-    auto_imports.len().hash(&mut hasher);
-    for key in &auto_imports {
-        key.hash(&mut hasher);
-    }
-
-    fn sorted(patterns: &[String]) -> Vec<&str> {
-        let mut patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
-        patterns.sort_unstable();
-        patterns
-    }
-    let mut jsx_import_sources: Vec<(&str, String, Vec<&str>, Vec<&str>)> = plugin_result
-        .jsx_import_sources
-        .iter()
-        .map(|rule| {
-            (
-                rule.source.as_str(),
-                root_relative_key(root, &rule.config_dir),
-                sorted(&rule.include),
-                sorted(&rule.exclude),
-            )
-        })
-        .collect();
-    jsx_import_sources.sort_unstable();
-    jsx_import_sources.dedup();
-    jsx_import_sources.len().hash(&mut hasher);
-    for key in &jsx_import_sources {
-        key.hash(&mut hasher);
-    }
-
-    let mut scss_include_paths: Vec<String> = plugin_result
-        .scss_include_paths
-        .iter()
-        .map(|path| root_relative_key(root, path))
-        .collect();
-    scss_include_paths.sort_unstable();
-    scss_include_paths.len().hash(&mut hasher);
-    for path in scss_include_paths {
-        path.hash(&mut hasher);
-    }
-
-    hash_static_dir_mappings(&plugin_result.static_dir_mappings, root, &mut hasher);
-    hash_static_dir_mappings(
-        &plugin_result.framework_static_dir_mappings,
-        root,
-        &mut hasher,
-    );
-
-    hasher.finish()
-}
-
-/// Hash `(directory, mount)` pairs sorted, with each directory root-relative.
-fn hash_static_dir_mappings(
-    mappings: &[(std::path::PathBuf, String)],
-    root: &std::path::Path,
-    hasher: &mut rustc_hash::FxHasher,
-) {
-    use std::hash::Hash;
-    let mut keys: Vec<(String, &str)> = mappings
-        .iter()
-        .map(|(from_dir, mount)| (root_relative_key(root, from_dir), mount.as_str()))
-        .collect();
-    keys.sort_unstable();
-    keys.len().hash(hasher);
-    for (from_dir, mount) in keys {
-        from_dir.hash(hasher);
-        mount.hash(hasher);
-    }
-}
-
-fn hash_active_plugins(
-    plugin_result: &plugins::AggregatedPluginResult,
-    hasher: &mut rustc_hash::FxHasher,
-) {
-    use std::hash::Hash;
-    let mut active: Vec<&str> = plugin_result
-        .active_plugins
-        .iter()
-        .map(String::as_str)
-        .collect();
-    active.sort_unstable();
-    active.len().hash(hasher);
-    for name in active {
-        name.hash(hasher);
-    }
-}
-
-/// Hash tsconfig- and plugin-derived path aliases. Replacements are absolute
-/// filesystem paths, so they are spelled root-relative like every other path in
-/// the mode hash.
-fn hash_path_aliases(
-    plugin_result: &plugins::AggregatedPluginResult,
-    root: &std::path::Path,
-    hasher: &mut rustc_hash::FxHasher,
-) {
-    use std::hash::Hash;
-    let mut aliases: Vec<(&str, String)> = plugin_result
-        .path_aliases
-        .iter()
-        .map(|(prefix, replacement)| {
-            (
-                prefix.as_str(),
-                root_relative_key(root, std::path::Path::new(replacement)),
-            )
-        })
-        .collect();
-    aliases.sort_unstable();
-    aliases.len().hash(hasher);
-    for (prefix, replacement) in aliases {
-        prefix.hash(hasher);
-        replacement.hash(hasher);
-    }
-}
-
-/// The fields of one auto-import rule that decide its graph edges: name,
-/// root-relative source, kind rank, and sorted root-relative scope.
-type AutoImportHashKey<'a> = (&'a str, String, u8, Vec<String>);
-
-fn auto_import_kind_rank(kind: fallow_config::AutoImportKind) -> u8 {
-    match kind {
-        fallow_config::AutoImportKind::Named => 0,
-        fallow_config::AutoImportKind::Default => 1,
-        fallow_config::AutoImportKind::DefaultComponent => 2,
-    }
 }
 
 fn collect_file_hashes(
@@ -2295,7 +1964,7 @@ fn analyze_all_scripts(
         },
         plugin_result,
     );
-    scripts::credit_npm_aliases(&mut plugin_result.script_used_packages, &manifests);
+    scripts::credit_npm_aliases(&mut plugin_result.script_used_packages, &manifests, config);
     plugin_result.dependency_binaries =
         scripts::DependencyBinaries::new(config.root.clone(), bin_map, all_dep_set);
     plugin_result.dev_dependency_names = manifests
@@ -2656,13 +2325,7 @@ fn discover_all_entry_points(
             )
         })
         .collect();
-    let mut skipped_entries = rustc_hash::FxHashMap::default();
-    let other_sources = root_discovery.non_manual_runtime_paths;
-    entry_points.extend_runtime(root_discovery.entries);
-    entry_points.extend_support(root_discovery.support_entries);
-    for (path, count) in root_discovery.skipped_entries {
-        *skipped_entries.entry(path).or_insert(0) += count;
-    }
+    let (other_sources, mut skipped_entries) = entry_points.extend_root(root_discovery);
     let mut ws_entries = Vec::new();
     let mut ws_support_entries = Vec::new();
     for workspace in workspace_discovery {
@@ -3378,7 +3041,7 @@ fn resolve_user_config(
 /// are silently dropped.
 #[cfg_attr(
     not(test),
-    allow(
+    expect(
         dead_code,
         reason = "config resolution fallback is exercised by session tests"
     )
@@ -3409,9 +3072,10 @@ mod tests {
         AnalysisSession, bucket_files_by_workspace, bucket_files_by_workspace_roots,
         collect_config_search_roots, credit_workspace_package_usage, default_config,
         format_undeclared_workspace_warning, gate_auto_import_entry_patterns,
-        parse_analysis_modules, plugin_config_hash, resolver_options_hash,
-        settings_for_entry_pattern, warn_undeclared_workspaces, workspace_prefix,
+        parse_analysis_modules, settings_for_entry_pattern, warn_undeclared_workspaces,
+        workspace_prefix,
     };
+    use crate::graph_cache_key::{plugin_config_hash, resolver_options_hash};
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 

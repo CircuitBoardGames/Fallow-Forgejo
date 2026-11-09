@@ -13,6 +13,7 @@ use fallow_types::suppress::IssueKind;
 
 use crate::Cli;
 use crate::cli_format::Format;
+use crate::exit_codes::exit_invalid_input;
 use crate::explain::{
     AUDIT_RULES, CHECK_RULES, DUPES_RULES, FLAGS_RULES, HEALTH_RULES, RuleDef, SECURITY_RULES,
     rule_docs_url, rule_severity_key,
@@ -28,7 +29,7 @@ pub fn run_schema(json_style: crate::json_style::JsonStyle) -> ExitCode {
         }
         Err(e) => {
             eprintln!("Error: failed to serialize schema: {e}");
-            ExitCode::from(2)
+            exit_invalid_input()
         }
     }
 }
@@ -445,6 +446,7 @@ fn apply_source_issue_meta(bare_id: &str, m: &mut IssueTypeMeta) -> bool {
         | "unresolved-import"
         | "missing-suppression-reason"
         | "unused-class-member"
+        | "unused-namespace-member"
         | "unused-store-member"
         | "unprovided-inject"
         | "unrendered-component"
@@ -489,7 +491,7 @@ fn apply_dependency_issue_meta(bare_id: &str, m: &mut IssueTypeMeta) -> bool {
     match bare_id {
         "unused-dependency" | "unused-dev-dependency" | "unused-optional-dependency" => {
             m.note = Some(
-                "--unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, and test-only-dependency",
+                "--unused-deps controls unused-dependency, unused-dev-dependency, unused-optional-dependency, type-only-dependency, test-only-dependency, and dev-dependency-in-production",
             );
         }
         "type-only-dependency" => {
@@ -503,6 +505,11 @@ fn apply_dependency_issue_meta(bare_id: &str, m: &mut IssueTypeMeta) -> bool {
             );
         }
         "unlisted-dependency" => {}
+        "unlisted-binary" => {
+            m.note = Some(
+                "Needs installed dependencies; a project without a root node_modules reports none",
+            );
+        }
         _ => return false,
     }
     true
@@ -1529,6 +1536,11 @@ mod tests {
             "UnusedMember".to_string(),
             "UnusedStoreMemberFinding".to_string()
         )));
+        assert!(aliases.contains(&(
+            "unused-namespace-member".to_string(),
+            "UnusedMember".to_string(),
+            "UnusedNamespaceMemberFinding".to_string()
+        )));
         assert_eq!(
             expected, aliases,
             "schema ts_alias rows must exactly mirror fallow-output contracts"
@@ -1542,6 +1554,45 @@ mod tests {
             assert!(
                 parent.ends_with("Finding"),
                 "TS alias parent must target a finding wrapper: {parent}"
+            );
+        }
+    }
+
+    /// The note on the unused-dependency rows says which kinds `--unused-deps`
+    /// selects, so a new kind on that flag must also appear in the note.
+    #[test]
+    fn unused_deps_note_lists_every_row_of_the_flag() {
+        let schema = schema();
+        let rows = schema["issue_types"].as_array().unwrap();
+        let note_of = |id: &str| -> &str {
+            rows.iter()
+                .find(|row| row["id"] == id)
+                .unwrap_or_else(|| panic!("no issue_types row for {id}"))["note"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no note on {id}"))
+        };
+        let note = note_of("unused-dependency");
+        assert_eq!(note, note_of("unused-dev-dependency"));
+        assert_eq!(note, note_of("unused-optional-dependency"));
+
+        let covered: Vec<&str> = rows
+            .iter()
+            .filter(|row| row["filter_flag"] == "--unused-deps")
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            covered.contains(&"dev-dependency-in-production"),
+            "kinds on --unused-deps: {covered:?}"
+        );
+        let listed: Vec<&str> = note
+            .trim_start_matches("--unused-deps controls ")
+            .split(", ")
+            .map(|id| id.trim_start_matches("and "))
+            .collect();
+        for id in &covered {
+            assert!(
+                listed.contains(id),
+                "the --unused-deps note omits {id}: {note}"
             );
         }
     }

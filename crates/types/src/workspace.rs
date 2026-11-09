@@ -120,7 +120,10 @@ pub enum WorkspaceDiagnosticKind {
     /// A repository that clones other repositories into the workspace in CI
     /// declares such patterns. The packages there can consume catalog
     /// entries, so the run does not report `unused-catalog-entries` while a
-    /// pattern of this kind exists.
+    /// pattern of this kind exists. For a `packages` entry of the
+    /// `pnpm-workspace.yaml` of a nested pnpm project, the pattern is
+    /// relative to that file, and the run does not report the unused entries
+    /// of that catalog only.
     WorkspacePatternDirMissing {
         /// The workspace pattern, as written in the file.
         pattern: String,
@@ -128,8 +131,10 @@ pub enum WorkspaceDiagnosticKind {
     /// A directory has its own `package.json` and `pnpm-workspace.yaml`, and
     /// no workspace pattern of the root manifests declares it. pnpm installs
     /// it as an independent project. Fallow analyzes it as a workspace, so its
-    /// `package.json` owns its files and dependencies, and its `catalog:`
-    /// references are not checked against the root catalog.
+    /// `package.json` owns its files and dependencies. The members that the
+    /// `packages` list of its `pnpm-workspace.yaml` declares are workspaces
+    /// too. The `catalog:` references of the project and its members resolve
+    /// against its own catalog, not against the root catalog.
     ///
     /// Information only: nothing is lost from the analysis, so
     /// `degrades_analysis` is false.
@@ -508,9 +513,9 @@ pub enum WorkspaceDiagnosticKind {
     /// surface as an unlisted dependency.
     ///
     /// Recorded by the plugin stage, which runs before analysis and is not
-    /// cached, so the entry is present on a warm cache too. It used to be a
-    /// bare `tracing::warn!` from inside the plugin, so it reached no envelope
-    /// and no CI consumer (issue #2736).
+    /// cached, so the entry is present on a warm cache too. A bare
+    /// `tracing::warn!` from inside the plugin reaches no envelope and no CI
+    /// consumer (issue #2736).
     ///
     /// A source file that calls the Module Federation runtime API gets the same
     /// entry: `path` names the source file, `key` names the runtime function
@@ -661,6 +666,18 @@ pub enum WorkspaceDiagnosticKind {
         /// Why the rule has no effect, as a kebab-case token.
         reason: String,
     },
+    /// An explicit issue-type selection asked for a rule that the config sets
+    /// to `off`, so that check did not run (issue #4067). One entry per rule.
+    /// The opt-in flags that turn their rule on and a run with no selection
+    /// never report it. `path` is the root. Not degraded: the run measured
+    /// what the config asked for, and no finding or exit code changes.
+    RequestedRuleOff {
+        /// The canonical rule name in `rules`.
+        rule: String,
+        /// The canonical CLI selector of the request, such as `--unused-deps`.
+        /// A typed API or MCP request reports the same selector.
+        flag: String,
+    },
     /// The dead-code baseline was saved in a different install state than
     /// this run: one of the two runs had `node_modules` and the other did not.
     /// Findings that need installed packages (dependency, unlisted,
@@ -727,6 +744,7 @@ impl WorkspaceDiagnosticKind {
             Self::IgnoreDependenciesEntryRedundant { .. } => "ignore-dependencies-entry-redundant",
             Self::IgnorePatternsEntryRedundant { .. } => "ignore-patterns-entry-redundant",
             Self::OverrideRuleIneffective { .. } => "override-rule-ineffective",
+            Self::RequestedRuleOff { .. } => "requested-rule-off",
             Self::BaselineInstallStateMismatch { .. } => "baseline-install-state-mismatch",
         }
     }
@@ -772,6 +790,7 @@ impl WorkspaceDiagnosticKind {
             | Self::IgnoreDependenciesEntryRedundant { .. }
             | Self::IgnorePatternsEntryRedundant { .. }
             | Self::OverrideRuleIneffective { .. }
+            | Self::RequestedRuleOff { .. }
             | Self::NestedProjectRoot => false,
             Self::UndeclaredWorkspace
             | Self::MalformedPackageJson { .. }
@@ -945,6 +964,7 @@ impl WorkspaceDiagnosticKind {
             | Self::IgnoreDependenciesEntryRedundant { .. }
             | Self::IgnorePatternsEntryRedundant { .. }
             | Self::OverrideRuleIneffective { .. }
+            | Self::RequestedRuleOff { .. }
             | Self::BaselineInstallStateMismatch { .. } => false,
         }
     }
@@ -1011,6 +1031,7 @@ impl WorkspaceDiagnosticKind {
             | Self::IgnoreDependenciesEntryRedundant { .. }
             | Self::IgnorePatternsEntryRedundant { .. }
             | Self::OverrideRuleIneffective { .. }
+            | Self::RequestedRuleOff { .. }
             | Self::BaselineInstallStateMismatch { .. } => false,
         }
     }
@@ -1079,6 +1100,7 @@ impl WorkspaceDiagnosticKind {
             | Self::IgnoreDependenciesEntryRedundant { .. }
             | Self::IgnorePatternsEntryRedundant { .. }
             | Self::OverrideRuleIneffective { .. }
+            | Self::RequestedRuleOff { .. }
             | Self::BaselineInstallStateMismatch { .. } => false,
         }
     }
@@ -1148,6 +1170,7 @@ impl WorkspaceDiagnosticKind {
             | Self::IgnoreDependenciesEntryRedundant { .. }
             | Self::IgnorePatternsEntryRedundant { .. }
             | Self::OverrideRuleIneffective { .. }
+            | Self::RequestedRuleOff { .. }
             | Self::BaselineInstallStateMismatch { .. } => false,
         }
     }
@@ -1455,6 +1478,22 @@ pub fn glob_first_literal_segment(pattern: &str) -> Option<&str> {
     })
 }
 
+/// The catalog entries that a `workspace-pattern-dir-missing` diagnostic
+/// keeps out of the run, as the subject of a sentence. `source_display` is
+/// the declaring file, relative to the project root.
+///
+/// A missing directory of a root pattern hides consumers of every catalog. A
+/// missing directory of a `packages` entry of a nested `pnpm-workspace.yaml`
+/// hides consumers of the catalog of that file only.
+#[must_use]
+pub fn missing_pattern_dir_skipped_entries(source_display: &str) -> &'static str {
+    if source_display.contains('/') && source_display.ends_with("pnpm-workspace.yaml") {
+        "Unused entries of the catalog in that file"
+    } else {
+        "Unused catalog entries"
+    }
+}
+
 /// The directory part of a workspace pattern: the segments before the first
 /// segment with a glob character, joined with `/`.
 ///
@@ -1514,9 +1553,10 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
                 format!("'{display}'")
             };
             let dir = workspace_pattern_literal_dir(pattern).unwrap_or_else(|| pattern.clone());
+            let skipped = missing_pattern_dir_skipped_entries(&display);
             format!(
                 "Workspace pattern '{pattern}' in {source} names directory '{dir}', which does \
-                 not exist. Fallow analyzes no package from it. Unused catalog entries are not \
+                 not exist. Fallow analyzes no package from it. {skipped} are not \
                  reported in this run, because packages in that directory can use them. \
                  Create the directory before the run, or remove the pattern."
             )
@@ -1524,8 +1564,9 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
         WorkspaceDiagnosticKind::NestedProjectRoot => format!(
             "Directory '{display}' has its own pnpm-workspace.yaml, so it is an independent \
              project. Fallow analyzes it as a workspace: its package.json owns its files and \
-             dependencies, and its catalog references are not checked against the root \
-             catalog. Add '{display}' to ignorePatterns to exclude it."
+             dependencies, the packages that its pnpm-workspace.yaml declares are workspaces, \
+             and their catalog references resolve against its own catalog. Add '{display}' to \
+             ignorePatterns to exclude it."
         ),
         WorkspaceDiagnosticKind::MalformedTsconfig { error } => format!(
             "tsconfig at '{display}' failed to parse ({error}); \
@@ -1812,7 +1853,8 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
         | WorkspaceDiagnosticKind::EntryPatternRedundant { .. }
         | WorkspaceDiagnosticKind::IgnoreDependenciesEntryRedundant { .. }
         | WorkspaceDiagnosticKind::IgnorePatternsEntryRedundant { .. }
-        | WorkspaceDiagnosticKind::OverrideRuleIneffective { .. } => {
+        | WorkspaceDiagnosticKind::OverrideRuleIneffective { .. }
+        | WorkspaceDiagnosticKind::RequestedRuleOff { .. } => {
             config_entry::config_entry_message(kind)
         }
         WorkspaceDiagnosticKind::FlagAgeUnavailable { cause } => {

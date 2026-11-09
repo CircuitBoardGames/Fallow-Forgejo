@@ -15,7 +15,8 @@ use crate::base_worktree::git_rev_parse;
 use crate::base_worktree::{BaseWorktree, git_toplevel, sweep_old_reusable_caches};
 use crate::check::{CheckOptions, CheckResult, IssueFilters, TraceOptions};
 use crate::dupes::{DupesMode, DupesOptions, DupesOverrides, DupesResult};
-use crate::error::emit_error;
+use crate::error::emit_input_error;
+use crate::exit_codes::exit_invalid_input;
 use crate::health::{HealthOptions, HealthResult};
 
 pub use fallow_api::audit_run::{AuditKeySnapshot, DupeDemotionDiffSource, branching_keys};
@@ -402,6 +403,10 @@ pub mod review_deltas;
 #[path = "audit_weakening.rs"]
 pub mod weakening;
 
+#[path = "audit_security_scan.rs"]
+mod security_scan;
+use security_scan::compute_security_step_signals;
+
 #[path = "audit_routing.rs"]
 pub mod routing;
 
@@ -550,7 +555,7 @@ impl AuditBackend for CliAuditBackend<'_> {
             if let Some(hint) = ambient_git_env_hint() {
                 let _ = write!(message, "\n  hint: {hint}");
             }
-            emit_error(&message, 2, self.opts.output)
+            emit_input_error(&message, self.opts.output)
         })
     }
 
@@ -1226,11 +1231,10 @@ fn audit_changed_files(
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        emit_error(
+        emit_input_error(
             &format!(
                 "could not determine changed files for base ref '{base_ref}': {cause}. Verify the ref exists in this git repository"
             ),
-            2,
             opts.output,
         )
     })
@@ -1683,7 +1687,7 @@ fn benchmark_audit_review_brief_started_at(
         base_snapshot,
         changed_files,
         external,
-    } = corpus.state.take().ok_or_else(|| ExitCode::from(2))?;
+    } = corpus.state.take().ok_or_else(exit_invalid_input)?;
     let config_path = None;
     let cache_dir = corpus.root.join(".fallow-cache-benchmark");
     let opts = audit_review_benchmark_options(&corpus.root, &config_path, &cache_dir, 1);
@@ -1711,7 +1715,7 @@ fn benchmark_audit_review_brief_started_at(
         },
     );
     if result.verdict != AuditVerdict::Fail {
-        return Err(ExitCode::from(2));
+        return Err(exit_invalid_input());
     }
     let decision_count = result
         .decision_surface
@@ -1722,13 +1726,13 @@ fn benchmark_audit_review_brief_started_at(
     result.elapsed = Duration::ZERO;
     let output = crate::audit_brief::build_brief_json(&result, result.diff_index.as_ref())?;
     let value = fallow_output::serialize_review_brief_json_output(output, None)
-        .map_err(|_| ExitCode::from(2))?;
+        .map_err(|_| exit_invalid_input())?;
     if value.get("kind").and_then(serde_json::Value::as_str) != Some("audit-brief") {
-        return Err(ExitCode::from(2));
+        return Err(exit_invalid_input());
     }
     let rendered = crate::json_style::JsonStyle::Compact
         .serialize(&value)
-        .map_err(|_| ExitCode::from(2))?;
+        .map_err(|_| exit_invalid_input())?;
     let benchmark_result = AuditReviewBenchmarkResult {
         introduced_count: result.attribution.dead_code_introduced,
         inherited_count: result.attribution.dead_code_inherited,
@@ -1757,10 +1761,7 @@ fn benchmark_audit_review_brief_started_at(
             health: result.health.take(),
             brief_diff_evidence: None,
         },
-        base_snapshot: result
-            .base_snapshot
-            .take()
-            .ok_or_else(|| ExitCode::from(2))?,
+        base_snapshot: result.base_snapshot.take().ok_or_else(exit_invalid_input)?,
         changed_files,
         external: AuditBriefExternalData {
             // Keep only the brief-local CI signals: the next iteration projects
@@ -2211,61 +2212,6 @@ fn brief_weakening_signals(
     let mut signals = weakening::signals_from_diff_risk(diff_risk);
     signals.extend(security_step_signals);
     signals.sort_by(|a, b| a.file.cmp(&b.file));
-    signals
-}
-
-/// Scan the changed CI files for removed security steps: read each file's
-/// base content via [`BaseFileReader`] and compare it with the head content
-/// on disk. Best-effort, but a read failure never reads as empty content: a
-/// file deleted at head or absent at base scans against `""`, an unreadable
-/// head file is skipped, and a base-reader error stops the scan for the
-/// remaining files (the batch pipe is no longer trustworthy).
-fn compute_security_step_signals(
-    root: &Path,
-    base_ref: &str,
-    changed_files: &FxHashSet<PathBuf>,
-) -> Vec<weakening::WeakeningSignal> {
-    let Some(git_root) = git_toplevel(root) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(&PathBuf, &Path, String)> = changed_files
-        .iter()
-        .filter_map(|abs| {
-            let relative = abs.strip_prefix(&git_root).ok()?;
-            let rel_str = relative.to_string_lossy().replace('\\', "/");
-            weakening::is_ci_file(&rel_str).then_some((abs, relative, rel_str))
-        })
-        .collect();
-    if files.is_empty() {
-        return Vec::new();
-    }
-    files.sort();
-    let Some(mut reader) = BaseFileReader::spawn(root) else {
-        return Vec::new();
-    };
-
-    let mut signals = Vec::new();
-    for (abs, relative, rel_str) in files {
-        let head = match std::fs::read(abs) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(_) => continue,
-        };
-        let base = match reader.read(base_ref, relative) {
-            BaseRead::Content(base) => base,
-            BaseRead::Missing => String::new(),
-            BaseRead::Error => break,
-        };
-        signals.extend(
-            weakening::detect_removed_security_steps(&base, &head)
-                .into_iter()
-                .map(|evidence| weakening::WeakeningSignal {
-                    kind: weakening::WeakeningKind::SecurityCheckRemoved,
-                    file: rel_str.clone(),
-                    evidence,
-                }),
-        );
-    }
     signals
 }
 
@@ -2805,7 +2751,7 @@ pub fn run_audit_with_type_aware(
     type_aware: AuditTypeAwareOptions<'_>,
 ) -> ExitCode {
     if let Err(e) = fallow_engine::health::validate_coverage_root_absolute(opts.coverage_root) {
-        return crate::error::emit_error_with_style(&e, 2, opts.output, opts.json_style);
+        return crate::error::emit_input_error_with_style(&e, opts.output, opts.json_style);
     }
     let coverage_resolved = opts
         .coverage

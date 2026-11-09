@@ -19,6 +19,7 @@ mod resolve;
 mod rules;
 mod similar_code;
 mod used_class_members;
+mod workspace_settings;
 
 #[expect(
     clippy::redundant_pub_crate,
@@ -74,6 +75,7 @@ pub use rules::{
 };
 pub use similar_code::SimilarCodeConfig;
 pub use used_class_members::{ScopedUsedClassMemberRule, UsedClassMemberRule};
+pub use workspace_settings::ResolvedWorkspaceSettings;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -208,6 +210,38 @@ impl CircularDependenciesConfig {
     }
 }
 
+/// Options for projects that use the Effect library.
+///
+/// The default changes nothing: each Effect export is reported like any
+/// other export.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct EffectConfig {
+    /// Report an unused exported Effect schema as an unused type, under the
+    /// `unused-types` rule, and not as an unused export. An Effect schema
+    /// defines a runtime value and a type (`typeof User.Type`), so a team
+    /// that keeps exported types as contracts can keep schemas too. With
+    /// `"unused-types": "off"`, fallow does not report them. A schema is a
+    /// class that extends a `Schema` class factory (`Schema.Class`,
+    /// `Schema.TaggedClass`, `Schema.TaggedError`, `Schema.TaggedRequest`,
+    /// `Schema.Error`, `Schema.Opaque`), or a const whose
+    /// value is a `Schema` constructor, member or pipe chain
+    /// (`Schema.Struct({...})`, `Schema.String.pipe(Schema.brand("Id"))`).
+    /// Each `pipe` argument must be a `Schema` transform.
+    /// `Schema` must come from `effect`, `effect/Schema` or `@effect/schema`.
+    /// Default `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub schema_exports_as_types: bool,
+}
+
+impl EffectConfig {
+    /// True when no option is set, so serialization can omit the section.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        !self.schema_exports_as_types
+    }
+}
+
 /// The `fix` config section: settings for `fallow fix` apply behavior.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -337,13 +371,17 @@ pub struct FallowConfig {
     #[schemars(schema_with = "extends_schema")]
     pub extends: Vec<String>,
 
-    /// An array of project-root-relative glob patterns whose matching files are seeded as manual entry points, on top of the framework and package.json entries fallow discovers automatically, so their transitive imports are not reported as unused. Set it (e.g. `["src/main.ts"]`) when a file is a real runtime root that no plugin or manifest declares; patterns are validated at load and matched against discovered files. For a script that does not run in production, use a `framework[]` entry with `entryPointRole: "support"` and leave its glob out of `entry`: a file that also matches `entry` stays a runtime root. A single `*` stays within one path segment; use `**` to match across directories.
+    /// An array of project-root-relative glob patterns whose matching files are seeded as manual entry points, on top of the framework and package.json entries fallow discovers automatically, so their transitive imports are not reported as unused. Set it (e.g. `["src/main.ts"]`) when a file is a real runtime root that no plugin or manifest declares; patterns are validated at load and matched against discovered files. For a script that does not run in production, use `supportEntry` and leave its glob out of `entry`: a file that also matches `entry` stays a runtime root. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub entry: Vec<String>,
 
     /// An array of project-root-relative glob patterns for files to exclude from analysis entirely; entries are unioned with fallow's built-in defaults (**/node_modules/**, **/dist/**, **/build/**, **/.git/**, **/coverage/**, **/*.min.js, **/*.min.mjs, **/*.min.cjs, **/*.bundle.js), so custom globs add to rather than replace them. Set it (e.g. `["generated/**"]`) to drop generated or vendored trees from every detector; patterns are validated at load. A `!`-prefixed entry is an exception that applies after the defaults and the positive patterns: `"!src/policy/coverage/**"` brings back hand-written source under a built-in default such as `**/coverage/**`, and `"!.config/**"` adds a hidden directory to discovery. Paths under `node_modules` or `.git` can not be lifted, and a `!` entry that names one of these segments is a config error. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+
+    /// An array of project-root-relative glob patterns whose matching files are support entry points: dev scripts, tooling and setup files that run outside production. In default mode a support entry keeps its file and its imports reachable, the same as `entry`. In `--production` mode (or `production` for dead-code analysis), fallow leaves a file that only a support entry matches out of the analysis, so its imports credit no export, file or dependency. A file that also matches `entry`, a framework plugin or a package.json field stays an entry point, and a support file that production code imports stays a normal module. Use `entry` for the files that run in production. A single `*` stays within one path segment; use `**` to match across directories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub support_entry: Vec<String>,
 
     /// An array of project-root-relative glob patterns whose source-owned dead-code findings are hidden after analysis without excluding matching files from discovery, parsing, resolution, or the module graph. Use `/` as the path separator on every platform. Positive patterns select paths to hide; `!`-prefixed patterns keep matching paths reportable, and a negated-only array reports only those exception paths. A finding with multiple source owners is hidden only when every owner matches, so a cycle, duplicate-export group, or unlisted dependency with any reportable location remains visible. Architecture, policy, suppression-hygiene, and framework-correctness findings remain visible even when a referenced path matches, as do manifest-owned findings that no source file owns: unused dependencies, unused dev and optional dependencies, catalog entries, and dependency overrides. Use `ignorePatterns` instead when a generated or vendored file must not be analyzed at all. A matching file that parses with errors reports no `source-parse-degraded` diagnostic, and its partial parse does not mark other findings as incomplete; use this only for files that are broken on purpose, such as syntax-error test fixtures. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -360,6 +398,10 @@ pub struct FallowConfig {
     /// A list of package names or package-name globs excluded from BOTH unused-dependency and unlisted-dependency detection, so a runtime-provided or otherwise-untracked package (e.g. `bun:sqlite`, a peer supplied at deploy time) is never flagged as unused when declared nor as unlisted when imported. Set it for packages fallow cannot observe being used and cannot observe being declared. An entry without glob characters matches the package name exactly; an entry with `*`, `?`, `[` or `{` is a glob in the `ignorePatterns` syntax matched against the package name, so `@acme/*` covers every package in the `@acme` scope.
     #[serde(default)]
     pub ignore_dependencies: Vec<String>,
+
+    /// A list of binary names or name globs that the `unlisted-binaries` rule does not report. Set it for a binary that the operating system, the CI image, or a tool outside `node_modules` provides (e.g. `["gnome-extensions", "tailscale"]`). An entry without glob characters matches the binary name exactly; an entry with `*`, `?`, `[` or `{` is a glob matched against the binary name, so `xcrun*` covers every name that starts with `xcrun`. Fallow already skips shell builtins and a fixed list of common operating-system tools (such as `git`, `ssh-keygen`, `curl`, and `ffmpeg`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_binaries: Vec<String>,
 
     /// A list of command names whose file arguments fallow does not make entry points. Fallow reads commands in package.json scripts (root and workspace packages), CI files (GitHub Actions and GitLab CI), Dockerfiles, Procfiles, and fly.toml files, and a file that a command names (such as `node scripts/seed.ts`) normally becomes an entry point. A listed command still counts as a used dependency, and its `--config` file is still tracked. Formatters and linters (ESLint, Prettier, Oxlint, Oxfmt, Biome, Stylelint, and similar tools) never make their targets entry points, so they do not need to be listed. Set it for a command whose file arguments are data, not code that runs (e.g. `["my-codegen"]`), or use `["*"]` to turn off entry points from all commands and declare real entries in `entry`. A name matches the command after environment, package-manager, and wrapper prefixes (`npx`, `pnpm exec`, `yarn run`, `varlock run --`), by exact file name; `*` is the only wildcard.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -440,6 +482,10 @@ pub struct FallowConfig {
     /// Options for the `circular-dependencies` rule, currently only `ignoreLazyImports`. Set `{ "ignoreLazyImports": true }` to skip import edges that load on demand or on another thread (an `import()` inside a function, a template `import()`, a lazy `import.meta.glob`, a worker URL, a webpack worker loader request such as `worker-loader!./work.js`) when fallow looks for cycles. A top-level `await import()`, `require()`, an eager glob, and an edge that also has a static import stay in the cycle graph. Default `false` leaves the rule unchanged.
     pub circular_dependencies: CircularDependenciesConfig,
 
+    #[serde(default, skip_serializing_if = "EffectConfig::is_default")]
+    /// Options for projects that use the Effect library, currently only `schemaExportsAsTypes`. Set `{ "schemaExportsAsTypes": true }` to report an unused exported Effect schema (a class that extends `Schema.Class`, `Schema.TaggedClass`, `Schema.TaggedError` and the other `Schema` class factories, or a const such as `Schema.Struct({...})` or `Schema.String.pipe(Schema.brand("Id"))`) as an unused type under the `unused-types` rule, not as an unused export, so `"unused-types": "off"` hides it. `Schema` must come from `effect`, `effect/Schema` or `@effect/schema`. A re-export of a schema from another module also counts. In a module that imports Effect, a chain on an imported schema (`Imported.pipe(Schema.brand("Id"))`, `Imported.annotations({...})`) and an alias (`export const Copy = Imported`) also count. Default `false` leaves every report unchanged.
+    pub effect: EffectConfig,
+
     /// Configures architecture boundary enforcement: which source directories belong to which named zone and which zones may import which others, reported as boundary-violation, boundary-coverage-violation, and boundary-call-violation findings (severity via rules.boundary-violation, default error). Set to enforce a layered/module architecture; the object holds `preset` (one of layered, hexagonal, feature-sliced, bulletproof, whose default zones/rules are merged in with the user-declared zones/rules taking precedence), `zones` (each with `name`, `patterns`, `autoDiscover`, optional `root`), `rules` (each with `from`, `allow`, `allowTypeOnly` target-zone lists), `coverage` (`requireAllFiles` plus `allowUnmatched` globs for files matching no zone), and `calls` (a `forbidden` list of `{from, callee}` banned-call rules per zone).
     #[serde(default)]
     pub boundaries: BoundaryConfig,
@@ -488,7 +534,7 @@ pub struct FallowConfig {
     )]
     pub markup_extensions: Vec<String>,
 
-    /// An ordered list of per-file rule-severity overrides: each entry re-severities specific analysis rules for files its globs match, layered on top of the top-level `rules` defaults. Set to relax or tighten a rule for a subset of paths (e.g. downgrade unused-exports to warn under a generated directory); each entry has `files` (glob-pattern array) and `rules` (a partial per-rule severity map of error/warn/off). Entries apply in list order and a file matched by several entries takes every matching entry's overrides (later entries win on conflict). For most rules, an override cannot start a detector for a rule that is off at top level, so set the top-level rule on and use an override to set `off` for the other paths. Project-level rules ignore overrides: unused-dependencies, unused-dev-dependencies, unused-optional-dependencies, unlisted-dependencies, type-only-dependencies, test-only-dependencies, dev-dependencies-in-production, duplicate-exports, re-export-cycle and unused-catalog-entries. Fallow reports each such entry as an `override-rule-ineffective` diagnostic that names the mechanism that works. A single `*` stays within one path segment; use `**` to match across directories.
+    /// An ordered list of per-file rule-severity overrides: each entry re-severities specific analysis rules for files its globs match, layered on top of the top-level `rules` defaults. Set to relax or tighten a rule for a subset of paths (e.g. downgrade unused-exports to warn under a generated directory); each entry has `files` (glob-pattern array) and `rules` (a partial per-rule severity map of error/warn/off). Entries apply in list order and a file matched by several entries takes every matching entry's overrides (later entries win on conflict). For most rules, an override cannot start a detector for a rule that is off at top level, so set the top-level rule on and use an override to set `off` for the other paths. Project-level rules ignore overrides: unused-dependencies, unused-dev-dependencies, unused-optional-dependencies, unlisted-dependencies, unlisted-binaries, type-only-dependencies, test-only-dependencies, dev-dependencies-in-production, duplicate-exports, re-export-cycle and unused-catalog-entries. Fallow reports each such entry as an `override-rule-ineffective` diagnostic that names the mechanism that works. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub overrides: Vec<ConfigOverride>,
 
@@ -915,6 +961,9 @@ pub struct RegressionBaseline {
     /// Baseline count of `unlisted-dependencies` findings.
     #[serde(default)]
     pub unlisted_dependencies: usize,
+    /// Baseline count of `unlisted-binaries` findings.
+    #[serde(default)]
+    pub unlisted_binaries: usize,
     /// Baseline count of `duplicate-exports` findings.
     #[serde(default)]
     pub duplicate_exports: usize,
@@ -1350,6 +1399,28 @@ usedClassMembers = [
 
         assert!(config.ignore_exports_used_in_file.suppresses(false));
         assert!(config.ignore_exports_used_in_file.suppresses(true));
+    }
+
+    #[test]
+    fn deserialize_effect_schema_exports_as_types() {
+        let default: FallowConfig = serde_json::from_str("{}").unwrap();
+        assert!(!default.effect.schema_exports_as_types);
+        assert!(
+            !serde_json::to_string(&default)
+                .unwrap()
+                .contains("\"effect\""),
+            "the default section is not serialized"
+        );
+
+        let config: FallowConfig =
+            serde_json::from_str(r#"{"effect":{"schemaExportsAsTypes":true}}"#).unwrap();
+        assert!(config.effect.schema_exports_as_types);
+
+        let toml: FallowConfig = toml::from_str("[effect]\nschemaExportsAsTypes = true\n").unwrap();
+        assert!(toml.effect.schema_exports_as_types);
+
+        let typo = serde_json::from_str::<FallowConfig>(r#"{"effect":{"schemaExports":true}}"#);
+        assert!(typo.is_err(), "an unknown effect key fails the load");
     }
 
     #[test]

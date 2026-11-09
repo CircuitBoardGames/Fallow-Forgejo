@@ -94,32 +94,42 @@ describe("node-test adapter with the Node flags of the test script", () => {
 
   after(() => project?.cleanup());
 
-  test("the test processes get node_args, with a relative --import from the root", async () => {
-    companion = startCompanion();
-    const ready = await init({
-      env: {},
-      node_args: ["--experimental-transform-types", "--import", "./support/setup.mjs"],
-    });
-    assert.equal(ready.type, "ready", JSON.stringify(ready));
-    const dryRun = await request({ type: "dry_run", test_files: [COLOR_TEST] });
-    assert.equal(dryRun.type, "dry_run_result", JSON.stringify(dryRun));
-    assert.deepEqual(dryRun.unhandled_errors, []);
-    assert.deepEqual(
-      dryRun.tests.map(({ name, status }) => ({ name, status })),
-      [
-        { name: "red", status: "pass" },
-        { name: "setup", status: "pass" },
-      ],
-    );
-    const result = await request({
-      type: "run",
-      mutant_id: "e1",
-      test_ids: [`${COLOR_TEST}::red`],
-      timeout_ms: 10_000,
-      bail: true,
-    });
-    assert.equal(result.status, "killed", JSON.stringify(result));
-  });
+  // Node.js 26 removed `--experimental-transform-types`, so no flag loads the
+  // enum there. The floor job runs this test on the lowest supported Node.js.
+  const transformTypes = process.allowedNodeEnvironmentFlags.has("--experimental-transform-types");
+
+  test(
+    "the test processes get node_args, with a relative --import from the root",
+    {
+      skip: transformTypes ? false : "this Node.js has no --experimental-transform-types",
+    },
+    async () => {
+      companion = startCompanion();
+      const ready = await init({
+        env: {},
+        node_args: ["--experimental-transform-types", "--import", "./support/setup.mjs"],
+      });
+      assert.equal(ready.type, "ready", JSON.stringify(ready));
+      const dryRun = await request({ type: "dry_run", test_files: [COLOR_TEST] });
+      assert.equal(dryRun.type, "dry_run_result", JSON.stringify(dryRun));
+      assert.deepEqual(dryRun.unhandled_errors, []);
+      assert.deepEqual(
+        dryRun.tests.map(({ name, status }) => ({ name, status })),
+        [
+          { name: "red", status: "pass" },
+          { name: "setup", status: "pass" },
+        ],
+      );
+      const result = await request({
+        type: "run",
+        mutant_id: "e1",
+        test_ids: [`${COLOR_TEST}::red`],
+        timeout_ms: 10_000,
+        bail: true,
+      });
+      assert.equal(result.status, "killed", JSON.stringify(result));
+    },
+  );
 
   test("a test file that does not load gives a message that starts with the error line", async () => {
     companion = startCompanion();
@@ -218,6 +228,13 @@ const createSubprocessProject = () => {
       '  const out = execFileSync(process.execPath, [copied, "2", "2"], { encoding: "utf8" });',
       '  assert.equal(out.trim(), "4");',
       "});",
+      'test("child only", () => {',
+      '  const out = execFileSync(process.execPath, [path("math.mjs"), "2", "2"], { encoding: "utf8" });',
+      '  assert.equal(out.trim(), "4");',
+      "});",
+      'test("no child", () => {',
+      "  assert.equal(1 + 1, 2);",
+      "});",
       'test("env", () => {',
       "  assert.ok(Number.isFinite(add(2, 2)));",
       '  assert.deepEqual(Object.keys(process.env).filter((key) => key.startsWith("FALLOW_MUTATION")), []);',
@@ -269,7 +286,7 @@ describe("node-test adapter with a test that starts a Node child process", () =>
     project?.cleanup();
   });
 
-  test("the dry run passes and the hits of the test process select each test", async () => {
+  test("the dry run passes and the hits of the test process and its children select each test", async () => {
     const dryRun = await request({ type: "dry_run", test_files: [CLI_TEST] });
     assert.equal(dryRun.type, "dry_run_result", JSON.stringify(dryRun));
     assert.deepEqual(dryRun.unhandled_errors, []);
@@ -279,6 +296,8 @@ describe("node-test adapter with a test that starts a Node child process", () =>
         { name: "cli", status: "pass" },
         { name: "fork", status: "pass" },
         { name: "copy", status: "pass" },
+        { name: "child only", status: "pass" },
+        { name: "no child", status: "pass" },
         { name: "env", status: "pass" },
       ],
     );
@@ -286,11 +305,12 @@ describe("node-test adapter with a test that starts a Node child process", () =>
       [`${CLI_TEST}::cli`]: ["s1"],
       [`${CLI_TEST}::fork`]: ["s1"],
       [`${CLI_TEST}::copy`]: ["s1"],
+      [`${CLI_TEST}::child only`]: ["s1"],
       [`${CLI_TEST}::env`]: ["s1"],
     });
   });
 
-  for (const name of ["cli", "fork", "copy"]) {
+  for (const name of ["cli", "fork", "copy", "child only"]) {
     test(`the child process of the ${name} test loads the active mutant`, async () => {
       const result = await request({
         type: "run",

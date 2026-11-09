@@ -11,10 +11,6 @@ use serde_json::Value;
     schemars(title = "fallow --format codeclimate / gitlab-codequality")
 )]
 #[serde(transparent)]
-#[allow(
-    dead_code,
-    reason = "schema-source-of-truth wrapper: runtime emits a Vec<CodeClimateIssue> directly; this newtype exists so schemars can title and document the bare-array shape for the drift gate."
-)]
 pub struct CodeClimateOutput(pub Vec<CodeClimateIssue>);
 
 /// Single CodeClimate-compatible issue inside [`CodeClimateOutput`].
@@ -55,6 +51,11 @@ pub struct CodeClimateIssue {
     #[serde(skip)]
     #[cfg_attr(feature = "schema", schemars(skip))]
     pub legacy_fingerprint: Option<String>,
+    /// Audit facts that an inline review comment shows. Never serialized:
+    /// the CodeClimate wire shape does not change.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub audit: Option<crate::AuditReviewContext>,
 }
 
 /// Discriminator value for [`CodeClimateIssue::kind`].
@@ -75,10 +76,6 @@ pub enum CodeClimateSeverity {
     /// by the current runtime path (which only emits Minor / Major /
     /// Critical via `severity_to_codeclimate` and the health / runtime-
     /// coverage match arms).
-    #[allow(
-        dead_code,
-        reason = "schema-source-of-truth: documents the full CodeClimate severity spec; runtime never produces this variant today."
-    )]
     Info,
     /// Minor finding.
     Minor,
@@ -88,10 +85,6 @@ pub enum CodeClimateSeverity {
     Critical,
     /// Blocker (highest severity). Reserved for future severity
     /// mappings; not produced by the current runtime path.
-    #[allow(
-        dead_code,
-        reason = "schema-source-of-truth: documents the full CodeClimate severity spec; runtime never produces this variant today."
-    )]
     Blocker,
 }
 
@@ -179,6 +172,7 @@ pub fn build_codeclimate_issue(input: CodeClimateIssueInput<'_>) -> CodeClimateI
         owner: None,
         group: None,
         legacy_fingerprint: None,
+        audit: None,
     }
 }
 

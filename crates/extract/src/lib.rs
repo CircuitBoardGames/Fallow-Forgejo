@@ -33,14 +33,15 @@ pub mod css_metrics;
 mod css_module_classes;
 pub mod dom_classes;
 pub mod effect_facts;
+mod effect_schema;
 pub mod federation_runtime;
 pub mod flags;
 mod function_body;
-pub(crate) mod function_hash;
+mod function_hash;
 pub mod glimmer;
 pub(crate) mod graphql;
 pub(crate) mod html;
-pub(crate) mod iconify;
+mod iconify;
 pub mod inventory;
 pub mod js_text;
 mod jsdoc_attach;
@@ -49,6 +50,7 @@ mod literal_membership;
 pub mod mdx;
 mod module_info;
 mod module_parse;
+mod namespace_member_uses;
 mod nesting;
 pub mod og_image;
 mod parse;
@@ -118,10 +120,8 @@ pub use dom_classes::{DomClassScan, scan_dom_class_values};
 pub use glimmer::{is_glimmer_file, strip_glimmer_templates};
 pub use js_text::JsText;
 pub use mdx::{extract_mdx_statements, extract_mdx_statements_mapped};
-pub use nesting::{
-    MAX_NESTING_DEPTH, exceeds_nesting_limit, parse_bounded, parse_bounded_or_default,
-    parse_style_bounded,
-};
+pub(crate) use nesting::parse_style_bounded;
+pub use nesting::{MAX_NESTING_DEPTH, parse_bounded, parse_bounded_or_default};
 pub use sfc::{
     SourceRegion, extract_sfc_scripts, extract_sfc_styles, extract_sfc_template_regions,
     is_sfc_file, sfc_merged_script_source,
@@ -162,6 +162,9 @@ const PARALLEL_PARSE_FILE_THRESHOLD: usize = 32;
 /// analyses) sees a consistent post-BOM view. Mirrors the
 /// `fallow_config` layer (`config_writer.rs::BOM`) so config-shaped sources
 /// and source-code-shaped sources are processed symmetrically. See issue #475.
+///
+/// Call it once for each source. Only the first U+FEFF of a file is the
+/// mark, so a second call removes a U+FEFF that is source text.
 #[must_use]
 fn strip_bom(source: &str) -> &str {
     source.strip_prefix(BOM_CHAR).unwrap_or(source)
@@ -424,7 +427,7 @@ fn parse_single_file_cached(
     let parse_start = std::time::Instant::now();
     // Drop a count that a scan outside a parse left on this thread.
     css_masked_bytes::take();
-    let module = parse_source_to_module_with_flags(
+    let module = module_parse::parse_source_without_bom(
         file.id,
         &file.path,
         source,
@@ -445,12 +448,13 @@ pub fn parse_single_file(file: &DiscoveredFile) -> Option<ModuleInfo> {
     let raw = std::fs::read_to_string(&file.path).ok()?;
     let source = strip_bom(&raw);
     let content_hash = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
-    Some(parse_source_to_module(
+    Some(module_parse::parse_source_without_bom(
         file.id,
         &file.path,
         source,
         content_hash,
         false,
+        &FlagPatterns::default(),
     ))
 }
 
@@ -459,8 +463,17 @@ pub fn parse_single_file(file: &DiscoveredFile) -> Option<ModuleInfo> {
 pub fn parse_from_content(file_id: FileId, path: &Path, content: &str) -> ModuleInfo {
     let content = strip_bom(content);
     let content_hash = xxhash_rust::xxh3::xxh3_64(content.as_bytes());
-    parse_source_to_module(file_id, path, content, content_hash, true)
+    module_parse::parse_source_without_bom(
+        file_id,
+        path,
+        content,
+        content_hash,
+        true,
+        &FlagPatterns::default(),
+    )
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests;
+#[cfg(all(test, not(miri)))]
+mod unicode_span_oracle;

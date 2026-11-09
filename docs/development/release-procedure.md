@@ -221,14 +221,18 @@ invariants in this file.
    synchronize its merged content after the protected merge, then require
    the main contract check to pass. Do not bypass either check.
 
-   Two version-bearing manifests sit outside the workspace bump and follow
-   opposite rules. `scripts/sync-npm-versions.sh` rewrites both and is wired to
-   no workflow, so a release can skip it silently.
+   Three version-bearing manifests sit outside the workspace bump.
+   `scripts/sync-npm-versions.sh` rewrites each of them and is wired to no
+   workflow, so a release can skip it silently.
 
    - `tools/type-aware-sidecar` bumps in lockstep with the CLI, inside the
      release commit. The CLI refuses a companion whose version differs from the
      binary, so a skipped bump turns `main` red on Windows validation rather
      than at publish time.
+   - `packaging/crates-io/fallow` bumps in lockstep with the CLI, inside the
+     release commit, together with its exact `fallow-cli` requirement. The
+     publish step publishes it after `fallow-cli`. `cargo install` skips an
+     installed version, so a skipped bump leaves users on the old CLI.
    - `crates/napi` and its `@fallow/*` platform manifests stay at the last
      published version through the release commit, keeping any dependabot bump
      that landed on top. Their platform packages do not exist on npm at the new
@@ -438,6 +442,15 @@ invariants in this file.
     parallel. The job `Wait for the approved fallow root` is then running. It
     is the only job that waits for the npm approval. If `Publish to npm`
     fails, the VSIX publishers do not start. Rerun the failed jobs.
+
+    The job stages the `fallow` root only after every other package is public,
+    because the root pins them. If one package fails, the job exits without a stage.
+    Sigstore sometimes answers a provenance entry with
+    `TLOG_CREATE_ENTRY_ERROR` and `(409)`, and npm then does not publish the
+    package. The job retries that error twice, after 20 and 40 seconds. Before
+    each retry it checks if the version is already on npm. Other errors do not
+    retry. If the retries fail, rerun the failed job. The rerun skips every
+    package that is already public.
 
     The workflow stages the `fallow` npm root instead of publishing it. Its
     trusted publisher grants stage publish only, so the version becomes
@@ -704,8 +717,9 @@ query, vite, and astro, then run
 `pgo-validate.yml` runs on pull requests that change `scripts/pgo-train.sh`,
 `.github/scripts/pgo-compare.mjs`, `.github/scripts/pgo-profile-match.mjs`,
 `benchmarks/download-fixtures.mjs`, `.github/actions/setup-rust/**`,
-`.cargo/config.toml`, `release.yml`, `pgo-validate.yml`, `Cargo.toml`,
-`Cargo.lock`, or `rust-toolchain.toml`. It trains one profile per PGO target
+`.cargo/config.toml`, `release.yml`, `pgo-validate.yml`, `Cargo.toml`, or
+`rust-toolchain.toml`. It skips Dependabot Cargo branches, and it runs every
+Sunday on `main`. It trains one profile per PGO target
 with the same script, runners, and container as `release.yml`. It builds
 `fallow-multicall` with and without the profile on Linux x64 and macOS arm64,
 and compares the held-out fixtures query, vite, and astro with interleaved

@@ -136,6 +136,191 @@ test("branch coverage reports weekly on the Fuzz Smoke nightly without gating re
   assert.doesNotMatch(job, /exit 1|FLOOR=/, "branch coverage only reports and has no floor");
 });
 
+test("the oracle seeds workflow runs the wide seed range on a schedule, outside pull request CI", async () => {
+  const workflow = readWorkflow(".github/workflows/oracle-seeds.yml");
+  const sequences = readFileSync(
+    "crates/engine/tests/integration/cache_model/sequences.rs",
+    "utf8",
+  );
+  const triggers = indentedBlock(workflow, "on", 0);
+  const job = indentedBlock(workflow, "cache-model-seeds", 2);
+  const { REQUIRED_WORKFLOWS } = await import("./verify-release-ci.mjs");
+
+  assert.match(triggers, /^  schedule:\n    - cron: '40 2 \* \* \*'$/m);
+  assert.match(triggers, /^  workflow_dispatch:$/m);
+  assert.doesNotMatch(triggers, /^  (push|pull_request|pull_request_target):/m);
+  assert.ok(
+    !REQUIRED_WORKFLOWS.some(({ file }) => file === "oracle-seeds.yml"),
+    "a scheduled seed run must not gate releases",
+  );
+  assert.match(workflow, /^permissions: \{\}$/m);
+  assert.match(job, /permissions:\n      contents: read/);
+  assert.match(job, /persist-credentials: false/);
+  assert.match(sequences, /#\[ignore = [^\]]*\]\nfn seed_sweep_matches_cache_free_runs\(\)/);
+  assert.match(sequences, /"FALLOW_CACHE_MODEL_SEEDS"/);
+  assert.match(sequences, /"FALLOW_CACHE_MODEL_SEED_START"/);
+  assert.match(
+    job,
+    /cache_model::sequences::seed_sweep_matches_cache_free_runs[\s\S]*-- --ignored --exact/,
+  );
+  assert.match(job, /export FALLOW_CACHE_MODEL_SEEDS=/);
+  assert.match(job, /export FALLOW_CACHE_MODEL_SEED_START=/);
+  assert.match(
+    job,
+    /panicked at[\s\S]*GITHUB_STEP_SUMMARY/,
+    "a failure prints the failing sequence",
+  );
+  assert.match(job, /exit "\$status"/);
+  assert.doesNotMatch(
+    readWorkflow(".github/workflows/ci.yml"),
+    /seed_sweep_matches_cache_free_runs|FALLOW_CACHE_MODEL_SEEDS/,
+    "pull request CI keeps the fixed seeds",
+  );
+});
+
+test("the oracle seeds workflow runs the mutation result cache seeds with the real runners", () => {
+  const workflow = readWorkflow(".github/workflows/oracle-seeds.yml");
+  const sequences = readFileSync("crates/api/src/mutation/cache_model/sequences.rs", "utf8");
+  const job = indentedBlock(workflow, "mutation-cache-model-seeds", 2);
+
+  assert.match(job, /permissions:\n      contents: read/);
+  assert.match(job, /persist-credentials: false/);
+  assert.match(job, /actions\/setup-node@/);
+  assert.match(job, /oven-sh\/setup-bun@/);
+  assert.match(job, /npm ci --prefix tools\/mutation-runner/);
+  assert.match(job, /FALLOW_MUTATION_E2E_REQUIRED: '1'/, "a missing runner fails the run");
+  assert.match(sequences, /#\[ignore = [^\]]*\]\nfn seed_sweep_matches_cache_free_runs\(\)/);
+  assert.match(sequences, /"FALLOW_MUTATION_CACHE_MODEL_SEEDS"/);
+  assert.match(sequences, /"FALLOW_MUTATION_CACHE_MODEL_SEED_START"/);
+  assert.match(
+    job,
+    /mutation::cache_model::sequences::seed_sweep_matches_cache_free_runs[\s\S]*-- --ignored --exact/,
+  );
+  assert.match(job, /export FALLOW_MUTATION_CACHE_MODEL_SEEDS=/);
+  assert.match(job, /export FALLOW_MUTATION_CACHE_MODEL_SEED_START=/);
+  assert.match(
+    job,
+    /panicked at[\s\S]*GITHUB_STEP_SUMMARY/,
+    "a failure prints the failing sequence",
+  );
+  assert.match(job, /exit "\$status"/);
+  assert.doesNotMatch(
+    readWorkflow(".github/workflows/ci.yml"),
+    /FALLOW_MUTATION_CACHE_MODEL_SEEDS/,
+    "pull request CI keeps the fixed seeds",
+  );
+});
+
+test("the oracle seeds workflow runs the permutation oracle seeds", () => {
+  const workflow = readWorkflow(".github/workflows/oracle-seeds.yml");
+  const oracle = readFileSync("crates/cli/tests/integration/permutation/oracle.rs", "utf8");
+  const job = indentedBlock(workflow, "permutation-seeds", 2);
+
+  assert.match(job, /permissions:\n      contents: read/);
+  assert.match(job, /persist-credentials: false/);
+  assert.match(oracle, /#\[ignore = [^\]]*\]\nfn seed_sweep_keeps_output_identical\(\)/);
+  assert.match(oracle, /"FALLOW_PERMUTATION_SEEDS"/);
+  assert.match(oracle, /"FALLOW_PERMUTATION_SEED_START"/);
+  assert.match(
+    job,
+    /permutation::oracle::seed_sweep_keeps_output_identical[\s\S]*-- --ignored --exact/,
+  );
+  assert.match(job, /export FALLOW_PERMUTATION_SEEDS=/);
+  assert.match(job, /export FALLOW_PERMUTATION_SEED_START=/);
+  const failureText = "the output changes with the discovery order";
+  assert.ok(oracle.includes(failureText), "the oracle panics with the text that the job finds");
+  assert.ok(job.includes(`grep -q '${failureText}'`), "the job finds the panic text of the oracle");
+  assert.match(job, /panicked at[\s\S]*GITHUB_STEP_SUMMARY/, "a failure prints the failing seeds");
+  assert.match(job, /exit "\$status"/);
+  assert.doesNotMatch(
+    readWorkflow(".github/workflows/ci.yml"),
+    /FALLOW_PERMUTATION_SEEDS|seed_sweep_keeps_output_identical/,
+    "pull request CI keeps the fixed seeds",
+  );
+});
+
+test("the oracle seeds workflow runs the surface differential seeds with the Node bindings", () => {
+  const workflow = readWorkflow(".github/workflows/oracle-seeds.yml");
+  const oracle = readFileSync(
+    "crates/mcp/tests/integration/surface_differential/oracle.rs",
+    "utf8",
+  );
+  const surfaces = readFileSync(
+    "crates/mcp/tests/integration/surface_differential/surfaces.rs",
+    "utf8",
+  );
+  const job = indentedBlock(workflow, "surface-differential-seeds", 2);
+
+  assert.match(job, /permissions:\n      contents: read/);
+  assert.match(job, /persist-credentials: false/);
+  assert.match(oracle, /#\[ignore = [^\]]*\]\nfn seed_sweep_agrees_on_every_surface\(\)/);
+  assert.match(oracle, /"FALLOW_SURFACE_SEEDS"/);
+  assert.match(oracle, /"FALLOW_SURFACE_SEED_START"/);
+  assert.match(surfaces, /NODE_ADDON_ENV: &str = "FALLOW_SURFACE_NODE_ADDON"/);
+  assert.match(job, /npx napi build --platform --no-js/);
+  assert.match(job, /export FALLOW_SURFACE_NODE_ADDON=/);
+  assert.match(job, /export FALLOW_SURFACE_SEEDS=/);
+  assert.match(job, /export FALLOW_SURFACE_SEED_START=/);
+  assert.match(job, /surface_differential:: \\\n\s+-- --include-ignored/);
+  const failureText = "the surfaces disagree";
+  assert.ok(oracle.includes(failureText), "the oracle panics with the text that the job finds");
+  assert.ok(job.includes(`grep -q '${failureText}'`), "the job finds the panic text of the oracle");
+  assert.match(job, /panicked at[\s\S]*GITHUB_STEP_SUMMARY/, "a failure prints the failing seed");
+  assert.match(job, /exit "\$status"/);
+  assert.doesNotMatch(
+    readWorkflow(".github/workflows/ci.yml"),
+    /FALLOW_SURFACE_SEEDS|FALLOW_SURFACE_NODE_ADDON|seed_sweep_agrees_on_every_surface/,
+    "pull request CI keeps the fixed seeds and adds no Node bindings run",
+  );
+});
+
+test("the oracle seeds workflow runs the Unicode span tests with a wide case range", () => {
+  const workflow = readWorkflow(".github/workflows/oracle-seeds.yml");
+  const job = indentedBlock(workflow, "unicode-span-seeds", 2);
+
+  assert.match(job, /permissions:\n      contents: read/);
+  assert.match(job, /persist-credentials: false/);
+  assert.match(job, /--lib unicode_span_oracle/);
+  assert.match(job, /export PROPTEST_CASES=/);
+  assert.match(job, /export PROPTEST_RNG_SEED=/);
+  assert.match(job, /minimal failing input[\s\S]*GITHUB_STEP_SUMMARY/, "a failure prints the case");
+  assert.match(job, /exit "\$status"/);
+  assert.doesNotMatch(
+    readWorkflow(".github/workflows/ci.yml"),
+    /PROPTEST_RNG_SEED|PROPTEST_CASES/,
+    "pull request CI keeps the fixed seed and the default case count",
+  );
+});
+
+test("the oracle seeds workflow runs the platform oracle seeds outside pull request CI", () => {
+  const workflow = readWorkflow(".github/workflows/oracle-seeds.yml");
+  const oracle = readFileSync("crates/cli/tests/integration/platform/oracle.rs", "utf8");
+  const job = indentedBlock(workflow, "platform-seeds", 2);
+
+  assert.match(job, /permissions:\n      contents: read/);
+  assert.match(job, /persist-credentials: false/);
+  assert.match(oracle, /#\[ignore = [^\]]*\]\nfn seed_sweep_keeps_findings_identical\(\)/);
+  assert.match(oracle, /"FALLOW_PLATFORM_SEEDS"/);
+  assert.match(oracle, /"FALLOW_PLATFORM_SEED_START"/);
+  assert.match(
+    job,
+    /platform::oracle::seed_sweep_keeps_findings_identical[\s\S]*-- --ignored --exact/,
+  );
+  assert.match(job, /export FALLOW_PLATFORM_SEEDS=/);
+  assert.match(job, /export FALLOW_PLATFORM_SEED_START=/);
+  assert.match(
+    job,
+    /panicked at[\s\S]*GITHUB_STEP_SUMMARY/,
+    "a failure prints the failing project seed and form",
+  );
+  assert.match(job, /exit "\$status"/);
+  assert.doesNotMatch(
+    readWorkflow(".github/workflows/ci.yml"),
+    /seed_sweep_keeps_findings_identical|FALLOW_PLATFORM_SEEDS/,
+    "pull request CI keeps the fixed seeds",
+  );
+});
+
 test("public skill PR parity uses the exact base while push and candidate checks stay strict", () => {
   const workflow = readWorkflow(".github/workflows/ci.yml");
   const job = indentedBlock(workflow, "skills-vendor", 2);
@@ -167,18 +352,21 @@ test("bundled skill validation uses the root lockfile without network fallback",
   const npmPackageJob = indentedBlock(workflow, "npm-package", 2);
   const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
   const nestedPackage = JSON.parse(readFileSync("npm/fallow/package.json", "utf8"));
-  const lockfile = JSON.parse(readFileSync("package-lock.json", "utf8"));
+  const lockfile = readFileSync("pnpm-lock.yaml", "utf8");
 
   assert.equal(rootPackage.devDependencies["@tanstack/intent"], "0.5.6");
   assert.equal(
     nestedPackage.devDependencies?.["@tanstack/intent"],
     rootPackage.devDependencies["@tanstack/intent"],
   );
-  assert.equal(lockfile.packages[""].devDependencies["@tanstack/intent"], "0.5.6");
-  assert.equal(lockfile.packages["node_modules/@tanstack/intent"].version, "0.5.6");
+  assert.match(
+    lockfile,
+    /^ {6}'@tanstack\/intent':\n {8}specifier: 0\.5\.6\n {8}version: 0\.5\.6$/mu,
+  );
+  assert.match(lockfile, /^ {2}'@tanstack\/intent@0\.5\.6':$/mu);
   assert.match(
     npmPackageJob,
-    /npm ci --no-audit --no-fund --ignore-scripts[\s\S]*npx --no-install intent validate npm\/fallow\/skills/,
+    /pnpm install --frozen-lockfile --ignore-scripts[\s\S]*npx --no-install intent validate npm\/fallow\/skills/,
   );
   assert.doesNotMatch(npmPackageJob, /npx[^\n]*@tanstack\/intent@/);
 });
@@ -414,7 +602,15 @@ test("regular CI keeps affected checks on Ubuntu", () => {
     assert.doesNotMatch(job, /matrix\.(?!partition\b)|windows-latest|macos-latest/);
   }
   assert.match(vscodePackageTargetsJob, /runs-on: ubuntu-26.04/);
-  assert.match(vscodeTargetHostJob, /linux-x64[\s\S]*win32-x64[\s\S]*darwin-x64/u);
+  // The darwin-x64 leg runs only in release validation and in the release
+  // host smoke. The macos-15-intel queue held each CI run on main.
+  assert.match(vscodeTargetHostJob, /linux-x64[\s\S]*win32-x64/u);
+  assert.doesNotMatch(vscodeTargetHostJob, /target: darwin-x64/u);
+  assert.doesNotMatch(
+    workflow,
+    /os: macos-|runs-on: macos-/u,
+    "CI must not wait for a macOS runner",
+  );
   assert.match(windowsRustJob, /needs: changes/);
   assert.match(windowsRustJob, /if: needs\.changes\.outputs\.windows-rust == 'true'/);
   assert.match(windowsRustJob, /runs-on: windows-latest/);
@@ -578,6 +774,9 @@ test("release runs Windows correctness and lifecycle verification without creden
   );
   assert.match(vscodeTargetJob, /verify:vsix/);
   assert.match(vscodeTargetJob, /FALLOW_LSP_BIN:/);
+  // CI runs only the Linux and Windows legs, so release validation must keep
+  // the darwin-x64 leg on its own macOS runner.
+  assert.match(vscodeTargetJob, /- os: macos-15-intel\n\s+target: darwin-x64/u);
   assert.match(vscodePackageJob, /name: validation-vscode-targets/);
   assert.match(vscodePackageJob, /test:packaging/);
   assert.doesNotMatch(vscodePackageJob, /name: fallow-vscode-targets/);
@@ -774,7 +973,7 @@ test("release publication waits for the aggregate verification gate", () => {
   assert.match(sidecarAudit[1], /--deny unmaintained/u);
   assert.deepEqual(
     [...sidecarAudit[1].matchAll(/--ignore (\S+)/gu)].map((match) => match[1]),
-    ["RUSTSEC-2024-0436", "RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"],
+    ["RUSTSEC-2024-0436"],
   );
   assert.match(
     sidecarAuditJob,
@@ -880,13 +1079,13 @@ test("release stages the fallow npm root for maintainer approval", () => {
   const security = readFileSync("docs/development/release-security.md", "utf8");
   const stageCalls = npmPublish.match(/^\s+stage_output=\$\(.*npm stage publish /gmu) ?? [];
   const stagedBranch = npmPublish.indexOf('if is_staged_name "$name"; then');
-  const directPublish = npmPublish.indexOf('if ! npm publish "$file"');
+  const directPublish = npmPublish.indexOf('if ! publish_with_retry "$file"');
 
   assert.match(npmPublish, /^\s+STAGED_NAMES=\("fallow"\)$/mu);
   assert.equal(stageCalls.length, 1, "npm-publish must make exactly one stage call");
   assert.match(
     npmPublish,
-    /NODE_AUTH_TOKEN="" npm stage publish "\$file" --access public --provenance --ignore-scripts/u,
+    /NODE_AUTH_TOKEN="" npm stage publish "\$DEFERRED_FILE" --access public --provenance --ignore-scripts/u,
   );
   assert.notEqual(stagedBranch, -1, "staged names must branch before the direct publish");
   assert.ok(stagedBranch < directPublish, "a staged name must never reach npm publish");
@@ -896,9 +1095,46 @@ test("release stages the fallow npm root for maintainer approval", () => {
     "the staged branch must end by skipping the direct publish",
   );
   assert.match(npmPublish, /grep -q '\^npm error code E409\$'/u);
-  assert.match(npmPublish, /npm install -g --ignore-scripts npm@11\.19\.0/u);
+  assert.match(npmPublish, /node-version: '26\.13\.0'/u);
+  assert.match(npmPublish, /run: test "\$\(npm --version\)" = 11\.20\.0/u);
+  assert.doesNotMatch(npmPublish, /npm install -g/u);
   assert.match(security, /Stage the `fallow` npm root, never publish it from the workflow/u);
   assert.match(security, /exactly one `npm stage publish` call/u);
+});
+
+test("npm publish retries a Sigstore 409 and stages the root last", () => {
+  const workflow = readWorkflow(".github/workflows/release.yml");
+  const npmPublish = indentedBlock(workflow, "npm-publish", 2);
+  const retry = npmPublish.slice(
+    npmPublish.indexOf("publish_with_retry() {"),
+    npmPublish.indexOf('DEFERRED_FILE=""'),
+  );
+  const loopEnd = npmPublish.indexOf("done < tarballs/manifest.tsv");
+  const failExit = npmPublish.indexOf('if [ "$FAILED" -eq 1 ]; then', loopEnd);
+  const stageCall = npmPublish.indexOf("npm stage publish");
+
+  assert.match(retry, /TLOG_CREATE_ENTRY_ERROR/u, "the retry must match the tlog error code");
+  assert.match(retry, /grep -qF '\(409\)'/u, "the retry must require the 409 status");
+  assert.match(npmPublish, /^\s+TLOG_RETRY_DELAYS=\(20 40\)$/mu, "at most 2 retries");
+  assert.match(retry, /npm view "\$name@\$version" version/u, "check npm before a retry");
+  assert.match(retry, /Rerun the failed job/u, "the final error must name the recovery");
+  assert.ok(loopEnd !== -1 && failExit > loopEnd, "failure exit must follow the publish loop");
+  assert.ok(stageCall > failExit, "the root must be staged only after the failure check");
+  assert.match(
+    npmPublish.slice(failExit, stageCall),
+    /\bexit 1\b/u,
+    "a failed package must stop the job before the root is staged",
+  );
+  assert.match(
+    retry,
+    /if ! grep -q 'TLOG_CREATE_ENTRY_ERROR' <<<"\$output" \|\| ! grep -qF '\(409\)' <<<"\$output"; then\n\s+return 1/u,
+    "the retry must stop unless the output has both the error code and the 409 status",
+  );
+  assert.equal(
+    npmPublish.slice(0, loopEnd).includes("npm stage publish"),
+    false,
+    "the publish loop must not stage the root",
+  );
 });
 
 const WAIT_STEP = "Wait until fallow@version is public with the staged bytes";
@@ -927,7 +1163,7 @@ test("release publishes no VSIX before the approved fallow root is public", () =
   // The digest must still reach the gate, or the wait fails with an empty
   // expected sha256 and no rerun can recover the run (v3.38.0).
   const digestOutput = npmPublish.indexOf('echo "fallow_sha256=$digest" >> "$GITHUB_OUTPUT"');
-  const publishedSkip = npmPublish.indexOf('if npm view "$name@$version" version');
+  const publishedSkip = npmPublish.indexOf("Already published, skipping");
   assert.notEqual(publishedSkip, -1, "npm-publish must skip a published tarball");
   assert.ok(
     digestOutput < publishedSkip,
@@ -1369,10 +1605,39 @@ test("CI runs the mutation runner tests at the declared runtime floors", () => {
   // Without Bun the bun-test suite skips. The job must fail instead.
   assert.match(
     job,
-    /FALLOW_REQUIRE_BUN: '1'\n\s+run: node --test tools\/mutation-runner\/test\/\*\.test\.mjs/u,
+    /FALLOW_REQUIRE_BUN: '1'\n\s+run: node scripts\/check-temp-leaks\.mjs -- node --test tools\/mutation-runner\/test\/\*\.test\.mjs/u,
   );
   assert.match(job, /persist-credentials: false/u);
   assert.match(indentedBlock(workflow, "ci-ok", 2), /mutation-runner-floor/u);
+});
+
+// A test that leaves a folder in the system temp directory fills a developer
+// machine and a reused runner. The guard fails such a step in CI.
+test("CI runs each JS test suite through the temp folder guard", () => {
+  const workflow = readWorkflow(".github/workflows/ci.yml");
+  const suites = [
+    ["js-lint", "scripts/*.test.mjs"],
+    ["js-lint", "tools/type-aware-sidecar/test/*.test.mjs"],
+    ["js-lint", "tools/mutation-runner/test/*.test.mjs"],
+    ["mutation-runner-floor", "tools/mutation-runner/test/*.test.mjs"],
+    ["npm-package", ".github/scripts/*.test.mjs"],
+  ];
+  for (const [jobName, glob] of suites) {
+    const job = indentedBlock(workflow, jobName, 2);
+    const runs = job.split("\n").filter((line) => line.includes(`node --test ${glob}`));
+    assert.notEqual(runs.length, 0, `${jobName} must run ${glob}`);
+    for (const line of runs) {
+      assert.match(line, /run: node scripts\/check-temp-leaks\.mjs -- node --test /u, line);
+    }
+  }
+});
+
+// Fallow reads the scripts of package.json to find entry points. Without this
+// script, each `scripts/*.test.mjs` file reads as an unused file, because only
+// the CI workflow runs them.
+test("package.json runs the script tests that CI runs", () => {
+  const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+  assert.equal(manifest.scripts["test:scripts"], "node --test scripts/*.test.mjs");
 });
 
 test("CI runs clippy on the similar-code sidecar workspace", () => {
@@ -1402,6 +1667,59 @@ test("CI runs clippy on the similar-code sidecar workspace", () => {
     /similar-code-sidecar: \$\{\{ steps\.filter\.outputs\.similar-code-sidecar \}\}/u,
   );
   assert.match(indentedBlock(workflow, "ci-ok", 2), /needs: \[[^\n]*\bsimilar-code-sidecar\b/u);
+});
+
+test("CI runs the cloud login credential store tests with a real Secret Service", () => {
+  const workflow = readWorkflow(".github/workflows/ci.yml");
+  const job = indentedBlock(workflow, "linux-keychain", 2);
+  const paths = listedPaths(indentedBlock(workflow, "linux-keychain", 12));
+  const script = readFileSync("scripts/linux-keychain-test.sh", "utf8");
+
+  assert.match(job, /apt-get install [^\n]*\bdbus gnome-keyring libsecret-tools\b/u);
+  assert.match(job, /run: sh scripts\/linux-keychain-test\.sh$/mu);
+  assert.match(job, /needs\.changes\.outputs\.linux-keychain == 'true'/u);
+  assert.match(job, /persist-credentials: false/u);
+  // The Secret Service test is ignored by default, so only this job runs it.
+  assert.match(script, /--ignored --exact "\$SECRET_SERVICE_TEST"/u);
+  assert.match(script, /unset DBUS_SESSION_BUS_ADDRESS/u);
+  for (const path of [
+    "crates/cli/src/coverage/credentials.rs",
+    "crates/cli/tests/integration/cloud_login_linux_keychain_tests.rs",
+    "crates/cli/tests/integration/main.rs",
+    "crates/cli/tests/common/**",
+    "scripts/linux-keychain-test.sh",
+  ]) {
+    assert.ok(paths.includes(path), `the linux-keychain filter must list ${path}`);
+  }
+  assert.match(
+    indentedBlock(workflow, "outputs", 4),
+    /linux-keychain: \$\{\{ steps\.filter\.outputs\.linux-keychain \}\}/u,
+  );
+  assert.match(indentedBlock(workflow, "ci-ok", 2), /needs: \[[^\n]*\blinux-keychain\b/u);
+});
+
+test("the Linux keychain script fails when a test name matches no test", (t) => {
+  const bin = mkdtempSync(join(tmpdir(), "fallow-linux-keychain-"));
+  t.after(() => rmSync(bin, { recursive: true, force: true }));
+  // Stubs for the tools that the `--in-session` part calls. The cargo stub
+  // prints the summary line of a test run with the given count.
+  writeFileSync(join(bin, "gnome-keyring-daemon"), "#!/bin/sh\ncat >/dev/null\n", { mode: 0o755 });
+  writeFileSync(
+    join(bin, "cargo"),
+    '#!/bin/sh\necho "test result: ok. $PASSED passed; 0 failed; 0 ignored"\n',
+    { mode: 0o755 },
+  );
+  const run = (passed) =>
+    runProcess("sh", ["scripts/linux-keychain-test.sh", "--in-session"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, PASSED: passed },
+    });
+
+  const renamed = run("0");
+  assert.equal(renamed.status, 1, renamed.stderr);
+  assert.match(renamed.stderr, /no test ran for/u);
+  const matched = run("1");
+  assert.equal(matched.status, 0, matched.stderr);
 });
 
 test("the check job runs the end-to-end mutation tests instead of a skip", () => {
@@ -1453,6 +1771,33 @@ test("mise.toml follows the tool versions that CI pins", () => {
   assert.ok(ciNodeVersions.length > 0, "ci.yml must set up node");
   for (const version of ciNodeVersions) {
     assert.equal(nodeVersion, version, "mise.toml node must match ci.yml setup-node");
+  }
+
+  // The contributor pnpm is the pnpm of the root tools, the extension, and CI.
+  const pnpmVersion = miseVersion("pnpm");
+  assert.ok(pnpmVersion, "mise.toml must pin pnpm");
+  const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
+  // A caret range keeps any pnpm 11 at or above the mise pin usable.
+  assert.equal(rootPackage.engines.pnpm, `^${pnpmVersion}`);
+  const extensionPackage = JSON.parse(readFileSync("editors/vscode/package.json", "utf8"));
+  assert.equal(extensionPackage.packageManager, `pnpm@${pnpmVersion}`);
+  for (const file of ["ci.yml", "commitlint.yml", "contributors.yml"]) {
+    const workflow = readWorkflow(join(workflowDir, file));
+    const versions = Array.from(
+      workflow.matchAll(
+        /uses: pnpm\/action-setup@[0-9a-f]{40}[^\n]*\n\s+with:\n\s+version: (\S+)/gu,
+      ),
+      (match) => match[1],
+    );
+    assert.ok(versions.length > 0, `${file} must set up pnpm`);
+    assert.equal(
+      versions.length,
+      workflow.match(/uses: pnpm\/action-setup@/gu).length,
+      `${file} has a pnpm/action-setup step whose version this test cannot read`,
+    );
+    for (const version of versions) {
+      assert.equal(version, pnpmVersion, `${file} pnpm must match mise.toml`);
+    }
   }
 
   // A tool that CI installs at an exact version must have that version in mise.toml.
@@ -1682,9 +2027,13 @@ test("pgo-validate gates PGO on the held-out fixtures for the PGO paths", () => 
     ".github/workflows/pgo-validate.yml",
     ".github/workflows/release.yml",
     "Cargo.toml",
-    "Cargo.lock",
     "rust-toolchain.toml",
   ]);
+  assert.match(workflow, /^ {2}schedule:\n {4}- cron: '40 3 \* \* 0'$/mu);
+  assert.match(
+    train,
+    /^ {4}if: \$\{\{ !startsWith\(github\.head_ref, 'dependabot\/cargo\/'\) \}\}$/mu,
+  );
   assert.match(workflow, /^ {2}workflow_dispatch:$/mu);
   assert.match(workflow, /^permissions: \{\}$/mu);
   assert.match(train, /scripts\/pgo-train\.sh/u);
@@ -2233,7 +2582,7 @@ test("the release validation heavy selector skips startup when unset", async () 
   assert.match(selector, /runs-on: ubuntu-26.04/);
   assert.match(selector, /permissions:\n      contents: read\n/);
   assert.match(selector, /ref: refs\/heads\/main\n          persist-credentials: false/);
-  assert.match(selector, /node-version: '22'/);
+  assert.match(selector, /node-version: '26'/);
   const output = selector.match(/^      runner: \$\{\{ (.+) \}\}$/m)?.[1];
   assertHeavySelectorScript(runInNewContext, selector, output);
 });
@@ -2325,23 +2674,6 @@ test("heavy admission reserves the actual job timeouts including overhead", asyn
       "ubuntu-26.04",
     );
   }
-});
-
-// The Hawk workflow installs one toolchain and `check-hawk.sh` runs Hawk with
-// `cargo +<version>`. When the two drift, the job either fails on a missing
-// toolchain or lets rustup install the old one without notice.
-test("the Hawk workflow installs the toolchain that check-hawk.sh runs", () => {
-  const workflow = readWorkflow(".github/workflows/hawk.yml");
-  const script = readFileSync("scripts/check-hawk.sh", "utf8");
-  const installed = workflow.match(/^\s+toolchain:\s*'([^']+)'/m)?.[1];
-  const used = new Set([...script.matchAll(/cargo \+([\w.-]+) hawk/g)].map((match) => match[1]));
-
-  assert.ok(installed, "hawk.yml must pin a toolchain for setup-rust");
-  assert.deepEqual(
-    [...used],
-    [installed],
-    "check-hawk.sh must run Hawk on the toolchain that hawk.yml installs",
-  );
 });
 
 // Git 2.55 starts a detached `git repack -d` after `git commit` when two loose
@@ -2534,6 +2866,21 @@ test("the Check, Lint and contracts, and Windows jobs run each step exactly once
   const napi = indentedBlock(workflow, "napi", 2);
   assert.doesNotMatch(lint, /napi build/);
   assert.match(check, /--partition hash:\$\{\{ matrix\.partition \}\}\/2/);
+  // Partition 1 runs the producer check and the schema drift gate, and
+  // partition 2 runs the runtime-coverage tests. The two partitions then take
+  // about the same time.
+  for (const [step, partition] of [
+    ["Run coverage producer conformance", 1],
+    ["Run runtime-coverage integration tests (feature-gated stub sidecar)", 2],
+    ["Run schema drift gate (feature-gated schema-emit binary)", 1],
+  ]) {
+    const escaped = escapeRegExp(step);
+    assert.match(
+      check,
+      new RegExp(`name: ${escaped}\\n\\s+if: matrix\\.partition == ${partition}\\n`, "u"),
+      `"${step}" must run in partition ${partition}`,
+    );
+  }
   assert.match(check, /partition: \[1, 2\]/);
   for (const job of [check, lint, napi]) {
     assert.match(job, /^    needs: changes$/m);
@@ -2706,6 +3053,56 @@ test("ordinary workflow npm installs suppress dependency lifecycle scripts", () 
       );
     }
   }
+});
+
+test("workflow pnpm installs are frozen and suppress dependency lifecycle scripts", () => {
+  for (const path of ["ci.yml", "commitlint.yml", "contributors.yml"]) {
+    const workflow = readWorkflow(`.github/workflows/${path}`);
+    const installs = workflow
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#") && /\bpnpm install\b/u.test(line));
+    assert.ok(installs.length > 0, `${path} must install with pnpm`);
+    for (const line of installs) {
+      assert.ok(line.includes("--frozen-lockfile"), `${path} resolves a new graph: ${line.trim()}`);
+      assert.ok(
+        line.includes("--ignore-scripts"),
+        `${path} permits dependency lifecycle scripts: ${line.trim()}`,
+      );
+    }
+  }
+});
+
+test("the root manifest pins pnpm through engines only", () => {
+  // pnpm/action-setup fails when its `version` input differs from the root
+  // `packageManager`. The PGO and ecosystem jobs set up pnpm 12 for public
+  // fixtures, so the root cannot use `packageManager`.
+  // `devEngines.packageManager` is not safe either:
+  // - npm fails `npm run` when no entry names npm.
+  // - actions/setup-node turns on npm caching when an entry names npm. Each
+  //   root `setup-node` step without `cache` then fails, because the root has
+  //   no npm lockfile.
+  // - Corepack ignores an array, so Dependabot selects pnpm 10 from the
+  //   lockfile version. pnpm 10 removes the `packageManagerDependencies`
+  //   document, and the frozen pnpm 11 install in CI then fails.
+  // Dependabot reads `engines.pnpm`, and npm and setup-node ignore it.
+  const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
+  assert.equal(rootPackage.packageManager, undefined);
+  assert.equal(rootPackage.devEngines, undefined);
+  // A caret range, so Dependabot selects pnpm 11 and a contributor with a
+  // newer pnpm 11 can still install.
+  assert.match(
+    rootPackage.engines.pnpm,
+    /^\^\d+\.\d+\.\d+$/u,
+    "pin a caret range of one pnpm major",
+  );
+  const lockfile = readFileSync("pnpm-lock.yaml", "utf8");
+  assert.doesNotMatch(lockfile, /^---$/mu, "the root lockfile has one YAML document");
+  assert.doesNotMatch(lockfile, /packageManagerDependencies/u);
+  assert.equal(existsSync("package-lock.json"), false, "the root tools install with pnpm");
+  const settings = readFileSync("pnpm-workspace.yaml", "utf8");
+  assert.match(settings, /^minimumReleaseAge: 10080$/mu);
+  assert.match(settings, /^strictDepBuilds: true$/mu);
+  assert.doesNotMatch(settings, /^packages:/mu, "editors/vscode stays a separate pnpm project");
 });
 
 test("VSIX publishers use reviewed frozen graphs from the validated source commit", () => {
@@ -3161,7 +3558,6 @@ const PULL_REQUEST_WORKFLOWS = [
   "codeql.yml",
   "commitlint.yml",
   "dependabot-auto-merge.yml",
-  "ecosystem.yml",
   "pgo-validate.yml",
   "protocol-parity.yml",
   "signing-migration.yml",

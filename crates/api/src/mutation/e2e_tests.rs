@@ -292,6 +292,102 @@ fn the_plan_uses_the_config_operators_unless_the_caller_names_operators() {
     assert_eq!(operators(&explicit), vec!["arithmetic-operator"]);
 }
 
+/// A project whose test reaches `src/range.ts`, so the plan marks the
+/// mutants of its one crowded line as planned.
+fn sampling_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("dir");
+    let write = |path: &str, text: &str| {
+        let target = dir.path().join(path);
+        fs::create_dir_all(target.parent().expect("parent")).expect("dir");
+        fs::write(target, text).expect("write");
+    };
+    write(
+        "package.json",
+        r#"{"name":"p","type":"module","main":"src/range.ts","devDependencies":{"vitest":"^5.0.0"}}"#,
+    );
+    write(
+        "src/range.ts",
+        "export function inRange(\n  n: number,\n): boolean {\n  return n > 0 && n + 1 < 10;\n}\n",
+    );
+    write(
+        "src/range.test.ts",
+        "import { expect, test } from \"vitest\";\nimport { inRange } from \"./range\";\n\ntest(\"in range\", () => {\n  expect(inRange(3)).toBe(true);\n});\n",
+    );
+    dir
+}
+
+fn write_config(project: &tempfile::TempDir, json: &str) {
+    fs::write(project.path().join(".fallowrc.json"), json).expect("config");
+}
+
+#[test]
+fn the_plan_reads_mutants_per_line_from_the_config_and_an_explicit_option_wins() {
+    let project = sampling_project();
+    let from_none = plan_mutation(&options(project.path(), MutationRunScope::All)).expect("plan");
+    assert_eq!(from_none.counts.sampled_out, 0);
+    write_config(&project, r#"{"mutation":{"mutantsPerLine":1}}"#);
+
+    let from_config = plan_mutation(&options(project.path(), MutationRunScope::All)).expect("plan");
+    assert!(
+        from_config.counts.sampled_out > 0,
+        "{:#?}",
+        from_config.counts
+    );
+    assert_eq!(from_config.counts.pending, from_config.counts.sampled_out);
+
+    let mut explicit = options(project.path(), MutationRunScope::All);
+    explicit.mutants_per_line = Some(1000);
+    let plan = plan_mutation(&explicit).expect("plan");
+    assert_eq!(
+        plan.counts.sampled_out, 0,
+        "the option wins over the config"
+    );
+    assert_eq!(plan.counts.planned, from_none.counts.planned);
+}
+
+#[test]
+fn a_run_of_selected_mutant_ids_never_samples() {
+    let project = sampling_project();
+    let all = plan_mutation(&options(project.path(), MutationRunScope::All)).expect("plan");
+    let ids: Vec<String> = all
+        .mutants
+        .iter()
+        .filter(|mutant| mutant.disposition == fallow_output::MutationPlanDisposition::Planned)
+        .map(|mutant| mutant.location.mutant_id.clone())
+        .collect();
+    assert!(ids.len() > 1, "{ids:?}");
+    write_config(&project, r#"{"mutation":{"mutantsPerLine":1}}"#);
+
+    let mut selected = options(project.path(), MutationRunScope::All);
+    selected.mutant_ids.clone_from(&ids);
+    selected.mutants_per_line = Some(1);
+    let plan = plan_mutation(&selected).expect("plan");
+    assert_eq!(plan.counts.sampled_out, 0, "a recheck never samples");
+    assert_eq!(plan.counts.planned, ids.len());
+}
+
+#[test]
+fn the_plan_reads_function_scope_from_the_config() {
+    let project = sampling_project();
+    let diff_path = project.path().join("param.diff");
+    fs::write(
+        &diff_path,
+        "diff --git a/src/range.ts b/src/range.ts\n--- a/src/range.ts\n+++ b/src/range.ts\n@@ -1,0 +2,1 @@\n+  n: number,\n",
+    )
+    .expect("diff");
+    let changed = || {
+        let mut changed = options(project.path(), MutationRunScope::Changed { base: None });
+        changed.analysis.diff_file = Some(diff_path.clone());
+        changed
+    };
+    let lines = plan_mutation(&changed()).expect("plan");
+    assert_eq!(lines.counts.total, 0, "a parameter line holds no mutant");
+
+    write_config(&project, r#"{"mutation":{"functionScope":true}}"#);
+    let widened = plan_mutation(&changed()).expect("plan");
+    assert!(widened.counts.total > 0, "{:#?}", widened.counts);
+}
+
 #[test]
 fn an_output_path_of_the_caller_does_not_make_the_worktree_dirty() {
     let project = small_project();
@@ -602,6 +698,104 @@ mod end_to_end {
         );
     }
 
+    /// A unified diff that adds line 2 of each file, written outside the
+    /// project so that the worktree stays clean. With `remove`, the diff only
+    /// removes a line.
+    fn diff_file(files: &[&str], remove: bool) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut text = String::new();
+        for file in files {
+            for prefix in ["diff --git a/", "--- a/", "+++ b/"] {
+                text.push_str(prefix);
+                text.push_str(file);
+                if prefix.starts_with("diff") {
+                    text.push_str(" b/");
+                    text.push_str(file);
+                }
+                text.push('\n');
+            }
+            text.push_str(if remove {
+                "@@ -2,1 +1,0 @@\n-// removed\n"
+            } else {
+                "@@ -1,0 +2,1 @@\n+// changed\n"
+            });
+        }
+        let path = dir.path().join("change.diff");
+        fs::write(&path, text).expect("diff");
+        (dir, path)
+    }
+
+    fn changed_options(root: &Path, diff: &Path) -> crate::mutation::MutationRunOptions {
+        let mut changed = options(root, MutationRunScope::Changed { base: None });
+        changed.analysis.diff_file = Some(diff.to_path_buf());
+        changed
+    }
+
+    #[test]
+    fn a_skipped_test_of_a_changed_test_file_gets_a_warning_and_a_test_only_change_starts_no_runner()
+     {
+        let Some(package) = companion_fixture() else {
+            return;
+        };
+        let (_project, root) = vitest_project(&package);
+        let warning = |report: &fallow_output::MutationReport| {
+            report
+                .errors
+                .iter()
+                .find(|error| error.code == fallow_output::SKIPPED_TESTS_CODE)
+                .map(|error| error.message.clone())
+        };
+        let expected = "1 test is skipped or todo: test/math.test.ts:29 (skipped). A skipped test checks nothing, so it cannot kill a mutant. Run each test or remove it.";
+
+        let (_dir, mixed_diff) = diff_file(&["src/math.ts", "test/math.test.ts"], false);
+        let mixed = run_mutation(&changed_options(&root, &mixed_diff)).expect("the run completes");
+        assert_eq!(
+            warning(&mixed).as_deref(),
+            Some(expected),
+            "{:#?}",
+            mixed.errors
+        );
+        assert_eq!(
+            mixed.completion.status,
+            MutationCompletionStatus::Complete,
+            "the warning does not make the run partial"
+        );
+        assert!(mixed.summary.counts.total > 0);
+        assert!(mixed.runner.is_some());
+
+        let (_dir, test_only_diff) = diff_file(&["test/math.test.ts"], false);
+        let test_only =
+            run_mutation(&changed_options(&root, &test_only_diff)).expect("the run completes");
+        assert_eq!(warning(&test_only).as_deref(), Some(expected));
+        assert_eq!(test_only.summary.counts.total, 0, "no source changed");
+        assert!(test_only.runner.is_none(), "the scan starts no companion");
+        assert_eq!(
+            test_only.completion.status,
+            MutationCompletionStatus::Complete
+        );
+
+        let (_dir, deletion_diff) = diff_file(&["test/math.test.ts"], true);
+        let deletion =
+            run_mutation(&changed_options(&root, &deletion_diff)).expect("the run completes");
+        assert_eq!(
+            warning(&deletion).as_deref(),
+            Some(expected),
+            "a removed line counts"
+        );
+
+        let (_dir, source_only_diff) = diff_file(&["src/math.ts"], false);
+        let source_only =
+            run_mutation(&changed_options(&root, &source_only_diff)).expect("the run completes");
+        assert!(warning(&source_only).is_none(), "{:#?}", source_only.errors);
+
+        let full = run_mutation(&options(
+            &root,
+            MutationRunScope::Paths(vec![PathBuf::from("src/math.ts")]),
+        ))
+        .expect("the run completes");
+        assert!(warning(&full).is_none(), "{:#?}", full.errors);
+    }
+
     #[test]
     fn a_second_run_reuses_the_results_until_a_key_file_changes() {
         let Some(package) = companion_fixture() else {
@@ -771,6 +965,30 @@ mod end_to_end {
             return None;
         }
         Some(dunce::canonicalize(package).expect("package path"))
+    }
+
+    /// Node.js 26 removed `--experimental-transform-types`, so no flag loads
+    /// an enum there. A Node.js without the flag skips the test. This is not a
+    /// missing dependency, so `FALLOW_MUTATION_E2E_REQUIRED` does not apply.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skipped end-to-end test says why it did not run"
+    )]
+    fn node_has_transform_types() -> bool {
+        use crate::mutation::discovery::RuntimeKind;
+        let supported = crate::mutation::discovery::discover_runtime(None, &[RuntimeKind::Node])
+            .ok()
+            .and_then(|runtime| {
+                std::process::Command::new(runtime.path)
+                    .args(["--experimental-transform-types", "-e", ""])
+                    .output()
+                    .ok()
+            })
+            .is_some_and(|output| output.status.success());
+        if !supported {
+            eprintln!("skipped: this Node.js has no --experimental-transform-types");
+        }
+        supported
     }
 
     /// Copies `files` of a companion fixture to a new committed repository.
@@ -989,6 +1207,9 @@ mod end_to_end {
     fn a_node_test_run_uses_the_module_flags_of_the_test_script() {
         use crate::mutation::discovery::RuntimeKind;
         if child_runner_package("node-test", RuntimeKind::Node).is_none() {
+            return;
+        }
+        if !node_has_transform_types() {
             return;
         }
         let project = tempfile::tempdir().expect("dir");
@@ -1526,6 +1747,90 @@ mod end_to_end {
             MutationKillMatrixStatus::Unavailable
         );
     }
+    #[test]
+    fn target_matrix_reports_shared_and_unique_kills_of_real_adapter_runs() {
+        use crate::mutation::{Operator, discovery::RuntimeKind};
+        use fallow_output::{MutationKillMatrixStatus, MutationTargetOnlyKill};
+        if child_runner_package("node-test", RuntimeKind::Node).is_none() {
+            return;
+        }
+        let (_project, root) = matrix_project();
+        let mut config = options(&root, MutationRunScope::All);
+        config.operators = Some(vec![Operator::ArithmeticOperator]);
+        config.analysis.no_cache = false;
+        config.kill_matrix_targets = vec!["./test/math.test.ts::A".to_owned()];
+        let one = run_mutation(&config).expect("target matrix");
+        let functions_with = |report: &fallow_output::MutationReport, status: MutantStatus| {
+            let mut names: Vec<String> = report
+                .mutants
+                .iter()
+                .filter(|mutant| mutant.status == status)
+                .filter_map(|mutant| mutant.location.function.clone())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        assert_eq!(functions_with(&one, MutantStatus::Killed), ["add"]);
+        assert_eq!(
+            functions_with(&one, MutantStatus::Pruned),
+            ["double", "multiply", "subtract"]
+        );
+        assert!(one.mutants.iter().all(|mutant| {
+            mutant.status != MutantStatus::Pruned
+                || mutant.prune_reason.as_deref() == Some("no-target-coverage")
+        }));
+        assert_eq!(
+            one.kill_matrix.status,
+            MutationKillMatrixStatus::Complete,
+            "{:#?}",
+            one.kill_matrix
+        );
+        assert_eq!(one.kill_matrix.candidates, ["test/math.test.ts::A"]);
+        assert_eq!(one.kill_matrix.tests.len(), 1);
+        assert_eq!(
+            one.kill_matrix.tests[0].target_only_kills,
+            Some(Vec::new()),
+            "B also kills each add mutant"
+        );
+
+        config.kill_matrix_targets = vec![
+            "test/math.test.ts::A".to_owned(),
+            "test/math.test.ts::B".to_owned(),
+        ];
+        let two = run_mutation(&config).expect("target matrix of two tests");
+        assert!(
+            two.mutants.iter().all(|mutant| !mutant.cached),
+            "a result of other targets is no target evidence"
+        );
+        assert_eq!(two.kill_matrix.status, MutationKillMatrixStatus::Complete);
+        assert_eq!(two.kill_matrix.candidates, ["test/math.test.ts::A"]);
+        let (a, b) = (&two.kill_matrix.tests[0], &two.kill_matrix.tests[1]);
+        assert!(a.unique_kills.is_empty());
+        assert_eq!(
+            a.target_only_kills,
+            Some(
+                a.kills
+                    .iter()
+                    .map(|mutant| MutationTargetOnlyKill {
+                        mutant_id: mutant.clone(),
+                        targets: vec!["test/math.test.ts::B".to_owned()],
+                    })
+                    .collect()
+            )
+        );
+        assert!(!b.unique_kills.is_empty(), "only B kills subtract mutants");
+        let again = run_mutation(&config).expect("cached target matrix");
+        assert!(
+            again
+                .mutants
+                .iter()
+                .filter(|mutant| mutant.status != MutantStatus::Pruned)
+                .all(|mutant| mutant.cached)
+        );
+        assert_eq!(again.kill_matrix, two.kill_matrix);
+    }
+
     #[test]
     fn project_prefixed_ids_keep_file_provenance_and_export_notes() {
         use crate::mutation::Operator;

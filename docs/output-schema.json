@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Fallow JSON Output Schemas",
-  "description": "Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field. A `--lean` document is not a root branch: it validates against `LeanOutput`.",
+  "description": "Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`, `mutation-tasks`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field. A `--lean` document is not a root branch: it validates against `LeanOutput`.",
   "oneOf": [
     {
       "$ref": "#/definitions/FallowOutput"
@@ -649,6 +649,13 @@
           },
           "description": "Class members never accessed. Wrapped in\n[`UnusedClassMemberFinding`]: same inner [`UnusedMember`] struct as\n`unused_enum_members`, with a class-targeted fix description and the\n`auto_fixable: false` default to reflect dependency-injection\npatterns."
         },
+        "unused_namespace_members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnusedNamespaceMemberFinding"
+          },
+          "description": "Exported members of an exported TypeScript namespace that no code\nreads. Wrapped in [`UnusedNamespaceMemberFinding`]: same inner\n[`UnusedMember`] struct as `unused_enum_members`. `member_name` is the\ndotted path from the exported namespace (`Inner.x`)."
+        },
         "unused_store_members": {
           "type": "array",
           "items": {
@@ -670,12 +677,26 @@
           },
           "description": "Dependencies used in code but not listed in package.json. Wrapped in\n[`UnlistedDependencyFinding`]."
         },
+        "unlisted_binaries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnlistedBinaryFinding"
+          },
+          "description": "Binaries that package.json scripts or process calls run, but that no\ninstalled or listed package provides. Wrapped in\n[`UnlistedBinaryFinding`]."
+        },
         "duplicate_exports": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/DuplicateExportFinding"
           },
           "description": "Exports with the same name across multiple modules. Wrapped in\n[`DuplicateExportFinding`] so each entry carries a typed `actions`\narray natively, with the position-0 `add-to-config` `ignoreExports`\nsnippet wired in at wrapper construction."
+        },
+        "duplicate_export_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DuplicateExportAliasFinding"
+          },
+          "description": "One module that exports one binding under two or more names. Wrapped\nin [`DuplicateExportAliasFinding`]. Default severity is `warn`."
         },
         "type_only_dependencies": {
           "type": "array",
@@ -1295,6 +1316,13 @@
           },
           "description": "Class members never accessed. Wrapped in\n[`UnusedClassMemberFinding`]: same inner [`UnusedMember`] struct as\n`unused_enum_members`, with a class-targeted fix description and the\n`auto_fixable: false` default to reflect dependency-injection\npatterns."
         },
+        "unused_namespace_members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnusedNamespaceMemberFinding"
+          },
+          "description": "Exported members of an exported TypeScript namespace that no code\nreads. Wrapped in [`UnusedNamespaceMemberFinding`]: same inner\n[`UnusedMember`] struct as `unused_enum_members`. `member_name` is the\ndotted path from the exported namespace (`Inner.x`)."
+        },
         "unused_store_members": {
           "type": "array",
           "items": {
@@ -1316,12 +1344,26 @@
           },
           "description": "Dependencies used in code but not listed in package.json. Wrapped in\n[`UnlistedDependencyFinding`]."
         },
+        "unlisted_binaries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnlistedBinaryFinding"
+          },
+          "description": "Binaries that package.json scripts or process calls run, but that no\ninstalled or listed package provides. Wrapped in\n[`UnlistedBinaryFinding`]."
+        },
         "duplicate_exports": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/DuplicateExportFinding"
           },
           "description": "Exports with the same name across multiple modules. Wrapped in\n[`DuplicateExportFinding`] so each entry carries a typed `actions`\narray natively, with the position-0 `add-to-config` `ignoreExports`\nsnippet wired in at wrapper construction."
+        },
+        "duplicate_export_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DuplicateExportAliasFinding"
+          },
+          "description": "One module that exports one binding under two or more names. Wrapped\nin [`DuplicateExportAliasFinding`]. Default severity is `warn`."
         },
         "type_only_dependencies": {
           "type": "array",
@@ -2182,6 +2224,14 @@
         "provenance": {
           "description": "Provenance an agent reads to self-attenuate confidence (mirrors\nthe cloud runtime-context `provenance`). F4: context only.",
           "$ref": "#/definitions/RuntimeCoverageProvenance"
+        },
+        "cloud_context": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Fields of the Fallow Cloud runtime-context answer that the CLI does not\nread, as the cloud sent them: for example `capabilities`, `page`,\n`context_unavailable` and `commit_shas`. Cloud mode only; omitted in\nlocal mode. Context only."
         }
       },
       "required": [
@@ -2648,6 +2698,14 @@
             }
           ],
           "description": "The discriminator inputs that produced this verdict (#321), emitted so an\nagent can reproduce it and see the confidence cap. `None` for findings\nnot built from the merge pipeline (e.g. baseline round-trips). Omitted\nfrom JSON when absent."
+        },
+        "cloud_context": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Production signals of the function from the Fallow Cloud runtime-context\nrow, as the cloud sent them: for example `errors`, `performance` (with\n`cpu` and `browser`), `branches`, `covered_by_test` and\n`test_hit_count`. The block holds only the row fields that the CLI does\nnot read for the verdict, and a newer cloud can add keys. Cloud mode\nonly; omitted in local mode. Context only: these signals never change\nthe verdict, the confidence or the actions."
         }
       },
       "required": [
@@ -2716,6 +2774,14 @@
             }
           ],
           "description": "Per-call cost inputs and the speed-work score for this hot function.\nOmitted when the hot path has no `stable_id` or no static counterpart\nin this checkout."
+        },
+        "cloud_context": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Production signals of the hot function from the Fallow Cloud\nruntime-context row, in the shape of `RuntimeCoverageFinding::cloud_context`.\nCloud mode only; omitted in local mode. Context only."
         }
       },
       "required": [
@@ -2793,6 +2859,14 @@
         "risk_band": {
           "description": "Risk band derived from caller counts and traffic-weighted reach.",
           "$ref": "#/definitions/RuntimeCoverageRiskBand"
+        },
+        "cloud_context": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Fields of the Fallow Cloud blast-radius row that the CLI does not read,\nas the cloud sent them: for example `production_callers`,\n`caller_sites`, `test_caller_count`, `non_runtime_caller_count` and\n`context_unavailable_reason`. Cloud mode only, and only when the cloud\nsent the blast-radius rows. Context only: the risk band does not read it."
         }
       },
       "required": [
@@ -5360,14 +5434,14 @@
         },
         "parent_name": {
           "type": "string",
-          "description": "Name of the parent enum or class."
+          "description": "Name of the parent enum, class, store, or exported namespace."
         },
         "member_name": {
           "type": "string",
-          "description": "Name of the unused member."
+          "description": "Name of the unused member. A member of a nested namespace has the dotted\npath from the exported namespace (`Inner.x`)."
         },
         "kind": {
-          "description": "Whether this is an enum member, class method, or class property.",
+          "description": "The kind of member: enum member, class method, class property, store\nmember, or namespace member.",
           "$ref": "#/definitions/MemberKind"
         },
         "line": {
@@ -5387,7 +5461,7 @@
         "line",
         "col"
       ],
-      "description": "An unused enum or class member."
+      "description": "An unused enum, class, store, or namespace member."
     },
     "UnresolvedImport": {
       "type": "object",
@@ -5739,7 +5813,7 @@
         "path",
         "line"
       ],
-      "description": "A package manager catalog entry that no workspace package references via\nthe `catalog:` protocol.\n\nThe default catalog uses `catalog_name: \"default\"`. Named catalogs\n(`catalogs.<name>`) use their declared name. The source file is\n`pnpm-workspace.yaml` for pnpm catalogs or root `package.json` for Bun\ncatalogs."
+      "description": "A package manager catalog entry that no workspace package references via\nthe `catalog:` protocol.\n\nThe default catalog uses `catalog_name: \"default\"`. Named catalogs\n(`catalogs.<name>`) use their declared name. The source file is the\n`pnpm-workspace.yaml` of the root or of a nested pnpm project, or the\nroot `package.json` for Bun catalogs."
     },
     "EmptyCatalogGroup": {
       "type": "object",
@@ -6245,6 +6319,10 @@
           "type": "integer",
           "description": "Unused class members."
         },
+        "unused_namespace_members": {
+          "type": "integer",
+          "description": "Unused namespace members."
+        },
         "unused_store_members": {
           "type": "integer",
           "description": "Unused store members."
@@ -6309,9 +6387,17 @@
           "type": "integer",
           "description": "Dependencies imported but absent from `package.json`."
         },
+        "unlisted_binaries": {
+          "type": "integer",
+          "description": "Binaries that scripts or process calls run, but that no installed or\nlisted package provides."
+        },
         "duplicate_exports": {
           "type": "integer",
           "description": "Same-named exports declared in more than one module."
+        },
+        "duplicate_export_aliases": {
+          "type": "integer",
+          "description": "Bindings that one module exports under two or more names."
         },
         "type_only_dependencies": {
           "type": "integer",
@@ -7064,6 +7150,13 @@
           },
           "description": "Class members never accessed. Wrapped in\n[`UnusedClassMemberFinding`]: same inner [`UnusedMember`] struct as\n`unused_enum_members`, with a class-targeted fix description and the\n`auto_fixable: false` default to reflect dependency-injection\npatterns."
         },
+        "unused_namespace_members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnusedNamespaceMemberFinding"
+          },
+          "description": "Exported members of an exported TypeScript namespace that no code\nreads. Wrapped in [`UnusedNamespaceMemberFinding`]: same inner\n[`UnusedMember`] struct as `unused_enum_members`. `member_name` is the\ndotted path from the exported namespace (`Inner.x`)."
+        },
         "unused_store_members": {
           "type": "array",
           "items": {
@@ -7085,12 +7178,26 @@
           },
           "description": "Dependencies used in code but not listed in package.json. Wrapped in\n[`UnlistedDependencyFinding`]."
         },
+        "unlisted_binaries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnlistedBinaryFinding"
+          },
+          "description": "Binaries that package.json scripts or process calls run, but that no\ninstalled or listed package provides. Wrapped in\n[`UnlistedBinaryFinding`]."
+        },
         "duplicate_exports": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/DuplicateExportFinding"
           },
           "description": "Exports with the same name across multiple modules. Wrapped in\n[`DuplicateExportFinding`] so each entry carries a typed `actions`\narray natively, with the position-0 `add-to-config` `ignoreExports`\nsnippet wired in at wrapper construction."
+        },
+        "duplicate_export_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DuplicateExportAliasFinding"
+          },
+          "description": "One module that exports one binding under two or more names. Wrapped\nin [`DuplicateExportAliasFinding`]. Default severity is `warn`."
         },
         "type_only_dependencies": {
           "type": "array",
@@ -10427,6 +10534,26 @@
               ]
             }
           ]
+        },
+        {
+          "description": "`fallow mutation tasks --format json`. The open tasks of a saved report as one\nbatch: each `survived` and `no_coverage` mutant with its source lines before\nand after the mutation. Runs no project code.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/MutationTasksOutput"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "const": "mutation-tasks"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            }
+          ]
         }
       ],
       "title": "fallow --format json (typed root)",
@@ -11168,14 +11295,14 @@
         },
         "parent_name": {
           "type": "string",
-          "description": "Name of the parent enum or class."
+          "description": "Name of the parent enum, class, store, or exported namespace."
         },
         "member_name": {
           "type": "string",
-          "description": "Name of the unused member."
+          "description": "Name of the unused member. A member of a nested namespace has the dotted\npath from the exported namespace (`Inner.x`)."
         },
         "kind": {
-          "description": "Whether this is an enum member, class method, or class property.",
+          "description": "The kind of member: enum member, class method, class property, store\nmember, or namespace member.",
           "$ref": "#/definitions/MemberKind"
         },
         "line": {
@@ -11250,14 +11377,14 @@
         },
         "parent_name": {
           "type": "string",
-          "description": "Name of the parent enum or class."
+          "description": "Name of the parent enum, class, store, or exported namespace."
         },
         "member_name": {
           "type": "string",
-          "description": "Name of the unused member."
+          "description": "Name of the unused member. A member of a nested namespace has the dotted\npath from the exported namespace (`Inner.x`)."
         },
         "kind": {
-          "description": "Whether this is an enum member, class method, or class property.",
+          "description": "The kind of member: enum member, class method, class property, store\nmember, or namespace member.",
           "$ref": "#/definitions/MemberKind"
         },
         "line": {
@@ -12995,7 +13122,7 @@
             "kind",
             "pattern"
           ],
-          "description": "A positive workspace pattern names a directory that does not exist.\nThe check reads the literal part of the pattern before the first\nsegment with a glob character (`vite` for `vite/packages/*`). A pattern\nwithout a literal part (`**/pkg`) never gets this diagnostic, and a\nliteral directory that exists but holds no package does not get it\neither. `path` is the file that declares the pattern, or the project\nroot for an entry of the fallow config `workspaces.patterns`.\n\nA repository that clones other repositories into the workspace in CI\ndeclares such patterns. The packages there can consume catalog\nentries, so the run does not report `unused-catalog-entries` while a\npattern of this kind exists."
+          "description": "A positive workspace pattern names a directory that does not exist.\nThe check reads the literal part of the pattern before the first\nsegment with a glob character (`vite` for `vite/packages/*`). A pattern\nwithout a literal part (`**/pkg`) never gets this diagnostic, and a\nliteral directory that exists but holds no package does not get it\neither. `path` is the file that declares the pattern, or the project\nroot for an entry of the fallow config `workspaces.patterns`.\n\nA repository that clones other repositories into the workspace in CI\ndeclares such patterns. The packages there can consume catalog\nentries, so the run does not report `unused-catalog-entries` while a\npattern of this kind exists. For a `packages` entry of the\n`pnpm-workspace.yaml` of a nested pnpm project, the pattern is\nrelative to that file, and the run does not report the unused entries\nof that catalog only."
         },
         {
           "type": "object",
@@ -13008,7 +13135,7 @@
           "required": [
             "kind"
           ],
-          "description": "A directory has its own `package.json` and `pnpm-workspace.yaml`, and\nno workspace pattern of the root manifests declares it. pnpm installs\nit as an independent project. Fallow analyzes it as a workspace, so its\n`package.json` owns its files and dependencies, and its `catalog:`\nreferences are not checked against the root catalog.\n\nInformation only: nothing is lost from the analysis, so\n`degrades_analysis` is false."
+          "description": "A directory has its own `package.json` and `pnpm-workspace.yaml`, and\nno workspace pattern of the root manifests declares it. pnpm installs\nit as an independent project. Fallow analyzes it as a workspace, so its\n`package.json` owns its files and dependencies. The members that the\n`packages` list of its `pnpm-workspace.yaml` declares are workspaces\ntoo. The `catalog:` references of the project and its members resolve\nagainst its own catalog, not against the root catalog.\n\nInformation only: nothing is lost from the analysis, so\n`degrades_analysis` is false."
         },
         {
           "type": "object",
@@ -13505,7 +13632,7 @@
             "key",
             "reason"
           ],
-          "description": "A framework plugin read a build config and could not read one of its\nkeys in full, so part of what the key declares never reached the\nanalysis. `path` names the config file.\n\nThe reader is syntactic, so a key whose value is computed at build time\nis invisible to it: a Module Federation `exposes: makeExposes()` or a\n`remotes` map spread from an environment module declares entries this\nrun does not know about. The consequence is a finding, not a missing\nnumber: an unread `exposes` target is not registered as an entry point\nand its file can surface as `unused-file`, and an unread `remotes` alias\nis not treated as provided by a remote container and its import can\nsurface as an unlisted dependency.\n\nRecorded by the plugin stage, which runs before analysis and is not\ncached, so the entry is present on a warm cache too. It used to be a\nbare `tracing::warn!` from inside the plugin, so it reached no envelope\nand no CI consumer (issue #2736).\n\nA source file that calls the Module Federation runtime API gets the same\nentry: `path` names the source file, `key` names the runtime function\n(`registerRemotes`, `loadRemote`, `init`, `createInstance`) and\n`reason` is `dynamic-argument` when the call receives a value that is\nnot a static literal. The analysis records it from the facts of the\nparse, which a warm cache restores (issue #2795). A `.vue` or `.svelte`\nfile gets it for a call in its `<script>` blocks (issue #2876)."
+          "description": "A framework plugin read a build config and could not read one of its\nkeys in full, so part of what the key declares never reached the\nanalysis. `path` names the config file.\n\nThe reader is syntactic, so a key whose value is computed at build time\nis invisible to it: a Module Federation `exposes: makeExposes()` or a\n`remotes` map spread from an environment module declares entries this\nrun does not know about. The consequence is a finding, not a missing\nnumber: an unread `exposes` target is not registered as an entry point\nand its file can surface as `unused-file`, and an unread `remotes` alias\nis not treated as provided by a remote container and its import can\nsurface as an unlisted dependency.\n\nRecorded by the plugin stage, which runs before analysis and is not\ncached, so the entry is present on a warm cache too. A bare\n`tracing::warn!` from inside the plugin reaches no envelope and no CI\nconsumer (issue #2736).\n\nA source file that calls the Module Federation runtime API gets the same\nentry: `path` names the source file, `key` names the runtime function\n(`registerRemotes`, `loadRemote`, `init`, `createInstance`) and\n`reason` is `dynamic-argument` when the call receives a value that is\nnot a static literal. The analysis records it from the facts of the\nparse, which a warm cache restores (issue #2795). A `.vue` or `.svelte`\nfile gets it for a call in its `<script>` blocks (issue #2876)."
         },
         {
           "type": "object",
@@ -13699,6 +13826,29 @@
             "reason"
           ],
           "description": "An `overrides` rule cannot change the result (issue #4065). `reason` is\n`project-level` (fallow reads only the top-level severity of the rule)\nor `base-rule-off` (the top-level rule is off after CLI flags, so its\ndetector does not run). The token set is open. `path` is the root. Not\ndegraded, and no finding or exit code changes."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "requested-rule-off"
+            },
+            "rule": {
+              "type": "string",
+              "description": "The canonical rule name in `rules`."
+            },
+            "flag": {
+              "type": "string",
+              "description": "The canonical CLI selector of the request, such as `--unused-deps`.\nA typed API or MCP request reports the same selector."
+            }
+          },
+          "required": [
+            "kind",
+            "rule",
+            "flag"
+          ],
+          "description": "An explicit issue-type selection asked for a rule that the config sets\nto `off`, so that check did not run (issue #4067). One entry per rule.\nThe opt-in flags that turn their rule on and a run with no selection\nnever report it. `path` is the root. Not degraded: the run measured\nwhat the config asked for, and no finding or exit code changes."
         },
         {
           "type": "object",
@@ -14795,7 +14945,7 @@
             "string",
             "null"
           ],
-          "description": "The catalogue category id (e.g. `\"dangerous-html\"`). `Some` for\n`TaintedSink`. For `ClientServerLeak` this is `None` for the secret-leak\nfinding, and `Some(\"server-only-import\")` when a `\"use client\"` cone\nreaches server-only code."
+          "description": "The catalogue category id (e.g. `\"dangerous-html\"`). `Some` for\n`TaintedSink`. For `ClientServerLeak` it is `\"client-server-leak\"` for the\nsecret leak (older releases omit it) or `\"server-only-import\"` when a\n`\"use client\"` cone reaches server-only code."
         },
         "cwe": {
           "type": [
@@ -15264,7 +15414,7 @@
         },
         "is_internal_dependency": {
           "type": "boolean",
-          "description": "Whether the package is a generated or platform-specific dependency\npackage rather than a hand-authored workspace."
+          "description": "Whether another workspace of the project lists this package as a\ndependency."
         }
       },
       "required": [
@@ -15460,7 +15610,7 @@
             "string",
             "null"
           ],
-          "description": "Catalogue category id of the sink (e.g. `\"dangerous-html\"`). For\n`client-server-leak` this is `None` for the secret-leak finding, and\n`Some(\"server-only-import\")` when a `\"use client\"` cone reaches\nserver-only code."
+          "description": "Catalogue category id of the sink (e.g. `\"dangerous-html\"`). For\n`client-server-leak` this is `\"client-server-leak\"` for the secret-leak\nfinding, and `\"server-only-import\"` when a `\"use client\"` cone reaches\nserver-only code. Older releases left it absent for the secret leak."
         },
         "cwe": {
           "type": [
@@ -16841,12 +16991,12 @@
         {
           "type": "string",
           "const": "active",
-          "description": "The override matches a finding that still needs the raised ceiling."
+          "description": "The override is in force on the matched unit. Either it raises a\nceiling that the unit needs to pass, or it lowers a ceiling that the\nunit breaches. In the second case `outstanding` names the breach."
         },
         {
           "type": "string",
           "const": "stale",
-          "description": "The override is not what keeps the matched unit quiet, so it can go:\neither the unit passes the global thresholds on its own, or an inline\nsuppression already covers it."
+          "description": "The override changes no result on the matched unit, so it can go:\neither the unit gives the same result with the global thresholds, or\nan inline suppression already covers it."
         },
         {
           "type": "string",
@@ -17290,14 +17440,14 @@
         },
         "parent_name": {
           "type": "string",
-          "description": "Name of the parent enum or class."
+          "description": "Name of the parent enum, class, store, or exported namespace."
         },
         "member_name": {
           "type": "string",
-          "description": "Name of the unused member."
+          "description": "Name of the unused member. A member of a nested namespace has the dotted\npath from the exported namespace (`Inner.x`)."
         },
         "kind": {
-          "description": "Whether this is an enum member, class method, or class property.",
+          "description": "The kind of member: enum member, class method, class property, store\nmember, or namespace member.",
           "$ref": "#/definitions/MemberKind"
         },
         "line": {
@@ -18397,6 +18547,10 @@
           "type": "integer",
           "description": "Distinct animation names referenced via `animation` / `animation-name`\nthat resolve to no `@keyframes` definition anywhere (the used-but-\nundefined direction). Located in `undefined_keyframes`; usually a typo or\na removed animation."
         },
+        "keyframes_unchecked": {
+          "type": "integer",
+          "description": "`@keyframes` with no literal reference that a Sass or Less source\ndefines and that the unreferenced check skips. A Sass or Less\nanimation value with a variable or an interpolation that fallow cannot\nresolve can name any such block. These are not in\n`keyframes_unreferenced`. A `@keyframes` block in plain CSS is always\nchecked."
+        },
         "scoped_unused_classes": {
           "type": "integer",
           "description": "Total Vue `<style scoped>` classes used nowhere else in their component\n(cleanup candidates), across all SFCs."
@@ -18489,6 +18643,7 @@
         "keyframes_defined",
         "keyframes_unreferenced",
         "keyframes_undefined",
+        "keyframes_unchecked",
         "scoped_unused_classes",
         "duplicate_declaration_blocks",
         "duplicate_declarations_total",
@@ -20742,7 +20897,7 @@
         {
           "type": "string",
           "const": "security-check-removed",
-          "description": "A security check or step was removed from CI."
+          "description": "A security check or step was removed from CI, or a security sink in a\nsource file was replaced by another sink of the same class or moved out\nof the static sink view."
         }
       ],
       "description": "The category of a single weakening signal."
@@ -23261,7 +23416,7 @@
         "message",
         "exit_code"
       ],
-      "description": "Structured JSON error emitted on stdout when `--format json` is active and a\ncommand fails. It carries no `kind` discriminator: it is distinguished from\nthe kind-tagged success envelopes by the required `error: true` field, and is\na document-root branch alongside `FallowOutput` and `CodeClimateOutput` in\n`docs/output-schema.json`. Agents that pass `--format json` and observe a\nnon-zero exit code parse this shape from stdout."
+      "description": "Structured JSON error that a tool writes to stdout when `--format json` is\nactive and a command fails. It has no `kind` discriminator. The required\n`error: true` member separates it from a success envelope, which carries a\n`kind`. The error document is one of the root branches of the output\nschema. A consumer that passes `--format json` and sees a non-zero exit\ncode parses this shape from stdout."
     },
     "TypeAwareMeta": {
       "type": "object",
@@ -25144,6 +25299,13 @@
             "$ref": "#/definitions/TracedReExport"
           },
           "description": "Re-exports declared by this file."
+        },
+        "entry_script": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The package.json script key that makes this file an entry point, e.g.\n`build`. Absent when no script makes the file an entry point\n(issue #4175)."
         },
         "sources": {
           "type": "array",
@@ -28672,42 +28834,42 @@
         },
         "enforced": {
           "type": "boolean",
-          "description": "True when a `fail` from this gate makes the run exit non-zero. False\nwhen the verdict is published for information only: the gate was never\narmed, the run was told never to fail, or the combined machine formats\nexit 0 for the gate (bare `fallow` without `--fail-on-issues`)."
+          "description": "True when a `fail` from this gate makes the run exit non-zero. False\nwhen the tool publishes the verdict for information only: no flag or\nconfig armed the gate, the run was told never to fail, or the output\nformat exits 0 for the gate."
         },
         "observed": {
           "type": [
             "number",
             "null"
           ],
-          "description": "The measured value the gate compared, when there is one: the duplication\npercentage, the health score, the number of findings at or above the\nseverity floor, the number of `error` findings of `health-findings` and\nof `error-severity-findings`, or\nthe number of files in `files`. Whole numbers are\ncarried as JSON numbers, so a count of three reads as `3.0`. Absent for\ngates that compare no number."
+          "description": "The measured value that the gate compared, when there is one: for\nexample a percentage, a score, a number of findings, or the number of\nfiles in `files`. A whole number is a JSON number, so a count of three\nreads as `3.0`. Absent for a gate that compares no number."
         },
         "threshold": {
           "type": [
             "number",
             "null"
           ],
-          "description": "The configured limit `observed` was compared against, when there is one.\nAbsent for gates that compare no number."
+          "description": "The configured limit that the gate compared `observed` against, when\nthere is one. Absent for a gate that compares no number."
         },
         "threshold_label": {
           "type": [
             "string",
             "null"
           ],
-          "description": "How the limit was spelled, for a gate whose `threshold` number does not\ncarry its own unit. `health-min-severity` sets it to the severity floor\n(`moderate`, `high` or `critical`); `health-findings` and\n`error-severity-findings` set it to `error`, the rule severity they\ncount; `regression` sets it to the\ntolerance as the user wrote it (`\"50%\"` or `\"5\"`), because `threshold`\nthere is the allowance in issues and the percentage would otherwise be\nunrecoverable on the grouped envelope, which carries no `regression`\nobject. Absent for gates whose numbers speak for themselves."
+          "description": "How the limit was spelled, for a gate whose `threshold` number does not\ncarry its unit. Examples are a severity floor such as `high`, the rule\nseverity that the gate counts such as `error`, or a tolerance as the\nuser wrote it, such as `\"50%\"`. Each gate name documents its label.\nAbsent for a gate whose numbers have a clear meaning without a label."
         },
         "files": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/GateFile"
           },
-          "description": "The files the gate judged, for a gate that judges files rather than a\nnumber. Only `parse-error` sets it: one item per file that did not\nparse cleanly, sorted by path. Absent when the list is empty."
+          "description": "The files that the gate judged, for a gate that judges files and not a\nnumber. One item for each file, sorted by path. Absent when the list is\nempty."
         }
       },
       "required": [
         "status",
         "enforced"
       ],
-      "description": "One gate's verdict on one run.\n\n`status` and `enforced` answer different questions and legitimately\ndisagree. `status` is what the rule concluded; `enforced` is whether a\n`fail` from this gate would make the run exit non-zero. A\n`health --report-only` run is an explicit request never to fail, so a\nfailing gate there reports `status: fail` with `enforced: false`, and a\nstale-baseline verdict published without `--fail-on-stale-baseline` reports\nthe same pair.\n\n**A gate fails the build when `status` is `fail` AND `enforced` is true.**\nNeither member decides it alone: `enforced` is true on every armed gate,\nincluding the ones that passed, so gating on it by itself fails every run\nthat armed anything. Read `status` on its own to decide what to say, and\nremember that `warn` and `skipped` are neither a pass nor a failure."
+      "description": "One gate's verdict on one run.\n\n`status` and `enforced` answer different questions, and they can disagree.\n`status` is what the rule concluded. `enforced` tells if a `fail` from this\ngate makes the run exit non-zero. A run that was told never to fail reports\na failed gate as `status: fail` with `enforced: false`.\n\n**A gate fails the build when `status` is `fail` AND `enforced` is true.**\nOne member alone does not decide it. `enforced` is true on every armed\ngate, also on a gate that passed. Thus a gate rule on `enforced` alone\nfails every run that armed a gate. Read `status` alone to decide what to\nsay. `warn` and `skipped` are not a pass and not a failure."
     },
     "GateStatus": {
       "oneOf": [
@@ -28719,7 +28881,7 @@
         {
           "type": "string",
           "const": "warn",
-          "description": "The gate ran and reached a warn tier that does not fail the run. Only\n`audit-verdict` can report this today."
+          "description": "The gate ran and reached a warn tier that does not fail the run. Only a\ngate with a warn tier reports this value."
         },
         {
           "type": "string",
@@ -28729,10 +28891,10 @@
         {
           "type": "string",
           "const": "skipped",
-          "description": "The gate could not judge this run and deliberately stood down: a\nchange-scoped baseline comparison, `health --report-only`, or a security\nadvisory shadowed by a configured gate. Distinct from `pass`, which\nasserts the condition was evaluated and did not hold."
+          "description": "The gate could not judge this run and stood down on purpose. For\nexample, the run was told never to fail, or a different gate decides\nthe run. This is not `pass`: `pass` says that the gate evaluated the\ncondition and the condition did not hold."
         }
       ],
-      "description": "What a gate concluded on this run.\n\nFour-valued rather than a boolean because audit's verdict has a warn tier\n(`crates/cli/src/cli_report.rs` maps it onto three conclusions) and because\na gate can stand down without passing. Widening a published boolean later\nwould retype a required field and bump every carrying envelope, so the width\nis decided here."
+      "description": "What a gate concluded on this run.\n\nThe status has four values, not two. A verdict can have a warn tier that\ndoes not fail the run, and a gate can stand down without a pass. A change\nfrom a boolean to a wider type later would change the type of a required\nmember and the version of each envelope that carries it."
     },
     "GateName": {
       "oneOf": [
@@ -28744,7 +28906,7 @@
         {
           "type": "string",
           "const": "regression",
-          "description": "`--fail-on-regression`: issue counts grew past `--tolerance` compared\nwith the regression baseline."
+          "description": "`--fail-on-regression`: issue counts grew past `--tolerance` compared\nwith the regression baseline. `threshold` is the allowance in issues.\n`threshold_label` is the tolerance as the user wrote it (`\"50%\"` or\n`\"5\"`), because the grouped envelope carries no `regression` object."
         },
         {
           "type": "string",
@@ -28759,7 +28921,7 @@
         {
           "type": "string",
           "const": "duplication-threshold",
-          "description": "`--threshold`: duplication exceeded the configured percentage."
+          "description": "`--threshold`: duplication exceeded the configured percentage.\n`observed` is the duplication percentage."
         },
         {
           "type": "string",
@@ -28769,12 +28931,12 @@
         {
           "type": "string",
           "const": "health-min-score",
-          "description": "`--min-score`: the health score fell below the configured minimum."
+          "description": "`--min-score`: the health score fell below the configured minimum.\n`observed` is the health score."
         },
         {
           "type": "string",
           "const": "health-min-severity",
-          "description": "`--min-severity`: at least one complexity finding reached the configured\nseverity. One branch of the findings gate; see [`Self::HealthFindings`]."
+          "description": "`--min-severity`: at least one complexity finding reached the configured\nseverity. One branch of the findings gate; see [`Self::HealthFindings`].\n`observed` is the number of findings at or above the floor, and\n`threshold_label` is the floor (`moderate`, `high` or `critical`)."
         },
         {
           "type": "string",
@@ -28814,17 +28976,17 @@
         {
           "type": "string",
           "const": "parse-error",
-          "description": "`--fail-on-parse-error` or the `failOnParseError` config key: at least\none source file did not parse cleanly (a `source-parse-degraded` or\n`source-nesting-too-deep` entry in `workspace_diagnostics[]`). The\nentry lists each such file in `files`. Never armed by default, because\nthe parser also rejects valid syntax that is newer than the parser."
+          "description": "`--fail-on-parse-error` or the `failOnParseError` config key: at least\none source file did not parse cleanly (a `source-parse-degraded` or\n`source-nesting-too-deep` entry in `workspace_diagnostics[]`). The\nentry lists each such file in `files`, with the same facts as the\ndiagnostic of that file, so a consumer can act without a join. A file\nwith a `source-nesting-too-deep` entry has `reason: nesting-too-deep`.\nThe gate is never armed by default, because\nthe parser also rejects valid syntax that is newer than the parser."
         }
       ],
-      "description": "Which gate an outcome describes.\n\nTaken from the exit-code sites rather than from any integration's input\nlist, because a gate a consumer cannot name is exactly the one whose verdict\ngoes missing. Serialized as kebab-case and published as an open set."
+      "description": "Which gate an outcome describes.\n\nTaken from the exit-code sites rather than from any integration's input\nlist, because a gate a consumer cannot name is exactly the one whose verdict\ngoes missing. Serialized as kebab-case and published as an open set: a name\nthat a consumer does not recognize means \"some gate\", not an error.\n\nThe default exit rule of a command is always in `gate_outcomes`, also when\nno flag armed a gate: `error-severity-findings` on `dead-code`, `check` and\nthe combined run (with `health-findings` when the combined run analyzed\nhealth), `health-findings` on `health`, `security-advisory` on `security`\nand `audit-verdict` on `audit`. `dupes` has no default exit rule, so a\n`dupes` run that armed no gate carries no object and always exits 0. The\ntyped programmatic API runs no CLI gate and leaves the object absent.\n\nA gate reports `skipped` when it stands down: a change-scoped baseline\ncomparison, `health --report-only`, or a security advisory that a\nconfigured `--gate` shadows. Only `audit-verdict` reports `warn`."
     },
     "GateOutcomes": {
       "type": "object",
       "additionalProperties": {
         "$ref": "#/definitions/GateOutcome"
       },
-      "description": "The verdict of every gate a run evaluated, keyed by name.\n\nA gate is armed by a flag or by config. The default exit rule of a command\nis always in the object, also when no flag armed a gate:\n`error-severity-findings` on `dead-code`, `check` and the combined run\n(with `health-findings` when the combined run analyzed health),\n`health-findings` on `health`, `security-advisory` on `security` and\n`audit-verdict` on `audit`. A reader of the JSON sees a failing run without\nthe exit code. `dupes` has no default exit rule, so a `dupes` run that armed\nno gate carries no object and always exits 0.\n\nAn empty object is never emitted. The typed programmatic API runs no CLI\ngate and leaves the object absent.\n\nThe names this build can emit are `error-severity-findings`, `regression`,\n`stale-baseline`, `baseline-growth`, `duplication-threshold`,\n`duplication-findings`, `health-min-score`,\n`health-min-severity`, `health-findings`, `health-coverage-gaps`,\n`health-runtime-coverage`, `security`, `security-advisory`, `audit-verdict`,\n`type-aware-require` and `parse-error`. The set is OPEN: a name a consumer does not\nrecognise means \"some gate\", not an error."
+      "description": "The verdict of every gate that a run evaluated, keyed by gate name.\n\nEach tool defines its own gate names. The name of a gate is the JSON member\nname, and the members are in the order of the names. A tool never writes an\nempty object. When no gate ran, the member is absent.\n\nThe key set is OPEN. A name that a consumer does not recognize means \"some\ngate\", not an error.\n\nThe names that this build can emit are `error-severity-findings`, `regression`, `stale-baseline`, `baseline-growth`, `duplication-threshold`, `duplication-findings`, `health-min-score`, `health-min-severity`, `health-findings`, `health-coverage-gaps`, `health-runtime-coverage`, `security`, `security-advisory`, `audit-verdict`, `type-aware-require` and `parse-error`. `GateName` describes each name and the default entries of each command."
     },
     "RequestOutcomes": {
       "type": "object",
@@ -29072,7 +29234,7 @@
         },
         "panicked": {
           "type": "boolean",
-          "description": "True when the parser stopped in the file instead of recovering, so the\nanalysis saw only the part before the error. `true` when `reason` is set."
+          "description": "True when the parser stopped in the file and did not recover, so the\nanalysis saw only the part before the error. `true` when `reason` is set."
         },
         "reason": {
           "anyOf": [
@@ -29091,7 +29253,7 @@
         "error_count",
         "panicked"
       ],
-      "description": "One file a file-judging gate names, with the reason the gate counted it.\n\nToday only `parse-error` emits it. The item carries the same facts as the\n`source-parse-degraded` entry in `workspace_diagnostics[]` for that file,\nso a consumer can act on the gate without a join. With `reason` set, the\ncount and the parser outcome are placeholders."
+      "description": "One file that a file-judging gate names, with the reason that the gate\ncounted it.\n\nA gate that counts files that did not parse cleanly writes this item. When\n`reason` is set, `error_count` and `panicked` hold fixed values."
     },
     "DeprecatedExportInUseFinding": {
       "type": "object",
@@ -30924,6 +31086,13 @@
           },
           "description": "Class members never accessed. Wrapped in\n[`UnusedClassMemberFinding`]: same inner [`UnusedMember`] struct as\n`unused_enum_members`, with a class-targeted fix description and the\n`auto_fixable: false` default to reflect dependency-injection\npatterns."
         },
+        "unused_namespace_members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnusedNamespaceMemberFinding"
+          },
+          "description": "Exported members of an exported TypeScript namespace that no code\nreads. Wrapped in [`UnusedNamespaceMemberFinding`]: same inner\n[`UnusedMember`] struct as `unused_enum_members`. `member_name` is the\ndotted path from the exported namespace (`Inner.x`)."
+        },
         "unused_store_members": {
           "type": "array",
           "items": {
@@ -30945,12 +31114,26 @@
           },
           "description": "Dependencies used in code but not listed in package.json. Wrapped in\n[`UnlistedDependencyFinding`]."
         },
+        "unlisted_binaries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnlistedBinaryFinding"
+          },
+          "description": "Binaries that package.json scripts or process calls run, but that no\ninstalled or listed package provides. Wrapped in\n[`UnlistedBinaryFinding`]."
+        },
         "duplicate_exports": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/DuplicateExportFinding"
           },
           "description": "Exports with the same name across multiple modules. Wrapped in\n[`DuplicateExportFinding`] so each entry carries a typed `actions`\narray natively, with the position-0 `add-to-config` `ignoreExports`\nsnippet wired in at wrapper construction."
+        },
+        "duplicate_export_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DuplicateExportAliasFinding"
+          },
+          "description": "One module that exports one binding under two or more names. Wrapped\nin [`DuplicateExportAliasFinding`]. Default severity is `warn`."
         },
         "type_only_dependencies": {
           "type": "array",
@@ -32397,6 +32580,17 @@
             "$ref": "#/definitions/DiffRiskAction"
           },
           "description": "Suppression actions."
+        },
+        "suppression": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DiffRiskSuppression"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The parsed `fallow-ignore` comment. Present only on an\n`added-suppression` finding whose evidence is `fallow-ignore` and\nwhose comment Fallow can parse."
         }
       },
       "required": [
@@ -32936,6 +33130,28 @@
             }
           ],
           "description": "The type check of the survivors. Absent when the run did not check\nthem (`--typecheck` not set)."
+        },
+        "recheck": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutationRecheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The result of each rechecked mutant against its status in the earlier\nreport. Absent outside `--recheck`."
+        },
+        "compare": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutationCompare"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The mutants whose result differs from a saved report. Absent outside\n`--compare`, and absent when this run is not complete."
         }
       },
       "required": [
@@ -33450,6 +33666,11 @@
         },
         {
           "type": "string",
+          "const": "sampled-out",
+          "description": "The `--mutants-per-line` limit left mutants out of the plan. They are\n`pending` with the reason `sampled-out`."
+        },
+        {
+          "type": "string",
           "const": "time-budget",
           "description": "The time budget ended before each mutant ran."
         },
@@ -33669,6 +33890,13 @@
           ],
           "description": "The static rule of a `pruned` mutant, kebab-case."
         },
+        "pending_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why a `pending` mutant did not run, kebab-case. Only `sampled-out` has\na reason: the `--mutants-per-line` limit left the mutant out of the\nplan. A mutant that the mutant limit or the time budget left out has\nno reason."
+        },
         "killed_by": {
           "type": [
             "string",
@@ -33741,6 +33969,17 @@
             "type": "integer"
           },
           "description": "The TypeScript diagnostic codes of the new errors of a\n`compile_error` mutant, sorted, at most 8."
+        },
+        "equivalence_hint": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutantEquivalenceHint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An advisory hint that the mutant may be equivalent to the original\ncode. The hint never changes the status: the mutant stays `survived`\nand counts in the score. A person decides, and records the decision in\na verdict file. The hint can be wrong."
         }
       },
       "required": [
@@ -33841,10 +34080,15 @@
             "null"
           ],
           "description": "The share of mutants that a test reaches, a fraction from 0 to 1:\n`covered / (covered + no_coverage)` over the whole plan. `covered`\ncounts each executed mutant with a covering test and each `pending`\nmutant that a passing dry-run test covers. A `pending` mutant that no\ndry-run test covers is `no_coverage`, so a run that `--max-mutants`\ncaps reports the coverage of the full run. `equivalent` and `pruned`\nmutants never count. `null` when no mutant is covered or unreached."
+        },
+        "sampled_out": {
+          "type": "integer",
+          "description": "The `pending` mutants that the `--mutants-per-line` limit left out of\nthe plan. They are part of `counts.pending`."
         }
       },
       "required": [
-        "counts"
+        "counts",
+        "sampled_out"
       ],
       "description": "The totals of a run."
     },
@@ -33938,7 +34182,7 @@
       "properties": {
         "code": {
           "type": "string",
-          "description": "A stable kebab-case code: `cache-write-failed`,\n`journal-write-failed`, `runtime-error`, `static-map-miss`,\n`test-files-not-discovered`, `typecheck-failed`, `worktree-changed`\nor `worktree-check-failed`."
+          "description": "A stable kebab-case code: `cache-write-failed`,\n`duplicate-test-ids`, `journal-write-failed`, `runtime-error`,\n`static-map-miss`, `test-files-not-discovered`, `typecheck-failed`,\n`worktree-changed` or `worktree-check-failed`."
         },
         "message": {
           "type": "string",
@@ -34215,6 +34459,13 @@
           ],
           "description": "The static rule of a `pruned` mutant, kebab-case."
         },
+        "pending_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why a `pending` mutant did not run, kebab-case. Only `sampled-out` has\na reason: the `--mutants-per-line` limit left the mutant out of the\nplan. A mutant that the mutant limit or the time budget left out has\nno reason."
+        },
         "test_reach": {
           "anyOf": [
             {
@@ -34251,7 +34502,11 @@
         },
         "pending": {
           "type": "integer",
-          "description": "Mutants after the mutant limit."
+          "description": "Mutants after the mutant limit, and the sampled-out mutants."
+        },
+        "sampled_out": {
+          "type": "integer",
+          "description": "The `pending` mutants that the `--mutants-per-line` limit left out."
         },
         "no_coverage": {
           "type": "integer",
@@ -34278,6 +34533,7 @@
         "total",
         "planned",
         "pending",
+        "sampled_out",
         "no_coverage",
         "pruned_dead_code",
         "pruned_generated",
@@ -34432,6 +34688,10 @@
         "compile_errors": {
           "type": "integer",
           "description": "The checked survivors that do not type-check. They have the status\n`compile_error`."
+        },
+        "hinted": {
+          "type": "integer",
+          "description": "The mutants of the final report that have an `equivalence_hint`. They\nkeep the status `survived`. A verdict that makes a mutant `equivalent`\nremoves its hint and lowers this count."
         },
         "skipped": {
           "type": "array",
@@ -34820,7 +35080,7 @@
         "from",
         "to"
       ],
-      "description": "The edit of a mutant, without project text.\n\nEach side is an operator token (for example `??` or `<=`), a fixed literal\n(`true`, `undefined`, `\"\"`, `\"fallow\"`, `void 0`), a regular expression\ntoken (`^`, `$`, `[`, `[^`, `\\d`), or a placeholder for a side that is\nproject code: `<condition>`, `<call>`, `<expression>` or `<string>`. An\nempty side means that the edit removes the token."
+      "description": "The edit of a mutant, without project text.\n\nEach side is an operator token (for example `??` or `<=`), a fixed literal\n(`true`, `undefined`, `\"\"`, `\"fallow\"`, `void 0`), a regular expression\ntoken (`^`, `$`, `[`, `[^`, `+`, `{n,m}`, `\\d`), or a placeholder for a\nside that is project code: `<condition>`, `<call>`, `<expression>`,\n`<string>` or `<template>`. An\nempty side means that the edit removes the token."
     },
     "NodeModulesState": {
       "oneOf": [
@@ -34870,10 +35130,10 @@
         {
           "type": "string",
           "const": "nesting-too-deep",
-          "description": "The file nests too deep to parse, so it was not parsed\n(`source-nesting-too-deep`)."
+          "description": "The file nests too deep to parse, so the tool did not parse it."
         }
       ],
-      "description": "Why a file counts for the `parse-error` gate, other than a parser error."
+      "description": "Why a file counts for a parse gate, other than a parser error."
     },
     "CyclomaticPolicy": {
       "oneOf": [
@@ -35136,7 +35396,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Tests with nonempty kills and no unique kills, sorted by test id."
+          "description": "Tests with nonempty kills and no unique kills, sorted by test id.\nIn target mode, only the tests of complete targets."
         },
         "coverage_without_kills": {
           "type": "array",
@@ -35144,6 +35404,16 @@
             "type": "string"
           },
           "description": "Tests with coverage and no observed kills, sorted by test id."
+        },
+        "targets": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/MutationKillMatrixTarget"
+          },
+          "description": "The `--kill-matrix-for` targets, in the given order. Absent outside\ntarget mode. In target mode, `tests` has only target tests, and\n`subsuming_tests` is empty, because bail hides the other killers."
         }
       },
       "required": [
@@ -35213,6 +35483,16 @@
             "type": "string"
           },
           "description": "Conservative evidence notes, sorted."
+        },
+        "target_only_kills": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/MutationTargetOnlyKill"
+          },
+          "description": "The kills that other target tests also detect and no non-target test\ndetects, sorted by mutant id. Only `--kill-matrix-for` sets this\nfield. The test stays redundant only while one of `targets` for each\nentry stays in the suite."
         }
       },
       "required": [
@@ -35586,12 +35866,36 @@
           ],
           "description": "Self CPU milliseconds per profiled hour. `None` when not measured."
         },
+        "browser_long_frame_ms_per_hour": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Long animation frame milliseconds per hour of visible page time in\nthe browser. `None` when not measured (a server function, or a\nbrowser without the API)."
+        },
         "never_run_ranges": {
           "type": [
             "integer",
             "null"
           ],
           "description": "Branch ranges that never ran. `None` when not measured."
+        },
+        "static_callers": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Files that import the function, from the static caller graph. `None`\nwhen not known."
+        },
+        "production_callers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/InspectCloudCaller"
+          },
+          "description": "Functions that called this one in the CPU profiles of the deployment,\nmost samples first. `None` when the deployment has no CPU profile; an\nempty list means a profile without a caller."
         },
         "summary": {
           "type": "string",
@@ -35672,6 +35976,837 @@
         }
       ],
       "description": "Capture policy of the runtime evidence behind a report."
+    },
+    "DiffRiskSuppression": {
+      "type": "object",
+      "properties": {
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The suppressed kinds in kebab-case, in source order. Empty for a\nblanket comment that suppresses every kind."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The human-authored reason after `--`, or `null` when absent."
+        },
+        "security_without_reason": {
+          "type": "boolean",
+          "description": "`true` when the comment names `security-sink` or\n`security-client-server-leak` and has no reason. An advisory signal\nonly: it does not change the severity of the finding."
+        }
+      },
+      "required": [
+        "kinds",
+        "security_without_reason"
+      ],
+      "description": "The parsed content of an added `fallow-ignore` comment."
+    },
+    "InspectCloudCaller": {
+      "type": "object",
+      "properties": {
+        "stable_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Stable id of the calling function."
+        },
+        "file": {
+          "type": "string",
+          "description": "File of the calling function, relative to the repository root."
+        },
+        "function": {
+          "type": "string",
+          "description": "Name of the calling function."
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "1-based start line of the calling function."
+        },
+        "samples": {
+          "type": "integer",
+          "description": "CPU profile samples with this caller to callee step on the stack."
+        }
+      },
+      "required": [
+        "file",
+        "function",
+        "samples"
+      ],
+      "description": "One production caller of an [`InspectCloudFunction`]."
+    },
+    "MutationTargetOnlyKill": {
+      "type": "object",
+      "properties": {
+        "mutant_id": {
+          "type": "string",
+          "description": "The killed mutant."
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The other target tests that also kill the mutant, sorted."
+        }
+      },
+      "required": [
+        "mutant_id",
+        "targets"
+      ],
+      "description": "A kill of a target test that only other target tests share."
+    },
+    "MutationKillMatrixTarget": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "The target as the caller gave it, after path normalization: a test\nfile or a runner test id."
+        },
+        "test_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The dry-run test ids that the target selects, sorted."
+        },
+        "status": {
+          "description": "Whether the evidence of this target supports candidate analysis:\n`complete` or `incomplete`. Only the tests of a complete target can\nbe candidates.",
+          "$ref": "#/definitions/MutationKillMatrixTargetStatus"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Why the evidence of this target is incomplete, sorted. The run-wide\nreasons `partial-mutation-run`, `baseline-failure`, and\n`missing-test-file-metadata` apply to each target.\n`incomplete-mutant-results` means that a test of this target covers a\nmutant with incomplete evidence. `unmatched-target` means that the\ntarget selects no test."
+        }
+      },
+      "required": [
+        "target",
+        "test_ids",
+        "status",
+        "reasons"
+      ],
+      "description": "One `--kill-matrix-for` target and the dry-run tests that it selects."
+    },
+    "DuplicateExportAliasFinding": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The module that exports the binding."
+        },
+        "local_name": {
+          "type": "string",
+          "description": "The local name of the binding. For a re-export, the name that the\nsource module exports."
+        },
+        "export_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The export names of the binding, in source order."
+        },
+        "line": {
+          "type": "integer",
+          "description": "1-based line number of the first export of the binding."
+        },
+        "col": {
+          "type": "integer",
+          "description": "0-based byte column offset of the first export of the binding."
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DuplicateExportAliasLocation"
+          },
+          "description": "One location for each export name, in source order."
+        },
+        "finding_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a\n`~<k>` suffix when several findings of one type share an identity.\nLine and column are not inputs, so the id survives line shifts,\nreformats and reorders. A rename of the file or the binding gives a\nnew id. Absent in output from older versions."
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/IssueAction"
+          },
+          "description": "Suggested next steps. Always emitted (possibly empty for\nforward-compat)."
+        },
+        "introduced": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AuditIntroduced"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set by the audit pass when this finding is introduced relative to\nthe merge-base."
+        },
+        "effective_severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EffectiveSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Gate severity of this finding after `rules` and `overrides[].rules`\nresolve for its path. CI formats read it for the annotation, SARIF\nand CodeClimate level. Absent in output from older versions. Not\npart of the finding identity, baseline keys or fingerprints."
+        }
+      },
+      "required": [
+        "path",
+        "local_name",
+        "export_names",
+        "line",
+        "col",
+        "locations",
+        "actions"
+      ],
+      "description": "Wire-shape envelope for a [`DuplicateExportAlias`] finding. There is no\nsafe auto-fix: a consumer outside the project can import any of the\nnames. Actions are manual remediation guidance plus a line-level\nsuppress."
+    },
+    "DuplicateExportAliasLocation": {
+      "type": "object",
+      "properties": {
+        "export_name": {
+          "type": "string",
+          "description": "The export name at this location (`default` for a default export)."
+        },
+        "line": {
+          "type": "integer",
+          "description": "1-based line number."
+        },
+        "col": {
+          "type": "integer",
+          "description": "0-based byte column offset."
+        }
+      },
+      "required": [
+        "export_name",
+        "line",
+        "col"
+      ],
+      "description": "One export name of a [`DuplicateExportAlias`]."
+    },
+    "UnlistedBinaryFinding": {
+      "type": "object",
+      "properties": {
+        "binary_name": {
+          "type": "string",
+          "description": "The binary name as the command runs it (for example `ffmpeg`)."
+        },
+        "used_in": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BinaryUseSite"
+          },
+          "description": "The sites that run this binary."
+        },
+        "finding_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a\n`~<k>` suffix when several findings of one type share an identity.\nLine and column are not inputs, so the id survives line shifts,\nreformats and reorders. Absent in output from older versions."
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/IssueAction"
+          },
+          "description": "Suggested next steps. Always emitted (possibly empty for\nforward-compat)."
+        },
+        "introduced": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AuditIntroduced"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set by the audit pass when this finding is introduced relative to\nthe merge-base."
+        },
+        "effective_severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EffectiveSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Gate severity of this finding after `rules` and `overrides[].rules`\nresolve for its path. CI formats read it for the annotation, SARIF\nand CodeClimate level. Absent in output from older versions. Not\npart of the finding identity, baseline keys or fingerprints."
+        }
+      },
+      "required": [
+        "binary_name",
+        "used_in",
+        "actions"
+      ],
+      "description": "Wire-shape envelope for an [`UnlistedBinary`] finding. Carries an\n`install-dependency` primary (non-auto-fixable) plus an `ignoreBinaries`\nconfig suppress."
+    },
+    "BinaryUseSite": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The `package.json` that declares the script, or the source file that\nmakes the process call."
+        },
+        "line": {
+          "type": "integer",
+          "description": "1-based line number."
+        },
+        "col": {
+          "type": "integer",
+          "description": "0-based byte column offset."
+        },
+        "script_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The name of the package.json script that runs the binary. Absent for\na process call in source."
+        }
+      },
+      "required": [
+        "path",
+        "line",
+        "col"
+      ],
+      "description": "A location that runs a binary."
+    },
+    "UnusedNamespaceMemberFinding": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File containing the unused member."
+        },
+        "parent_name": {
+          "type": "string",
+          "description": "Name of the parent enum, class, store, or exported namespace."
+        },
+        "member_name": {
+          "type": "string",
+          "description": "Name of the unused member. A member of a nested namespace has the dotted\npath from the exported namespace (`Inner.x`)."
+        },
+        "kind": {
+          "description": "The kind of member: enum member, class method, class property, store\nmember, or namespace member.",
+          "$ref": "#/definitions/MemberKind"
+        },
+        "line": {
+          "type": "integer",
+          "description": "1-based line number."
+        },
+        "col": {
+          "type": "integer",
+          "description": "0-based byte column offset."
+        },
+        "finding_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a\n`~<k>` suffix when several findings of one type share an identity.\nLine and column are not inputs, so the id survives line shifts,\nreformats and reorders. A rename of the file or the symbol gives a\nnew id. Absent in output from older versions."
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/IssueAction"
+          },
+          "description": "Suggested next steps. Always emitted (possibly empty for\nforward-compat)."
+        },
+        "introduced": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AuditIntroduced"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set by the audit pass when this finding is introduced relative to\nthe merge-base."
+        },
+        "effective_severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EffectiveSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Gate severity of this finding after `rules` and `overrides[].rules`\nresolve for its path. CI formats read it for the annotation, SARIF\nand CodeClimate level. Absent in output from older versions. Not\npart of the finding identity, baseline keys or fingerprints."
+        },
+        "reachability_caveats": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ReachabilityCaveat"
+          },
+          "description": "Advisory caveats on the verdict behind this finding. A namespace\nmember takes the member rule unchanged: any module this run analyzed\nincompletely can hold the access that credits it. Sorted,\ndeduplicated, and omitted from the wire when empty. This is disclosure\nonly, because a namespace member offers no mutation."
+        }
+      },
+      "required": [
+        "path",
+        "parent_name",
+        "member_name",
+        "kind",
+        "line",
+        "col",
+        "actions"
+      ],
+      "description": "Wire-shape envelope for an [`UnusedMember`] finding consumed under the\n`unused_namespace_members` key (an exported member of an exported\nTypeScript namespace that no code reads). `member_name` is the dotted path\nfrom the exported namespace, for example `Inner.x`. Emits only a\nline-level suppress action: a member can be a multi-line function, class\nor nested namespace, so there is no safe one-line auto-fix."
+    },
+    "MutationTasksOutput": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "description": "Independent schema version.",
+          "$ref": "#/definitions/MutationTasksSchemaVersion"
+        },
+        "version": {
+          "description": "The Fallow version.",
+          "$ref": "#/definitions/ToolVersion"
+        },
+        "report_completion": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutationCompletionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The completion status of the report. A `partial` report can miss\ntasks: a `pending` mutant is not a task."
+        },
+        "summary": {
+          "description": "The counts of the tasks.",
+          "$ref": "#/definitions/MutationTasksSummary"
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MutationTask"
+          },
+          "description": "The tasks, sorted by file, line, column and mutant id."
+        }
+      },
+      "required": [
+        "schema_version",
+        "version",
+        "summary",
+        "tasks"
+      ],
+      "description": "The envelope of `fallow mutation tasks`: the open tasks of one saved\nreport, as one batch. It runs no user code."
+    },
+    "MutationTasksSchemaVersion": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "1",
+          "description": "The first version."
+        }
+      ],
+      "description": "Version singleton for the open tasks of a mutation report."
+    },
+    "MutationTask": {
+      "type": "object",
+      "properties": {
+        "mutant_id": {
+          "type": "string",
+          "description": "The id of the mutant. `fallow mutation inspect` takes this id."
+        },
+        "file": {
+          "type": "string",
+          "description": "The project-root-relative path of the mutated file."
+        },
+        "line": {
+          "type": "integer",
+          "description": "The 1-based line of the mutant."
+        },
+        "column": {
+          "type": "integer",
+          "description": "The 1-based column of the mutant."
+        },
+        "operator": {
+          "type": "string",
+          "description": "The operator, kebab-case."
+        },
+        "function": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The name of the enclosing function. Absent at the top level of a\nmodule and for an anonymous function."
+        },
+        "status": {
+          "description": "`survived` or `no_coverage`.",
+          "$ref": "#/definitions/MutantStatus"
+        },
+        "original_lines": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The source lines that contain the mutant, from the current file.\n`null` when the task is stale."
+        },
+        "mutated_lines": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The same lines with the mutation applied. `null` when the task is\nstale."
+        },
+        "equivalence_hint": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutantEquivalenceHint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An advisory hint that the mutant may be equivalent. The task stays\nopen: a person decides, and records an equivalent mutant in a verdict\nfile."
+        },
+        "stale_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutationStaleReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the current file no longer gives the mutant. Absent for a fresh\ntask."
+        },
+        "covering_test_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The test files of the tests that reached the mutant in the dry run,\nsorted. Empty for `no_coverage`. `fallow mutation inspect` gives the\ntest ids and the static test files of one mutant."
+        }
+      },
+      "required": [
+        "mutant_id",
+        "file",
+        "line",
+        "column",
+        "operator",
+        "status",
+        "covering_test_files"
+      ],
+      "description": "One open task: a `survived` or `no_coverage` mutant of a saved report.\nA task holds no source text other than the source lines of the mutant."
+    },
+    "MutationTasksSummary": {
+      "type": "object",
+      "properties": {
+        "tasks": {
+          "type": "integer",
+          "description": "The number of tasks."
+        },
+        "survived": {
+          "type": "integer",
+          "description": "The tasks with the status `survived`."
+        },
+        "no_coverage": {
+          "type": "integer",
+          "description": "The tasks with the status `no_coverage`."
+        },
+        "stale": {
+          "type": "integer",
+          "description": "The tasks whose file changed after the report. They have no code."
+        }
+      },
+      "required": [
+        "tasks",
+        "survived",
+        "no_coverage",
+        "stale"
+      ],
+      "description": "The number of tasks for each status."
+    },
+    "MutationRecheck": {
+      "type": "object",
+      "properties": {
+        "report_sha256": {
+          "type": "string",
+          "description": "The SHA-256 digest of the earlier report."
+        },
+        "killed": {
+          "type": "integer",
+          "description": "The number of mutants for each outcome."
+        },
+        "survived": {
+          "type": "integer",
+          "description": "See `killed`."
+        },
+        "no_coverage": {
+          "type": "integer",
+          "description": "See `killed`."
+        },
+        "tests_fail_on_original": {
+          "type": "integer",
+          "description": "See `killed`."
+        },
+        "unsettled": {
+          "type": "integer",
+          "description": "See `killed`."
+        },
+        "mutants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MutationRecheckMutant"
+          },
+          "description": "The rechecked mutants, sorted by file, line and mutant id."
+        }
+      },
+      "required": [
+        "report_sha256",
+        "killed",
+        "survived",
+        "no_coverage",
+        "tests_fail_on_original",
+        "unsettled",
+        "mutants"
+      ],
+      "description": "The recheck facts of a `--recheck` run."
+    },
+    "MutationRecheckMutant": {
+      "type": "object",
+      "properties": {
+        "mutant_id": {
+          "type": "string",
+          "description": "The id of the mutant."
+        },
+        "file": {
+          "type": "string",
+          "description": "The project-root-relative path of the mutated file."
+        },
+        "line": {
+          "type": "integer",
+          "description": "The 1-based line of the mutant."
+        },
+        "previous_status": {
+          "description": "The status in the earlier report.",
+          "$ref": "#/definitions/MutantStatus"
+        },
+        "status": {
+          "description": "The status in this run.",
+          "$ref": "#/definitions/MutantStatus"
+        },
+        "outcome": {
+          "description": "What the recheck shows.",
+          "$ref": "#/definitions/MutationRecheckOutcome"
+        }
+      },
+      "required": [
+        "mutant_id",
+        "file",
+        "line",
+        "previous_status",
+        "status",
+        "outcome"
+      ],
+      "description": "One rechecked mutant."
+    },
+    "MutationRecheckOutcome": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "killed",
+          "description": "A test now fails on the mutant (`killed` or `timeout`)."
+        },
+        {
+          "type": "string",
+          "const": "survived",
+          "description": "Each covering test still passes on the mutant."
+        },
+        {
+          "type": "string",
+          "const": "no_coverage",
+          "description": "No test reaches the mutant."
+        },
+        {
+          "type": "string",
+          "const": "tests_fail_on_original",
+          "description": "A test of the run fails on the original code, so the run proves no\nsurvivor. Fix that test first."
+        },
+        {
+          "type": "string",
+          "const": "unsettled",
+          "description": "The mutant has no final result, for example `runtime_error`, `flaky`\nor `pending`. `status` gives the reason."
+        }
+      ],
+      "description": "What a recheck shows for one mutant of the earlier report."
+    },
+    "MutationCompare": {
+      "type": "object",
+      "properties": {
+        "report_sha256": {
+          "type": "string",
+          "description": "The SHA-256 digest of the saved report."
+        },
+        "compared": {
+          "type": "integer",
+          "description": "The number of mutant ids in both runs."
+        },
+        "regressed": {
+          "type": "integer",
+          "description": "The number of mutants for each change."
+        },
+        "inconclusive": {
+          "type": "integer",
+          "description": "See `regressed`."
+        },
+        "added": {
+          "type": "integer",
+          "description": "See `regressed`."
+        },
+        "removed": {
+          "type": "integer",
+          "description": "See `regressed`."
+        },
+        "mutants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MutationCompareMutant"
+          },
+          "description": "Each mutant with a change, sorted by file, line and mutant id. A\nmutant in both runs without a change is not in the list."
+        }
+      },
+      "required": [
+        "report_sha256",
+        "compared",
+        "regressed",
+        "inconclusive",
+        "added",
+        "removed",
+        "mutants"
+      ],
+      "description": "The compare facts of a `--compare` run."
+    },
+    "MutationCompareMutant": {
+      "type": "object",
+      "properties": {
+        "mutant_id": {
+          "type": "string",
+          "description": "The id of the mutant."
+        },
+        "file": {
+          "type": "string",
+          "description": "The project-root-relative path of the mutated file."
+        },
+        "line": {
+          "type": "integer",
+          "description": "The 1-based line of the mutant."
+        },
+        "change": {
+          "description": "How the mutant differs from the saved report.",
+          "$ref": "#/definitions/MutationCompareChange"
+        },
+        "previous_status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutantStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The status in the saved report. Absent for an `added` mutant."
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MutantStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The status in this run. Absent for a `removed` mutant."
+        },
+        "previous_killing_tests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The tests that killed the mutant in the saved report, sorted: its\n`killing_tests`, else its `killed_by`. Empty when the saved report\nnames no killing test."
+        }
+      },
+      "required": [
+        "mutant_id",
+        "file",
+        "line",
+        "change",
+        "previous_killing_tests"
+      ],
+      "description": "One mutant of a compare."
+    },
+    "MutationCompareChange": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "regressed",
+          "description": "The saved report detects the mutant (`killed` or `timeout`), and this\nrun does not (`survived` or `no_coverage`). The tests lost the\ndetection of the mutant."
+        },
+        {
+          "type": "string",
+          "const": "inconclusive",
+          "description": "The mutant is `flaky` in one of the two runs, so the comparison of\nthis mutant proves nothing."
+        },
+        {
+          "type": "string",
+          "const": "added",
+          "description": "Only this run has the mutant id."
+        },
+        {
+          "type": "string",
+          "const": "removed",
+          "description": "Only the saved report has the mutant id."
+        }
+      ],
+      "description": "How one mutant of a compare differs from the saved report."
+    },
+    "MutationKillMatrixTargetStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "complete",
+          "description": "Each test of the target has complete evidence for each covered mutant."
+        },
+        {
+          "type": "string",
+          "const": "incomplete",
+          "description": "The run or at least one covered mutant has incomplete evidence."
+        }
+      ],
+      "description": "The quality of the evidence of one `--kill-matrix-for` target."
+    },
+    "MutantEquivalenceHint": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "type-non-nullish",
+          "description": "The mutant removes an optional-chaining link (`?.`), and the declared\ntype of the receiver excludes `null` and `undefined`. If no run-time\nvalue can be nullish, the mutant is equivalent. A run-time value can\nstill be nullish, for example in a method that loses its `this`, or\nin a call whose declared return type hides a nullish value."
+        }
+      ],
+      "description": "Why a survivor may be equivalent, as far as the type check can tell."
     }
   }
 }

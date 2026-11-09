@@ -70,10 +70,11 @@ The protocol adapters are `fallow-cli`, `fallow-lsp`, `fallow-mcp`, and
 Run the cheap crate-edge gate while changing workspace dependencies:
 
 ```bash
-npm run check:crate-boundaries
+cargo fallow boundaries --fail-on-issues
 ```
 
-The check uses `cargo metadata --no-deps` for crate dependency rules. The
+The rules are in `[workspace.metadata.fallow.boundaries]` of the root
+`Cargo.toml`. cargo-fallow reads the crate edges from `cargo metadata`. The
 `architecture_boundaries` Rust tests also guard source-level invariants such as
 backend adapter containment and shared output-helper ownership. Repository
 policy tests and contract generation guard type-aware manifest/docs drift plus
@@ -87,6 +88,27 @@ protocol and package parity.
   must not crawl arbitrary project files to complete a report.
 - Cache expansion needs invalidation tests and visible fallback behavior before
   it becomes part of a public workflow.
+- A warm run of a persisted cache must give the same result as a
+  `--no-cache` run. The cache model tests in
+  `crates/engine/tests/integration/cache_model` check this for the graph,
+  extract and dupes caches over edit sequences. The tests in
+  `crates/api/src/mutation/cache_model` check it for the mutation result
+  cache: they run the real Vitest and `bun test` runners, trace the project
+  files that each runner reads, and check that an edit of each traced file
+  changes the result cache key. A new runner input needs a key part and a
+  step in that template. They also check that the
+  graph cache key covers each path that import resolution reads, through the
+  `read-trace` feature of `fallow-graph`. A new resolver read of a file goes
+  through `crate::read_trace`, so that the check sees it. The same helpers
+  report each path that resolution checks and does not find to
+  `crate::missed_probes`. The graph cache stores these paths and the
+  resolved targets that discovery does not list. A warm run refuses the
+  cache when a stored missed path exists or a stored target is gone. The
+  helpers also report each package manifest below `node_modules` that
+  resolution reads. For a Bun install, the graph cache stores the `version`
+  of each of these manifests (`crate::installed_versions`), and a warm run
+  refuses the cache when one of the versions changed. A new kind of resolver
+  input needs a step in the templates of these tests.
 - Runtime and cloud data must enter through explicit options or typed evidence
   fields. Static analyzers should not hide network or filesystem side effects.
 

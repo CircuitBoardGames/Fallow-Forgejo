@@ -21,6 +21,7 @@ use fallow_config::{MutationConfig, OutputFormat};
 use fallow_output::{
     MutantStatus, MutationPlanOutput, MutationReport, serialize_mutation_inspect_json_output,
     serialize_mutation_json_output, serialize_mutation_plan_json_output,
+    serialize_mutation_tasks_json_output,
 };
 
 use crate::json_style::JsonStyle;
@@ -51,6 +52,19 @@ pub enum MutationSubcommand {
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
     },
+    /// List the open tasks of a saved report as one batch. Runs no code.
+    ///
+    /// A task is a `survived` or `no_coverage` mutant with the source lines
+    /// before and after the change. The human and markdown output is a list
+    /// that an agent or a person can use to write the missing tests. Without
+    /// `--report`, it reads the report that the last run saved in the Fallow
+    /// cache.
+    Tasks {
+        /// A saved `fallow mutation --format json` report (default: the report
+        /// of the last run).
+        #[arg(long, value_name = "PATH")]
+        report: Option<PathBuf>,
+    },
 }
 
 /// The flags of `fallow mutation`.
@@ -66,6 +80,19 @@ pub struct MutationArgs {
     /// count. The others are `pending`.
     #[arg(long, value_name = "N")]
     pub max_mutants: Option<usize>,
+    /// Keep at most N mutants on each source line. The plan keeps the most
+    /// productive mutants of the line (relational, condition, arithmetic and
+    /// logical operators first). The others are `pending` with the reason
+    /// `sampled-out` and do not run (default: the `mutation.mutantsPerLine`
+    /// key, else each mutant).
+    #[arg(long, value_name = "N")]
+    pub mutants_per_line: Option<usize>,
+    /// Widen each changed line to the whole function that holds it, so that a
+    /// changed parameter or signature selects the mutants of the function.
+    /// Only the changed-code scope uses it (default: the
+    /// `mutation.functionScope` key, else the changed lines only).
+    #[arg(long, conflicts_with_all = ["all", "paths"])]
+    pub function_scope: bool,
     /// Stop starting mutants after this time, for example `90s`, `10m` or `1h`.
     /// The others are `pending`.
     #[arg(long, value_name = "DURATION")]
@@ -110,7 +137,9 @@ pub struct MutationArgs {
     pub runner_config: Option<PathBuf>,
     /// Type-check each survived mutant through the `--type-aware`
     /// companion. A survivor that does not type-check becomes
-    /// `compile_error` and leaves the score.
+    /// `compile_error` and leaves the score. An optional-chaining survivor on a
+    /// receiver whose type excludes `null` and `undefined` gets an advisory
+    /// `equivalence_hint`. Its status and the score do not change.
     #[arg(long)]
     pub typecheck: bool,
     /// Continue an interrupted or partial run: reuse the killed and confirmed
@@ -122,6 +151,42 @@ pub struct MutationArgs {
     /// individual review. Run every covering test without stopping at a failure.
     #[arg(long)]
     pub kill_matrix: bool,
+    /// Check whether this test is redundant: a test file (each test in it) or
+    /// a test id (`file::name`). Repeat the flag for more targets. Only the
+    /// mutants that a target covers run: first the target tests without a
+    /// stop at a failure, then the other covering tests up to the first
+    /// failure.
+    #[arg(long, value_name = "TARGET", conflicts_with = "kill_matrix")]
+    pub kill_matrix_for: Vec<String>,
+    /// Rerun the open tasks of a saved report (its `survived` and
+    /// `no_coverage` mutants) against the current tests. The worktree may
+    /// change test files only. The run replaces the saved report, so
+    /// `fallow mutation tasks` then lists the mutants that are still open.
+    #[arg(
+        long,
+        conflicts_with_all = ["all", "paths", "plan", "resume", "allow_dirty", "max_mutants", "mutants_per_line", "function_scope", "min_score"]
+    )]
+    pub recheck: bool,
+    /// The saved report of `--recheck` (default: the report of the last run).
+    /// A recheck without `--mutant` replaces the saved report.
+    #[arg(long, value_name = "PATH", requires = "recheck")]
+    pub report: Option<PathBuf>,
+    /// Recheck only these mutant ids of the report, comma-separated or
+    /// repeated (default: each open task). The saved report then stays as it
+    /// is, so `fallow mutation tasks` keeps the other open tasks.
+    #[arg(
+        long = "mutant",
+        value_name = "ID",
+        value_delimiter = ',',
+        requires = "recheck"
+    )]
+    pub mutants: Vec<String>,
+    /// Compare this run with a saved complete report: list each mutant that
+    /// the report detects (`killed` or `timeout`) and this run does not
+    /// (`survived` or `no_coverage`), with its earlier killing tests. A
+    /// report or a run that is not complete exits 2.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["plan", "recheck"])]
+    pub compare: Option<PathBuf>,
     /// Mutate only these files or directories instead of the changed code.
     #[arg(value_name = "PATH")]
     pub paths: Vec<PathBuf>,
@@ -293,6 +358,12 @@ pub fn run_options(input: &MutationCliInput<'_>) -> Result<MutationRunOptions, P
             "mutation.maxMutants",
         ));
     }
+    if input.args.mutants_per_line == Some(0) {
+        return Err(input_error(
+            "--mutants-per-line must be at least 1",
+            "mutation.mutantsPerLine",
+        ));
+    }
     Ok(MutationRunOptions {
         analysis: AnalysisOptions {
             root: Some(input.root.to_path_buf()),
@@ -307,6 +378,8 @@ pub fn run_options(input: &MutationCliInput<'_>) -> Result<MutationRunOptions, P
         operators: parse_operators(&input.args.operators)?,
         allow_side_effects: input.args.allow_side_effects,
         max_mutants: input.args.max_mutants,
+        mutants_per_line: input.args.mutants_per_line,
+        function_scope: input.args.function_scope,
         allow_dirty: input.args.allow_dirty,
         runtime: input.args.runtime.clone(),
         concurrency: input.args.concurrency.or(input.config.concurrency),
@@ -321,6 +394,9 @@ pub fn run_options(input: &MutationCliInput<'_>) -> Result<MutationRunOptions, P
         typecheck: input.args.typecheck || input.config.typecheck == Some(true),
         resume: input.args.resume,
         kill_matrix: input.args.kill_matrix,
+        kill_matrix_targets: input.args.kill_matrix_for.clone(),
+        mutant_ids: Vec::new(),
+        test_changes_only: false,
     })
 }
 
@@ -471,10 +547,12 @@ fn code_lookup(report: &MutationReport, root: &Path) -> CodeLookup {
 
 pub fn run(input: &MutationCliInput<'_>) -> ExitCode {
     let (output, style) = (input.output, input.json_style);
+    if let Some(MutationSubcommand::Tasks { report }) = &input.subcommand {
+        return run_tasks(input, report.as_deref());
+    }
     if !matches!(output, OutputFormat::Human | OutputFormat::Json) {
-        return crate::error::emit_error_with_style(
+        return crate::error::emit_input_error_with_style(
             "`fallow mutation` supports only human and json output",
-            INPUT_EXIT_CODE,
             output,
             style,
         );
@@ -521,6 +599,11 @@ fn refuse_run_flags_in_plan(args: &MutationArgs) -> Result<(), ProgrammaticError
             "--kill-matrix requires a run; a plan collects no test outcomes",
             "mutation.killMatrix",
         ))
+    } else if !args.kill_matrix_for.is_empty() {
+        Some((
+            "--kill-matrix-for requires a run; a plan collects no test outcomes",
+            "mutation.killMatrixFor",
+        ))
     } else if args.resume {
         Some((
             "--resume continues a run; a plan runs no mutant",
@@ -535,8 +618,15 @@ fn refuse_run_flags_in_plan(args: &MutationArgs) -> Result<(), ProgrammaticError
 }
 
 fn run_inner(input: &MutationCliInput<'_>) -> Result<ExitCode, ProgrammaticError> {
-    let options = run_options(input)?;
-    let min_score = min_score(input)?;
+    let mut options = run_options(input)?;
+    let recheck = recheck_selection(input)?;
+    let min_score = apply_recheck(input, &mut options, recheck.as_ref())?;
+    let baseline = input
+        .args
+        .compare
+        .as_deref()
+        .map(compare::load)
+        .transpose()?;
     if input.args.plan {
         refuse_run_flags_in_plan(&input.args)?;
         let plan = plan_mutation(&options)?;
@@ -558,12 +648,17 @@ fn run_inner(input: &MutationCliInput<'_>) -> Result<ExitCode, ProgrammaticError
     }
     let mut report = run_with_progress(&options, input)?;
     complete_file_digests(&mut report, input.root);
+    report.recheck = recheck.as_ref().map(|selection| selection.section(&report));
     // Before the verdicts: an equivalent verdict for a survivor does not make
     // the run one in which no mutant has a test result.
     let blocked = baseline_blocked_run_error(&report);
     if let Some(verdicts) = verdicts {
         apply_mutation_verdicts(&mut report, &verdicts)?;
     }
+    // After the verdicts: an equivalent mutant is no lost detection.
+    let (compare_section, compare_blocked) = compare_with(baseline.as_ref(), &report);
+    report.compare = compare_section;
+    let blocked = blocked.or(compare_blocked);
     let exit = run_exit_code(&report, min_score);
     crate::telemetry::note_result_count(report.summary.counts.survived);
     let value = serialize_mutation_json_output(report.clone()).map_err(|error| {
@@ -572,7 +667,14 @@ fn run_inner(input: &MutationCliInput<'_>) -> Result<ExitCode, ProgrammaticError
             2,
         )
     })?;
-    let saved_path = save_report(&options.analysis, &value);
+    // A recheck of named mutants keeps the saved report, so the other open
+    // tasks stay in it.
+    let saved_path = input
+        .args
+        .mutants
+        .is_empty()
+        .then(|| save_report(&options.analysis, &value))
+        .flatten();
     let saved = saved_path.is_some();
     if saved {
         remove_journal(&options.analysis, &report);
@@ -593,19 +695,7 @@ fn run_inner(input: &MutationCliInput<'_>) -> Result<ExitCode, ProgrammaticError
         if json {
             emit_json(&value, input.json_style)?;
         } else {
-            let code = code_lookup(&report, input.root);
-            let flags = inspect_flags(input);
-            let text = render_run(
-                &report,
-                &RunReportOptions {
-                    min_score,
-                    code: Some(&code),
-                    inspect_flags: saved.then_some(flags.as_str()),
-                },
-            );
-            for line in text.lines() {
-                crate::report::sink::outln!("{line}");
-            }
+            emit_human(input, &report, min_score, saved);
         }
         if let Some(path) = input.output_file
             && let Err(code) = crate::finalize_report_file(path, input.quiet, input.output)
@@ -629,6 +719,97 @@ fn run_inner(input: &MutationCliInput<'_>) -> Result<ExitCode, ProgrammaticError
         ));
     }
     Ok(ExitCode::from(exit))
+}
+
+/// Prints the human run report, then the recheck or compare section.
+fn emit_human(
+    input: &MutationCliInput<'_>,
+    report: &MutationReport,
+    min_score: Option<f64>,
+    saved: bool,
+) {
+    let code = code_lookup(report, input.root);
+    let flags = inspect_flags(input);
+    let text = render_run(
+        report,
+        &RunReportOptions {
+            min_score,
+            code: Some(&code),
+            inspect_flags: saved.then_some(flags.as_str()),
+        },
+    );
+    let section_text = report
+        .recheck
+        .as_ref()
+        .map(recheck::render)
+        .or_else(|| report.compare.as_ref().map(compare::render));
+    for line in text
+        .lines()
+        .chain(section_text.iter().flat_map(|text| text.lines()))
+    {
+        crate::report::sink::outln!("{line}");
+    }
+}
+
+#[path = "mutation_recheck.rs"]
+mod recheck;
+
+#[path = "mutation_compare.rs"]
+mod compare;
+
+/// The compare section of a `--compare` run, or the error of a run that is
+/// not complete. Both are `None` without `--compare`.
+fn compare_with(
+    baseline: Option<&compare::Baseline>,
+    report: &MutationReport,
+) -> (
+    Option<fallow_output::MutationCompare>,
+    Option<ProgrammaticError>,
+) {
+    let Some(baseline) = baseline else {
+        return (None, None);
+    };
+    match compare::guard_run_complete(report) {
+        Some(error) => (None, Some(error)),
+        None => (Some(baseline.compare(&report.mutants)), None),
+    }
+}
+
+/// Narrows the run options to the mutants of a recheck and gives the minimum
+/// score. The score of a recheck covers only the rechecked mutants, so the
+/// project gate of `mutation.minScore` does not apply to it.
+fn apply_recheck(
+    input: &MutationCliInput<'_>,
+    options: &mut MutationRunOptions,
+    recheck: Option<&recheck::Selection>,
+) -> Result<Option<f64>, ProgrammaticError> {
+    let Some(selection) = recheck else {
+        return min_score(input);
+    };
+    options.scope = MutationRunScope::Paths(selection.files());
+    options.mutant_ids = selection.mutant_ids();
+    options.test_changes_only = true;
+    options.mutants_per_line = None;
+    options.function_scope = false;
+    Ok(None)
+}
+
+/// The mutants of a `--recheck` run, from the saved report. `None` without
+/// `--recheck`.
+fn recheck_selection(
+    input: &MutationCliInput<'_>,
+) -> Result<Option<recheck::Selection>, ProgrammaticError> {
+    if !input.args.recheck {
+        return Ok(None);
+    }
+    if input.changed_since.is_some() {
+        return Err(input_error(
+            "--recheck takes its mutants from the report; it cannot be combined with --changed-since",
+            "mutation.recheck",
+        ));
+    }
+    let (path, root) = inspect_report_path(input, input.args.report.as_deref())?;
+    recheck::select(&path, &root, &input.args.mutants).map(Some)
 }
 
 /// Saves the report for `fallow mutation inspect` and gives its path. A
@@ -820,6 +1001,64 @@ fn run_inspect(input: &MutationCliInput<'_>, mutant_id: &str, report: Option<&Pa
         for line in render_inspect(&packet).lines() {
             crate::report::sink::outln!("{line}");
         }
+    }
+    if let Some(path) = input.output_file
+        && let Err(code) = crate::finalize_report_file(path, input.quiet, output)
+    {
+        return code;
+    }
+    ExitCode::SUCCESS
+}
+
+#[path = "mutation_tasks.rs"]
+mod tasks;
+
+fn run_tasks(input: &MutationCliInput<'_>, report: Option<&Path>) -> ExitCode {
+    let (output, style) = (input.output, input.json_style);
+    if !matches!(
+        output,
+        OutputFormat::Human | OutputFormat::Json | OutputFormat::Markdown
+    ) {
+        return crate::error::emit_input_error_with_style(
+            "`fallow mutation tasks` supports only human, json and markdown output",
+            output,
+            style,
+        );
+    }
+    let batch = inspect_report_path(input, report).and_then(|(path, root)| {
+        let saved = crate::mutation_inspect::read_saved_report(&path)?;
+        tasks::tasks(&saved, &root)
+    });
+    let batch = match batch {
+        Ok(batch) => batch,
+        Err(error) => return crate::error::emit_programmatic_error(&error, output, style),
+    };
+    crate::telemetry::note_result_count(batch.tasks.len());
+    if let Some(path) = input.output_file
+        && let Err(code) = crate::redirect_report_to_file(path, output)
+    {
+        return code;
+    }
+    let text = match output {
+        OutputFormat::Json => {
+            let result = serialize_mutation_tasks_json_output(batch)
+                .map_err(|error| {
+                    ProgrammaticError::new(
+                        format!("failed to serialize the mutation tasks: {error}"),
+                        INPUT_EXIT_CODE,
+                    )
+                })
+                .and_then(|value| emit_json(&value, style));
+            if let Err(error) = result {
+                return crate::error::emit_programmatic_error(&error, output, style);
+            }
+            None
+        }
+        OutputFormat::Markdown => Some(tasks::render_markdown(&batch)),
+        _ => Some(tasks::render_text(&batch)),
+    };
+    for line in text.iter().flat_map(|text| text.lines()) {
+        crate::report::sink::outln!("{line}");
     }
     if let Some(path) = input.output_file
         && let Err(code) = crate::finalize_report_file(path, input.quiet, output)

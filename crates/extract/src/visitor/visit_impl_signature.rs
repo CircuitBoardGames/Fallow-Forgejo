@@ -5,6 +5,32 @@ use super::*;
 use crate::js_text::JsText;
 use crate::{SemanticFact, TypeAliasSurfaceTargetFact};
 
+/// A local in a class method that holds the result of a `this.<name>()` call,
+/// such as `table` in `const table = this.find()`. The extractor keeps the
+/// locals of one name in declaration order, the outer local first.
+#[derive(Debug, Clone)]
+pub(in crate::visitor) struct ThisResultLocal {
+    /// The `scoped_direct_object_binding_roots` frame that declares the local.
+    /// A binding with the same name in a deeper frame hides the local.
+    frame: usize,
+    /// `this.find()` when a base class declares the method (issue #4183).
+    /// `None` when the class itself declares the return type (issue #4033).
+    inherited_source: Option<String>,
+    /// The deeper frame that binds the same name to a class of its own. A read
+    /// in that frame resolves through the class binding, not through the local.
+    rebound_frame: Option<usize>,
+    /// The deeper frames that hold a copy of an outer binding of the name,
+    /// such as the branch of an `instanceof` guard. A copy declares nothing.
+    forked_frames: Vec<usize>,
+}
+
+/// The visitor state that a method body replaces and its end restores.
+pub(super) struct MethodVisitState {
+    span: Option<Span>,
+    independent_this_depth: usize,
+    this_result_locals: FxHashMap<String, Vec<ThisResultLocal>>,
+}
+
 impl ModuleInfoExtractor {
     fn collect_type_alias_surface_targets(
         ty: &TSType<'_>,
@@ -604,16 +630,26 @@ impl ModuleInfoExtractor {
         }
     }
 
-    /// Prepare the visit of a method body. Set the method span and reset the
-    /// independent `this` depth. Return the previous span and depth, which the
-    /// caller restores after the walk.
+    /// Prepare the visit of a method body. Set the method span, reset the
+    /// independent `this` depth, and start an empty set of `this` result
+    /// locals. Return the previous state, which the caller gives to
+    /// `exit_method_definition` after the walk.
     pub(super) fn enter_method_definition(
         &mut self,
         method: &MethodDefinition<'_>,
-    ) -> (Option<Span>, usize) {
-        let previous_span = self.class_method_function_span.replace(method.value.span);
-        let previous_depth = std::mem::replace(&mut self.independent_this_depth, 0);
-        (previous_span, previous_depth)
+    ) -> MethodVisitState {
+        MethodVisitState {
+            span: self.class_method_function_span.replace(method.value.span),
+            independent_this_depth: std::mem::replace(&mut self.independent_this_depth, 0),
+            this_result_locals: std::mem::take(&mut self.this_result_locals),
+        }
+    }
+
+    /// Restore the state that `enter_method_definition` returned.
+    pub(super) fn exit_method_definition(&mut self, previous: MethodVisitState) {
+        self.class_method_function_span = previous.span;
+        self.independent_this_depth = previous.independent_this_depth;
+        self.this_result_locals = previous.this_result_locals;
     }
 
     /// Record a `this` binding for an instance method or getter that declares
@@ -627,7 +663,7 @@ impl ModuleInfoExtractor {
     /// method. The class visit calls this for each method before it walks the
     /// class body. Thus a local such as `const old = this.current()` resolves
     /// also when the method comes after the call site (issue #4033).
-    pub(super) fn record_this_return_binding(&mut self, method: &MethodDefinition<'_>) {
+    fn record_this_return_binding(&mut self, method: &MethodDefinition<'_>) {
         let call_suffix = match method.kind {
             MethodDefinitionKind::Method => "()",
             MethodDefinitionKind::Get => "",
@@ -667,9 +703,11 @@ impl ModuleInfoExtractor {
     /// `old?.deactivate?.()` then credits `Tool.deactivate`, as the direct
     /// `this.current()?.deactivate?.()` does (issue #4033).
     ///
-    /// Only a call with no arguments directly on `this` gives a binding. A
-    /// cast (`as`), a call with arguments, and a call in a function with its
-    /// own `this` give no binding.
+    /// Only a call directly on `this` gives a binding. The arguments do not
+    /// change the binding: `this.findBy(1)` binds to the return type of
+    /// `findBy`, as the direct `this.findBy(1)?.reset()` does (issue #4199).
+    /// A cast (`as`) and a call in a function with its own `this` give no
+    /// binding.
     pub(super) fn record_this_method_result_alias(
         &mut self,
         declarator: &VariableDeclarator<'_>,
@@ -678,6 +716,14 @@ impl ModuleInfoExtractor {
         let BindingPattern::BindingIdentifier(id) = &declarator.id else {
             return;
         };
+        let frame = self.current_binding_frame();
+        // A declaration in the frame of the local replaces it. A declaration
+        // in a deeper frame is a shadow, which the frame roots record. The
+        // outer local stays for the reads after the deeper frame ends.
+        if let Some(locals) = self.this_result_locals.get_mut(id.name.as_str()) {
+            locals.retain(|local| local.frame < frame);
+        }
+        self.mark_factory_local_rebound(id.name.as_str(), init);
         if self.class_scope_stack.is_empty() || self.independent_this_depth > 0 {
             return;
         }
@@ -685,10 +731,172 @@ impl ModuleInfoExtractor {
             return;
         };
         let key = self.this_member_key(&format!("{name}()"));
-        if let Some(BindingTarget::Class(type_name)) = self.binding_target_names.get(&key) {
-            let type_name = type_name.clone();
-            self.insert_class_binding_target(id.name.to_string(), type_name);
+        let inherited_source = match self.binding_target_names.get(&key) {
+            Some(BindingTarget::Class(type_name)) => {
+                let type_name = type_name.clone();
+                self.insert_class_binding_target(id.name.to_string(), type_name);
+                None
+            }
+            // The class does not declare a typed `name()`, so a base class
+            // can declare it (issue #4183). Keep the call spelling for the
+            // local, so the analysis resolves it through the inherited
+            // return type.
+            None => Some(format!("this.{name}()")),
+            Some(_) => return,
+        };
+        self.this_result_locals
+            .entry(id.name.to_string())
+            .or_default()
+            .push(ThisResultLocal {
+                frame,
+                inherited_source,
+                rebound_frame: None,
+                forked_frames: Vec::new(),
+            });
+    }
+
+    /// The index of the innermost `scoped_direct_object_binding_roots` frame.
+    fn current_binding_frame(&self) -> usize {
+        self.scoped_direct_object_binding_roots
+            .len()
+            .saturating_sub(1)
+    }
+
+    /// Whether a binding in a deeper frame hides the `this` result local
+    /// `root` (issue #4198). A parameter, a loop head, a `catch` parameter and
+    /// a block declaration with the same name hold another value. A deeper
+    /// frame that binds the name to a class of its own does not count.
+    pub(super) fn this_result_local_is_shadowed(&self, root: &str) -> bool {
+        let Some(shadow) = self.this_result_local_shadow_frame(root) else {
+            return false;
+        };
+        self.innermost_this_result_local(root)
+            .is_some_and(|local| local.rebound_frame != Some(shadow))
+    }
+
+    /// The innermost open `this` result local with the name `root`.
+    fn innermost_this_result_local(&self, root: &str) -> Option<&ThisResultLocal> {
+        self.this_result_locals
+            .get(root)
+            .and_then(|locals| locals.last())
+    }
+
+    /// The innermost frame that declares `root` above the frame of the `this`
+    /// result local `root`. A frame with a copy of an outer binding does not
+    /// declare the name.
+    fn this_result_local_shadow_frame(&self, root: &str) -> Option<usize> {
+        let local = self.innermost_this_result_local(root)?;
+        self.scoped_direct_object_binding_roots
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, roots)| roots.contains(root) && !local.forked_frames.contains(index))
+            .map(|(index, _)| index)
+            .filter(|&index| index > local.frame)
+    }
+
+    /// Whether `frame` takes a copy of the outer binding of `root` that the
+    /// frame `owner` declares. A copy declares nothing, so the function also
+    /// records it for a `this` result local with the name `root`.
+    pub(super) fn admit_direct_object_binding_fork(
+        &mut self,
+        root: &str,
+        frame: usize,
+        owner: Option<usize>,
+    ) -> bool {
+        if owner.is_some_and(|index| index >= frame) {
+            return false;
         }
+        if let Some(local) = self
+            .this_result_locals
+            .get_mut(root)
+            .and_then(|locals| locals.last_mut())
+            && frame > local.frame
+            && !local.forked_frames.contains(&frame)
+        {
+            local.forked_frames.push(frame);
+        }
+        true
+    }
+
+    /// A local from a bare call such as `const seat = makeSeat()` can hold
+    /// a class that a same-file factory returns. The factory resolves after
+    /// the walk, so the shadow of a `this` result local counts as a class
+    /// binding of its own now. A callee that returns no class falls back to
+    /// the module-flat binding of the name.
+    fn mark_factory_local_rebound(&mut self, name: &str, init: &Expression<'_>) {
+        if !self.this_result_locals.contains_key(name) {
+            return;
+        }
+        let call = match init {
+            Expression::AwaitExpression(await_expr) => &await_expr.argument,
+            _ => init,
+        };
+        if Self::bare_call_callee_name(self.class_carrying_init(call)).is_some() {
+            self.mark_this_result_local_rebound(name);
+        }
+    }
+
+    /// Record that the shadow frame of the `this` result local `root` binds
+    /// the name to a class of its own.
+    pub(super) fn mark_this_result_local_rebound(&mut self, root: &str) {
+        let Some(shadow) = self.this_result_local_shadow_frame(root) else {
+            return;
+        };
+        if let Some(local) = self
+            .this_result_locals
+            .get_mut(root)
+            .and_then(|locals| locals.last_mut())
+        {
+            local.rebound_frame = Some(shadow);
+        }
+    }
+
+    /// Drop the `this` result locals of a closed frame, and the class
+    /// rebinding of a closed shadow frame. `depth` is the number of open
+    /// frames.
+    pub(super) fn close_this_result_local_frames(&mut self, depth: usize) {
+        if self.this_result_locals.is_empty() {
+            return;
+        }
+        self.this_result_locals.retain(|_, locals| {
+            locals.retain(|local| local.frame < depth);
+            for local in locals.iter_mut() {
+                if local.rebound_frame.is_some_and(|frame| frame >= depth) {
+                    local.rebound_frame = None;
+                }
+                local.forked_frames.retain(|&frame| frame < depth);
+            }
+            !locals.is_empty()
+        });
+    }
+
+    /// Record a read through a local that holds an inherited `this` method
+    /// result also on the call spelling: `table.setVip` gives
+    /// `this.find().setVip` for `const table = this.find()`. The analysis
+    /// then credits `setVip` on the return type that a base class declares
+    /// for `find()` (issue #4183).
+    pub(super) fn record_inherited_this_result_access(&mut self, object_name: &str, member: &str) {
+        let (root, rest) = object_name
+            .split_once('.')
+            .map_or((object_name, None), |(root, rest)| (root, Some(rest)));
+        // Any binding in a deeper frame holds another value, also a binding
+        // to a class of its own. Only the outer local reads the base class.
+        if self.this_result_local_shadow_frame(root).is_some() {
+            return;
+        }
+        let Some(source) = self
+            .innermost_this_result_local(root)
+            .and_then(|local| local.inherited_source.as_deref())
+        else {
+            return;
+        };
+        let source = match rest {
+            Some(rest) => format!("{source}.{rest}"),
+            None => source.to_string(),
+        };
+        let object = self.qualify_this_scope(&source);
+        self.push_receiver_member_access(object, member.to_string());
     }
 
     pub(super) fn record_typed_binding(
@@ -938,10 +1146,11 @@ impl<'a> Visit<'a> for ReturnedValueCollector<'_, '_, '_> {
     fn visit_class(&mut self, _class: &Class<'a>) {}
 }
 
-/// The method name of a call with no arguments on `this`: `current` for
-/// `this.current()` or `this.current?.()`, `#current` for `this.#current()`.
-/// Parentheses and a non-null assertion around the call are transparent. Any
-/// other expression, a cast included, gives `None`.
+/// The method name of a call on `this`: `current` for `this.current()`,
+/// `this.current?.()` or `this.current(1)`, `#current` for `this.#current()`.
+/// The arguments do not change the name. Parentheses and a non-null assertion
+/// around the call are transparent. Any other expression, a cast included,
+/// gives `None`.
 fn this_method_call_name(init: &Expression<'_>) -> Option<String> {
     let mut expr = init;
     let call = loop {
@@ -956,9 +1165,6 @@ fn this_method_call_name(init: &Expression<'_>) -> Option<String> {
             _ => return None,
         }
     };
-    if !call.arguments.is_empty() {
-        return None;
-    }
     match &call.callee {
         Expression::StaticMemberExpression(member)
             if matches!(member.object, Expression::ThisExpression(_)) =>

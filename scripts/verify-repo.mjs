@@ -24,10 +24,10 @@ const FAST_COMMANDS = [
     args: ["run", "check:agent-adapters"],
   },
   {
-    // CI runs the same rule in the "JS Lint and Format" job.
+    // CI runs the same rule for .rs files in the "Rust Structure" job.
     label: "Large file growth",
-    command: "node",
-    args: ["scripts/check-file-size.mjs", "--base", BASE_REF],
+    command: "cargo",
+    args: ["fallow", "size", "--base", BASE_REF, "--fail-on-growth", "--quiet"],
     requiresRef: BASE_REF,
   },
   {
@@ -81,24 +81,17 @@ const FAST_COMMANDS = [
     args: ["run", "generate:contracts:check"],
   },
   {
-    label: "Cargo feature unification",
-    command: "npm",
-    args: ["run", "check:cargo-features"],
-  },
-  {
-    label: "Crate boundaries",
-    command: "npm",
-    args: ["run", "check:crate-boundaries"],
-  },
-  {
-    label: "Miri cfg gates",
-    command: "npm",
-    args: ["run", "check:miri-cfg"],
-  },
-  {
-    label: "Bounded parse sites",
-    command: "npm",
-    args: ["run", "check:parse-sites"],
+    // The same command as the "Rust Structure" CI job.
+    label: "Rust structure",
+    command: "cargo",
+    args: [
+      "fallow",
+      "check",
+      "--baseline",
+      "cargo-fallow-baseline.json",
+      "--fail-on-issues",
+      "--quiet",
+    ],
   },
   {
     label: "Emitted version drift",
@@ -111,11 +104,26 @@ const FAST_COMMANDS = [
     args: ["run", "check:conformance-fixtures"],
   },
   {
+    // The step above builds the fallow binary that this step runs. CI runs
+    // the same rule for .mjs and .ts files in the "Fallow Self Analysis" job.
+    label: "File length",
+    command: "sh",
+    args: ["scripts/hook-file-length.sh", BASE_REF],
+    requiresRef: BASE_REF,
+  },
+  {
     // Fast, and it catches a Rust file with Windows-only code that no
     // Windows CI job lints.
     label: "Workflow policy",
     command: "node",
     args: ["--test", "scripts/workflow-policy.test.mjs"],
+  },
+  {
+    // The Miri CI job is path-filtered and slow. This step finds a test in
+    // a Miri crate that calls the file system and has no Miri ignore mark.
+    label: "Miri file system tests",
+    command: "npm",
+    args: ["run", "check:miri-fs-tests"],
   },
 ];
 
@@ -183,7 +191,7 @@ const FULL_ONLY_COMMANDS = [
   },
 ];
 
-const ROOT_INSTALL = "npm ci";
+const ROOT_INSTALL = "pnpm install";
 
 // Local installs that the gates need. The preflight checks all of them before
 // the first gate, so one run names every missing or stale install.
@@ -204,12 +212,19 @@ const FULL_ONLY_INSTALLS = [
     installCommand: "npm ci --prefix crates/napi",
   },
   {
-    // The sidecar has its own package.json, so the root `npm ci` leaves it
+    // The sidecar has its own package.json, so the root `pnpm install` leaves it
     // out. The type-aware workspace tests fail without it. `tsrs` is only in
     // the sidecar manifest, so the probe cannot resolve from the root install.
     dependency: "tsrs",
     resolveFrom: "tools/type-aware-sidecar/package.json",
     installCommand: "npm ci --prefix tools/type-aware-sidecar",
+  },
+  {
+    // The repository script tests render the contributor image. Without this
+    // probe, a partial root install fails only after the workspace tests.
+    dependency: "@resvg/resvg-js",
+    resolveFrom: "package.json",
+    installCommand: ROOT_INSTALL,
   },
 ];
 
@@ -293,14 +308,16 @@ export const helpText = () => `Usage: node scripts/verify-repo.mjs [--fast | --f
 Canonical local repository verification:
   --fast  Knowledge routing, adapter drift, large file growth against
           origin/main, formatting, linting, generated
-          contracts, crate boundaries, and the conformance fixtures (default)
+          contracts, Rust structure (cargo-fallow), and the conformance
+          fixtures (default)
   --full  Fast checks plus repository script tests, npm wrapper tests, workspace
           tests, the duplication accuracy floor, benchmark compilation, rustdoc,
           and the local NAPI build and tests
 
 Prerequisites:
-  - Node.js 22 or newer and root dependencies installed with npm install
+  - Node.js 22.12.0 or newer and root dependencies installed with pnpm install
   - A stable Rust toolchain with rustfmt and clippy
+  - cargo-fallow, at the version in mise.toml
   - editors/vscode dependencies installed with pnpm install
   - Full mode also needs crates/napi and tools/type-aware-sidecar
     dependencies installed with npm ci, and a platform compiler

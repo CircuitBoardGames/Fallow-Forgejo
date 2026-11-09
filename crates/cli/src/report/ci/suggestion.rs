@@ -249,6 +249,7 @@ mod tests {
             other_locations: Vec::new(),
             fingerprint: "abc".to_owned(),
             legacy_fingerprint: None,
+            audit: None,
         };
 
         assert_eq!(
@@ -359,6 +360,20 @@ mod tests {
     }
 
     #[test]
+    fn namespace_members_never_offer_unverified_line_deletions() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            assert!(
+                suggestion_block_for_issue_line(
+                    provider,
+                    "fallow/unused-namespace-member",
+                    "  export const unused = 2;"
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn renders_unused_class_member_delete_suggestion() {
         assert_eq!(
             suggestion_block_for_issue_line(
@@ -382,6 +397,7 @@ mod tests {
             other_locations: Vec::new(),
             fingerprint: "abc".to_owned(),
             legacy_fingerprint: None,
+            audit: None,
         }
     }
 

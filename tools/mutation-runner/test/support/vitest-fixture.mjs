@@ -64,6 +64,23 @@ export function shout(text: string): string {
   return (__fallow_m_a("m6") ? (null) : (__fallow_m_c("m6"), (text))).toUpperCase();
 }
 
+export function spin(limit: number): number {
+  let count = 0;
+  while ((__fallow_m_a("m12") ? (count < limit) : (__fallow_m_c("m12"), (count < limit)))) {
+    count = (__fallow_m_a("m11") ? (count) : (__fallow_m_c("m11"), (count + 1)));
+  }
+  return count;
+}
+
+export function drain(limit: number): number {
+  const step = (__fallow_m_a("m13") ? (0) : (__fallow_m_c("m13"), (1)));
+  let count = 0;
+  while ((__fallow_m_a("m14") ? (count < limit) : (__fallow_m_c("m14"), (count < limit)))) {
+    count += step;
+  }
+  return count;
+}
+
 export const READY = (__fallow_m_a("m7") ? ((() => { throw new Error("load failure"); })()) : (__fallow_m_c("m7"), (true)));
 `;
 
@@ -110,8 +127,34 @@ const PATH_MAP = {
   "src/unused.ts": "files/src/unused.ts",
 };
 
+const INSTRUMENTED_STORE = `// @ts-nocheck
+${PRELUDE}
+export const store: { value?: number } = (globalThis.fallowStore ??= {});
+
+export function reset(): void {
+  if ((__fallow_m_a("m30") ? (false) : (__fallow_m_c("m30"), (true)))) delete store.value;
+}
+`;
+
+const INSTRUMENTED_REUSE = `// @ts-nocheck
+${PRELUDE}
+const memo = new Map();
+
+export function double(value: number): number {
+  if (!memo.has(value)) memo.set(value, (__fallow_m_a("m40") ? (value * 3) : (__fallow_m_c("m40"), (value * 2))));
+  return memo.get(value);
+}
+
+export function stays(): number {
+  if ((__fallow_m_a("m41") ? (true) : (__fallow_m_c("m41"), (false)))) process.kill(process.pid, "SIGKILL");
+  return 1;
+}
+`;
+
 /** The optional run files, each with its path-map key. */
 const OPTIONAL_FILES = {
+  reuse: { source: "src/reuse.ts", text: INSTRUMENTED_REUSE },
+  store: { source: "src/store.ts", text: INSTRUMENTED_STORE },
   components: { source: "src/Badge.vue", text: INSTRUMENTED_BADGE },
   commonjs: { source: "require/shipping.cjs", text: INSTRUMENTED_SHIPPING },
 };
@@ -152,6 +195,8 @@ export const createFixtureProject = ({
   fixture = "vitest-basic",
   components = false,
   commonjs = false,
+  store = false,
+  reuse = false,
 } = {}) => {
   const installed = join(PACKAGE_ROOT, "node_modules", packageName);
   // Without this check the symlink below dangles, and each test then fails
@@ -172,7 +217,7 @@ export const createFixtureProject = ({
     mkdirSync(join(root, "node_modules"));
     symlinkSync(installed, join(root, "node_modules", "vitest"), "dir");
   }
-  const { runFiles, pathMap } = fixtureFiles({ components, commonjs });
+  const { runFiles, pathMap } = fixtureFiles({ components, commonjs, store, reuse });
   for (const [path, text] of Object.entries(runFiles)) write(runDir, path, text);
   return {
     root,

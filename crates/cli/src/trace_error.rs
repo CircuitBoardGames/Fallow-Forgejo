@@ -15,7 +15,8 @@ use fallow_config::{OutputFormat, ProductionAnalysis};
 use fallow_engine::trace_error::MAX_STACK_TRACE_BYTES;
 use fallow_types::trace_error::{ErrorTrace, FrameResolution};
 
-use crate::error::emit_error;
+use crate::error::emit_input_error;
+use crate::exit_codes::INVALID_INPUT;
 use crate::report;
 use crate::report::sink::outln;
 use crate::{ConfigLoadOptions, load_config_for_analysis};
@@ -42,7 +43,7 @@ pub fn run_trace_error(opts: &TraceErrorOptions<'_>) -> ExitCode {
     let (input, source) = match read_trace(opts.root, opts.trace_file) {
         Ok(pair) => pair,
         Err((message, hint)) => {
-            return crate::error::emit_error_with_hint(&message, hint, 2, opts.output);
+            return crate::error::emit_error_with_hint(&message, hint, INVALID_INPUT, opts.output);
         }
     };
 
@@ -65,13 +66,13 @@ pub fn run_trace_error(opts: &TraceErrorOptions<'_>) -> ExitCode {
 
     let session = match fallow_engine::session::AnalysisSession::from_resolved_config(config) {
         Ok(session) => session,
-        Err(err) => return emit_error(&format!("Analysis error: {err}"), 2, opts.output),
+        Err(err) => return emit_input_error(&format!("Analysis error: {err}"), opts.output),
     };
 
     let trace = match fallow_engine::trace_error::trace_error_with_session(&session, &input, source)
     {
         Ok(trace) => trace,
-        Err(err) => return emit_error(&format!("Analysis error: {err}"), 2, opts.output),
+        Err(err) => return emit_input_error(&format!("Analysis error: {err}"), opts.output),
     };
 
     emit_trace_error(trace, opts)
@@ -169,9 +170,8 @@ fn emit_trace_error(trace: ErrorTrace, opts: &TraceErrorOptions<'_>) -> ExitCode
             ) {
                 Ok(value) => value,
                 Err(err) => {
-                    return emit_error(
+                    return emit_input_error(
                         &format!("failed to serialize trace-error output: {err}"),
-                        2,
                         opts.output,
                     );
                 }
@@ -185,7 +185,7 @@ fn emit_trace_error(trace: ErrorTrace, opts: &TraceErrorOptions<'_>) -> ExitCode
         _ => crate::error::emit_error_with_hint(
             "trace-error supports --format json or human",
             "re-run with `--format json` for a machine-readable answer, or drop `--format`",
-            2,
+            INVALID_INPUT,
             opts.output,
         ),
     }
@@ -280,11 +280,11 @@ fn print_human(trace: &ErrorTrace, quiet: bool) {
 
 /// The empty state: one statement of the fact, then what to do about it.
 ///
-/// It used to state the same thing three times (a literal `No stack frames
-/// recognised.`, a counts line that was all zeroes, and the prose `reason`) and
-/// then stop, with no next step and nothing saying the input can be piped. The
-/// unparsed-line count is folded into the sentence rather than left on a counts
-/// line so it survives `--quiet`, which drops prose.
+/// It states the fact once, instead of a literal `No stack frames recognised.`,
+/// a counts line of zeroes and the prose `reason`, and it names the next step,
+/// including that the input can be piped. The unparsed-line count is folded
+/// into the sentence rather than left on a counts line so it survives
+/// `--quiet`, which drops prose.
 fn print_empty_human(trace: &ErrorTrace) {
     let unparsed = trace.counts.unparsed_lines;
     if unparsed > 0 {

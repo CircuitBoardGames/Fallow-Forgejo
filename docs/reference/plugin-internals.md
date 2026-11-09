@@ -91,6 +91,38 @@ The rule suppresses unlisted-dependency findings only. It does not change
 resolution, so a real installed package, a path alias, or a workspace package
 with the same name still wins, and the import keeps crediting that package.
 
+The React Native plugin adds such a rule for each static key of the Metro
+`resolver.extraNodeModules` object (`crates/core/src/plugins/metro.rs`).
+Metro maps the key to a folder, which is often generated output. The plugin
+reads the object as a `extraNodeModules` property value or as the right side
+of a `config.resolver.extraNodeModules = {...}` assignment.
+
+## Packages that a config needs installed
+
+A plugin may push a `RequiredDependency` when a config needs a package that no
+source file imports. The check reports the package as unlisted when no
+manifest that the config can use lists it. The manifest that owns the config,
+each ancestor manifest, and the root manifest count. A sibling manifest does
+not, and `ignoreDependencies` suppresses the finding. The finding points at the
+config value.
+
+Push a requirement only for a value that names a package with certainty. A
+shorthand that a tool expands to an unknown package name, or a path, must stay
+a dependency credit only. Mark a requirement `dev_only` when only a development
+tool loads the package, so a `--production` run skips it.
+
+The current producers are:
+
+- the TypeScript plugin, for each bare `compilerOptions.plugins[].name`,
+  except the plugins that editor extensions ship (`EDITOR_BUNDLED_PLUGINS`);
+- the Expo and Expo Router plugins, for `expo-system-ui` when the app config
+  sets `userInterfaceStyle` at the top level or under `android`. iOS applies
+  its own key without `expo-system-ui`.
+
+The check also reads each `package.json` from the config directory up to the
+project root, so a manifest that owns no analyzed file still counts. A config
+that `ignorePatterns` covers gives no finding.
+
 ## Advisories about a config a plugin could not use
 
 A plugin never prints an advisory about the config it read. It pushes a
@@ -533,6 +565,29 @@ unused in this one.
 The plugin has no tooling dependencies. The Egg binaries (`egg-bin`,
 `egg-scripts`) are credited by the scripts that call them.
 
+## Configs exported through `mergeConfig`
+
+A Vite, Vitest or Vite+ config can export `mergeConfig(defaults, overrides)`.
+Each argument can be an object literal, a `defineConfig(...)` or
+`defineProject(...)` call, a local variable, or a nested `mergeConfig(...)`.
+The `extract_config_*` readers in `config_parser.rs` read every argument
+that resolves to an object, as Vite merges them:
+
+- A list value concatenates in argument order.
+- A single value comes from the last argument that sets it. When that value
+  is not static, the reader gives no value, and an earlier static value does
+  not apply.
+
+Before a reader runs, the constant inline pass replaces a list element
+`defineProject(value)` or `defineConfig(value)` with `value`. A
+`test.projects` list of such calls then gives its project objects, also when
+`value` names a local constant.
+
+The options object of another call, such as a plugin call, is not a config.
+An imported argument gives no object, because the parser does not follow
+imports. Code that calls `find_config_object` directly still reads one
+object only.
+
 ## Vite+ config blocks
 
 Vite+ keeps the config of each tool that it bundles in `vite.config.*`.
@@ -559,6 +614,40 @@ entry points, `vp test -c <file>` sends the file to the Vitest plugin, and
 `vp pack <file>` makes an entry point. `vp run <task>` and `vpr <task>` call a
 declared script. `vp exec`, `vp dlx` and `vpx` run their child command, as a
 command wrapper does.
+
+## GraphQL config files
+
+The `graphql-config` plugin reads `graphql.config.*`, `.graphqlrc`,
+`.graphqlrc.*`, and the `graphql` key in `package.json`. GraphQL tools read
+the files that the `schema` and `documents` globs name, so the plugin pushes
+these globs to `always_used_files`. It reads the top level and each
+`projects.<name>` entry. Each glob is relative to the directory of the config
+file. Only a glob whose extensions are all GraphQL extensions (`graphql`,
+`gql`, `graphqls`) gets credit. An import reaches a source file, and a credit
+for a broad glob such as `src/**/*.tsx` hides real unused files. A URL and a
+negated glob get no credit. The plugin does not apply a negated glob to the
+other globs, so a file that a negation excludes stays used. A workspace run
+reads a package config with the package directory as its root. A glob that
+climbs out of the package, such as `../../shared/*.graphql`, becomes a
+parent-relative entry pattern.
+
+A tool that reads the config often depends on `graphql-config` only
+transitively. So the plugin also activates from a config file anywhere below
+the root, through the candidate index of the discovery walk, and from a
+`graphql` object in `package.json`. Production mode has no candidate index,
+so the plugin probes only the root for a config file. The `graphql-codegen`
+plugin reads `graphql.config.*` too. Both results add up.
+
+## pnpm hook files
+
+The registry calls `is_enabled_with_deps` and `is_enabled_with_files`, not
+`Plugin::is_enabled`. A plugin that activates from a file must probe for the
+file in one of these methods. The pnpm plugin probes the root for
+`pnpm-workspace.yaml`, `pnpm-lock.yaml`, `.pnpmfile.cjs`, and `.pnpmfile.mjs`,
+and also activates from a `packageManager` field that names pnpm. pnpm loads
+the pnpmfile next to the lockfile. The `pnpmfile` setting in
+`pnpm-workspace.yaml` (one path or a list) or in `.npmrc` moves it. The plugin
+reads both settings and marks the files as used.
 
 ## Author verification
 

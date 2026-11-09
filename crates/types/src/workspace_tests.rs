@@ -33,6 +33,26 @@ fn workspace_pattern_dir_missing_id_degrades_and_names_the_directory() {
 }
 
 #[test]
+fn workspace_pattern_dir_missing_in_nested_pnpm_file_names_its_catalog() {
+    let root = Path::new("/project");
+    let diag = WorkspaceDiagnostic::new(
+        root,
+        root.join("site/pnpm-workspace.yaml"),
+        WorkspaceDiagnosticKind::WorkspacePatternDirMissing {
+            pattern: "libs/*".to_owned(),
+        },
+    );
+    assert!(
+        diag.message.contains("'site/pnpm-workspace.yaml'")
+            && diag
+                .message
+                .contains("Unused entries of the catalog in that file are not reported"),
+        "{}",
+        diag.message
+    );
+}
+
+#[test]
 fn workspace_pattern_dir_missing_from_config_names_the_setting() {
     let root = Path::new("/project");
     let diag = WorkspaceDiagnostic::new(
@@ -974,6 +994,35 @@ fn override_rule_ineffective_is_an_advisory_root_note() {
     assert_eq!(json["rule"], "re-export-cycle");
     assert_eq!(json["files"][1], "lib/**");
     assert_eq!(json["reason"], "project-level");
+}
+
+#[test]
+fn requested_rule_off_is_an_advisory_root_note() {
+    let root = Path::new("/project");
+    let kind = WorkspaceDiagnosticKind::RequestedRuleOff {
+        rule: "unused-dependencies".to_owned(),
+        flag: "--unused-deps".to_owned(),
+    };
+    let diag = WorkspaceDiagnostic::new(root, root.to_path_buf(), kind.clone());
+    assert!(!diag.degrades_analysis);
+    assert!(!kind.warns_on_stderr());
+    assert!(!kind.is_redundant_config_entry());
+    assert_eq!(kind.unmatched_config_pattern(), None);
+    assert_eq!(kind.ineffective_override(), None);
+    assert_eq!(
+        kind.requested_rule_off(),
+        Some(("unused-dependencies", "--unused-deps"))
+    );
+    assert_eq!(
+        diag.message,
+        "unused-dependencies is off in config, so --unused-deps did not check it. Set the rule \
+         to \"error\" or \"warn\" to run this check."
+    );
+    let json = serde_json::to_value(&diag).expect("serialize");
+    assert_eq!(json["kind"], "requested-rule-off");
+    assert_eq!(json["rule"], "unused-dependencies");
+    assert_eq!(json["flag"], "--unused-deps");
+    assert!(json.get("degrades_analysis").is_none());
 }
 
 #[test]

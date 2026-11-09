@@ -11,7 +11,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use oxc_allocator::{Allocator, CloneIn};
-#[allow(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -22,7 +21,7 @@ mod value_changes;
 
 /// The maximum number of constants that one inlined value can pass through,
 /// as in `const A = {...}; const B = [A]; export default { x: B }`.
-pub(super) const MAX_INLINE_NESTING: usize = 4;
+const MAX_INLINE_NESTING: usize = 4;
 
 /// Replace each identifier in a property value or an array element that names
 /// a stable top-level constant with a literal value, and replace each object
@@ -34,15 +33,15 @@ pub(super) const MAX_INLINE_NESTING: usize = 4;
 /// The copied AST nodes stay at or below `source_len`, and each node of the
 /// parsed source spans at least one byte, so the AST grows at most to two
 /// times its parsed size.
-pub(super) fn inline_value_constants<'a>(
+///
+/// The pass also replaces an array element `defineProject(value)` with
+/// `value`, also when the program has no qualifying constant.
+fn inline_value_constants<'a>(
     allocator: &'a Allocator,
     program: &mut Program<'a>,
     source_len: usize,
 ) {
     let values = constant_values(allocator, program);
-    if values.is_empty() {
-        return;
-    }
     Inliner::new(allocator, &values, source_len).visit_program(program);
 }
 
@@ -363,6 +362,7 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
     }
 
     fn visit_array_expression_element(&mut self, element: &mut ArrayExpressionElement<'a>) {
+        unwrap_define_helper_call(element);
         let copy = element.as_expression().and_then(|expr| self.copy_for(expr));
         let Some(value) = copy else {
             walk_mut::walk_array_expression_element(self, element);
@@ -372,6 +372,24 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
         self.nesting += 1;
         walk_mut::walk_array_expression_element(self, element);
         self.nesting -= 1;
+    }
+}
+
+/// Replace an array element `defineProject(value)` or `defineConfig(value)`
+/// with `value`. These helpers return their only argument, so a list such as
+/// `projects: [defineProject(unit)]` holds the value itself.
+fn unwrap_define_helper_call(element: &mut ArrayExpressionElement<'_>) {
+    let ArrayExpressionElement::CallExpression(call) = element else {
+        return;
+    };
+    if call.arguments.len() != 1
+        || call.arguments[0].is_spread()
+        || !super::merge_config::is_define_config_callee(&call.callee)
+    {
+        return;
+    }
+    if let Some(argument) = call.arguments.pop() {
+        *element = ArrayExpressionElement::from(argument.into_expression());
     }
 }
 
@@ -391,7 +409,7 @@ pub(super) fn holds_one_stable_object(
 /// The subset of `names` that [`holds_one_stable_object`] accepts, from one
 /// walk of the program. With `require_top_level` unset, the caller checks
 /// where the one binding of each name is.
-pub(super) fn stable_bindings<'n>(
+fn stable_bindings<'n>(
     program: &Program<'_>,
     names: impl IntoIterator<Item = &'n str>,
     allow_mutating_calls: bool,
@@ -530,6 +548,37 @@ impl NameCount {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The number of identifiers that [`NameUsage`] read on this thread.
+    static NAME_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one identifier that [`NameUsage`] reads. Tests read the count to
+/// check that the stable filter does work linear in the program size.
+fn count_name_visit() {
+    #[cfg(test)]
+    NAME_VISITS.set(NAME_VISITS.get() + 1);
+}
+
+/// The number of identifiers that [`NameUsage`] read on this thread since
+/// the last call. The count starts again at zero.
+#[cfg(test)]
+pub(super) fn take_name_visits() -> usize {
+    NAME_VISITS.replace(0)
+}
+
+/// The number of steps that the alias analysis took on this thread since the
+/// last call. The count starts again at zero.
+#[cfg(test)]
+pub(super) fn take_alias_steps() -> usize {
+    value_changes::take_steps()
+}
+
+/// The most steps that one run of the alias analysis can count.
+#[cfg(test)]
+pub(super) const MAX_ALIAS_STEPS: usize = value_changes::MAX_TOTAL_STEPS;
+
 /// The [`NameCount`] of each name in a set, from one walk of a program.
 struct NameUsage<'n> {
     counts: FxHashMap<&'n str, NameCount>,
@@ -558,12 +607,14 @@ impl NameUsage<'_> {
 
 impl<'a> Visit<'a> for NameUsage<'_> {
     fn visit_binding_identifier(&mut self, identifier: &BindingIdentifier<'a>) {
+        count_name_visit();
         if let Some(count) = self.counts.get_mut(identifier.name.as_str()) {
             count.bindings += 1;
         }
     }
 
     fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        count_name_visit();
         if self.write_depth > 0
             && let Some(count) = self.counts.get_mut(identifier.name.as_str())
         {

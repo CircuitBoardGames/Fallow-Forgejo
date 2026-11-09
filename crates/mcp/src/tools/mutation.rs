@@ -1,4 +1,5 @@
-//! Read-only mutation tools. MCP plans mutants and inspects one mutant, but
+//! Read-only mutation tools. MCP plans mutants, inspects one mutant and lists
+//! the open tasks of a report, but
 //! never runs the tests of the project: a run is a
 //! host permission decision, so it stays with the `fallow mutation` CLI.
 
@@ -11,13 +12,25 @@ use fallow_api::{MutationRunOptions, MutationRunScope, plan_mutation};
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, ContentBlock};
 
-use crate::params::{MutationInspectParams, MutationPlanParams};
+use crate::params::{MutationInspectParams, MutationPlanParams, MutationTasksParams};
 
 use super::api_runtime::{
     EnvScope, call_cancellation, json_success, non_empty_path, non_empty_string,
     programmatic_error_body, run_api_blocking, shared_analysis_options, shared_params,
 };
 use super::{push_global, push_remote_extends, run_tool, validation_error_body};
+
+/// The error for `package` on the JavaScript route: only a Cargo workspace
+/// has packages in this sense.
+const PACKAGE_ON_JS_MESSAGE: &str =
+    "package is valid only on a Rust workspace (a root with Cargo.toml and no package.json)";
+
+fn reject_package(package: Option<&str>) -> Result<(), String> {
+    match package {
+        Some(_) => Err(validation_error_body(PACKAGE_ON_JS_MESSAGE)),
+        None => Ok(()),
+    }
+}
 
 /// Build the static mutation plan through the typed API. Without the
 /// `operators` param, `plan_mutation` applies the `mutation.operators` config
@@ -63,6 +76,19 @@ pub async fn run_mutation_inspect(
     }
 }
 
+/// List the open tasks of a saved report through `fallow mutation tasks`.
+/// Without `report`, the CLI reads the report that the last run saved in the
+/// cache directory of the project.
+pub async fn run_mutation_tasks(
+    binary: &str,
+    params: MutationTasksParams,
+) -> Result<CallToolResult, McpError> {
+    match build_mutation_tasks_args(&params) {
+        Ok(args) => run_tool(binary, "mutation_tasks", &args).await,
+        Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+    }
+}
+
 /// Map the plan parameters to the typed plan options, with the same scope
 /// rules as the CLI: changed code by default, `all` or `paths` otherwise.
 ///
@@ -74,6 +100,7 @@ pub fn mutation_plan_options(
     params: &MutationPlanParams,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<MutationRunOptions, String> {
+    reject_package(params.package.as_deref())?;
     Ok(MutationRunOptions {
         // The plan scope comes from the tool's own `changed_since`, `paths`
         // and `all` params, not from the inherited environment.
@@ -85,7 +112,7 @@ pub fn mutation_plan_options(
     })
 }
 
-fn plan_scope(params: &MutationPlanParams) -> Result<MutationRunScope, String> {
+pub(super) fn plan_scope(params: &MutationPlanParams) -> Result<MutationRunScope, String> {
     let all = params.all == Some(true);
     let base = non_empty_string(params.changed_since.as_deref());
     let selected = [all, params.paths.is_some(), base.is_some()]
@@ -147,6 +174,7 @@ fn plan_operators(names: Option<&[String]>) -> Result<Option<Vec<Operator>>, Str
 /// Returns a validation error body when `mutant_id` or a given `report` is
 /// empty.
 pub fn build_mutation_inspect_args(params: &MutationInspectParams) -> Result<Vec<String>, String> {
+    reject_package(params.package.as_deref())?;
     let mutant_id = params.mutant_id.trim();
     if mutant_id.is_empty() {
         return Err(validation_error_body("mutant_id must not be empty"));
@@ -173,6 +201,43 @@ pub fn build_mutation_inspect_args(params: &MutationInspectParams) -> Result<Vec
     );
     push_remote_extends(&mut args, params.allow_remote_extends);
     args.extend(["inspect".to_owned(), mutant_id.to_owned()]);
+    if let Some(report) = &params.report {
+        args.extend([
+            "--report".to_owned(),
+            report_path(params.root.as_deref(), report.trim()),
+        ]);
+    }
+    Ok(args)
+}
+
+/// Build the CLI arguments of `mutation_tasks`.
+///
+/// # Errors
+///
+/// Returns a validation error body when a given `report` is empty.
+pub fn build_mutation_tasks_args(params: &MutationTasksParams) -> Result<Vec<String>, String> {
+    if params
+        .report
+        .as_deref()
+        .is_some_and(|report| report.trim().is_empty())
+    {
+        return Err(validation_error_body("report must not be empty"));
+    }
+    let mut args = vec![
+        "mutation".to_owned(),
+        "--format".to_owned(),
+        "json".to_owned(),
+        "--quiet".to_owned(),
+    ];
+    push_global(
+        &mut args,
+        params.root.as_deref(),
+        params.config.as_deref(),
+        None,
+        None,
+    );
+    push_remote_extends(&mut args, params.allow_remote_extends);
+    args.push("tasks".to_owned());
     if let Some(report) = &params.report {
         args.extend([
             "--report".to_owned(),
@@ -375,6 +440,37 @@ mod tests {
                 report.as_ref(),
             ]
         );
+    }
+
+    #[test]
+    fn tasks_forwards_the_report_and_the_root_to_the_cli() {
+        let params: MutationTasksParams = serde_json::from_value(serde_json::json!({
+            "report": "reports/run.json",
+            "root": "/repo",
+        }))
+        .unwrap();
+        let args = build_mutation_tasks_args(&params).unwrap();
+        let report = std::path::Path::new("/repo")
+            .join("reports/run.json")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            args,
+            [
+                "mutation", "--format", "json", "--quiet", "--root", "/repo", "tasks", "--report",
+                &report,
+            ]
+        );
+
+        let last_run: MutationTasksParams =
+            serde_json::from_value(serde_json::json!({ "root": "/repo" })).unwrap();
+        let args = build_mutation_tasks_args(&last_run).unwrap();
+        assert_eq!(args.last().map(String::as_str), Some("tasks"));
+
+        let empty: MutationTasksParams =
+            serde_json::from_value(serde_json::json!({ "report": " " })).unwrap();
+        let error = build_mutation_tasks_args(&empty).unwrap_err();
+        assert!(error.contains("report must not be empty"), "{error}");
     }
 
     #[test]
@@ -644,5 +740,20 @@ mod tests {
         assert!(is_error, "{body}");
         assert_eq!(body["code"], "FALLOW_INVALID_MUTATION_OPTIONS");
         assert_eq!(body["exit_code"], 2);
+    }
+
+    #[test]
+    fn a_package_on_a_javascript_project_is_an_error() {
+        let body =
+            mutation_plan_options(&plan_params(serde_json::json!({ "package": "core" })), None)
+                .err()
+                .unwrap();
+        assert_eq!(error_message(&body), PACKAGE_ON_JS_MESSAGE);
+        let body = build_mutation_inspect_args(&inspect_params(serde_json::json!({
+            "mutant_id": "m_1",
+            "package": "core",
+        })))
+        .unwrap_err();
+        assert_eq!(error_message(&body), PACKAGE_ON_JS_MESSAGE);
     }
 }
