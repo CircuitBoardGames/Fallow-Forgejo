@@ -31,7 +31,8 @@ env:
 jobs:
   test:
     name: cargo test
-    runs-on: ubuntu-latest
+    # The heavy lane (Box-Ops runner-lanes.sh, operator 2026-11-18): cmux, DSH-OMP-Emu and fallow share one slot.
+    runs-on: heavy
     timeout-minutes: 90
     # A draft waits off the runner: the queue un-drafts it at the front, and that edit runs this.
     # Red, held or not-admitted, a draft still waits: the un-draft at the front is what gates its fix.
