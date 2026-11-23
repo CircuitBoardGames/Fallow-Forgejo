@@ -70,7 +70,7 @@
     "@fallow-cli/fallow-node-darwin-arm64": "3.41.0",
     "@fallow-cli/fallow-node-darwin-x64": "3.41.0",
     "@fallow-cli/fallow-node-linux-arm64-gnu": "3.41.0",
-    "@fallow-cli/fallow-node-linux-arm64-musl": "3.41.0",
+    "@fallow-cli/fallow-node-linux-arm64-musl": "3.43.1",
     "@fallow-cli/fallow-node-linux-x64-gnu": "3.41.0",
     "@fallow-cli/fallow-node-linux-x64-musl": "3.41.0",
     "@fallow-cli/fallow-node-win32-arm64-msvc": "3.41.0",
